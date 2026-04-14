@@ -1,12 +1,165 @@
 // Application state machine.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use nucleo::pattern::{Atom, AtomKind, CaseMatching, Normalization};
+use nucleo::{Config, Matcher, Utf32Str};
 
 use muxtop_core::process::{
     ProcessInfo, SortField, SortOrder, build_process_tree, filter_processes, flatten_tree,
     sort_processes,
 };
 use muxtop_core::system::SystemSnapshot;
+
+// ---------------------------------------------------------------------------
+// Command registry
+// ---------------------------------------------------------------------------
+
+/// All available commands in the palette.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Command {
+    Quit,
+    ToggleTreeView,
+    SortByCpu,
+    SortByMem,
+    SortByPid,
+    SortByName,
+    SortByUser,
+    ToggleSortOrder,
+    CycleSort,
+    SwitchToGeneral,
+    SwitchToProcesses,
+    OpenFilter,
+    NextTab,
+    PrevTab,
+}
+
+impl Command {
+    pub const ALL: &[Command] = &[
+        Command::Quit,
+        Command::ToggleTreeView,
+        Command::SortByCpu,
+        Command::SortByMem,
+        Command::SortByPid,
+        Command::SortByName,
+        Command::SortByUser,
+        Command::ToggleSortOrder,
+        Command::CycleSort,
+        Command::SwitchToGeneral,
+        Command::SwitchToProcesses,
+        Command::OpenFilter,
+        Command::NextTab,
+        Command::PrevTab,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Command::Quit => "Quit",
+            Command::ToggleTreeView => "Toggle tree view",
+            Command::SortByCpu => "Sort by CPU",
+            Command::SortByMem => "Sort by Memory",
+            Command::SortByPid => "Sort by PID",
+            Command::SortByName => "Sort by Name",
+            Command::SortByUser => "Sort by User",
+            Command::ToggleSortOrder => "Toggle sort order",
+            Command::CycleSort => "Cycle sort field",
+            Command::SwitchToGeneral => "Switch to General tab",
+            Command::SwitchToProcesses => "Switch to Processes tab",
+            Command::OpenFilter => "Open filter",
+            Command::NextTab => "Next tab",
+            Command::PrevTab => "Previous tab",
+        }
+    }
+
+    pub fn shortcut(self) -> &'static str {
+        match self {
+            Command::Quit => "q",
+            Command::ToggleTreeView => "t",
+            Command::SortByCpu => "F3",
+            Command::SortByMem => "F4",
+            Command::SortByPid => "F1",
+            Command::SortByName => "F2",
+            Command::SortByUser => "F5",
+            Command::ToggleSortOrder => "S",
+            Command::CycleSort => "s",
+            Command::SwitchToGeneral => "Alt+1",
+            Command::SwitchToProcesses => "Alt+2",
+            Command::OpenFilter => "/",
+            Command::NextTab => "Tab",
+            Command::PrevTab => "Shift+Tab",
+        }
+    }
+
+    /// The search haystack: label + shortcut combined for better fuzzy matching.
+    fn search_text(self) -> String {
+        format!("{} {}", self.label(), self.shortcut())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Palette state
+// ---------------------------------------------------------------------------
+
+/// State for the command palette overlay.
+pub struct PaletteState {
+    pub input: String,
+    pub selected: usize,
+    /// Filtered commands with match scores (higher = better).
+    pub filtered: Vec<(Command, Option<u16>)>,
+}
+
+impl Default for PaletteState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PaletteState {
+    pub fn new() -> Self {
+        let filtered = Command::ALL.iter().map(|&cmd| (cmd, None)).collect();
+        Self {
+            input: String::new(),
+            selected: 0,
+            filtered,
+        }
+    }
+
+    /// Recompute filtered results using nucleo fuzzy matching.
+    pub fn refilter(&mut self) {
+        if self.input.is_empty() {
+            self.filtered = Command::ALL.iter().map(|&cmd| (cmd, None)).collect();
+        } else {
+            let mut matcher = Matcher::new(Config::DEFAULT);
+            let atom = Atom::new(
+                &self.input,
+                CaseMatching::Ignore,
+                Normalization::Smart,
+                AtomKind::Fuzzy,
+                false,
+            );
+
+            let mut scored: Vec<(Command, u16)> = Command::ALL
+                .iter()
+                .filter_map(|&cmd| {
+                    let haystack = cmd.search_text();
+                    let mut buf = Vec::new();
+                    let haystack_utf32 = Utf32Str::new(&haystack, &mut buf);
+                    atom.score(haystack_utf32, &mut matcher)
+                        .map(|score| (cmd, score))
+                })
+                .collect();
+
+            scored.sort_by(|a, b| b.1.cmp(&a.1));
+            self.filtered = scored.into_iter().map(|(cmd, s)| (cmd, Some(s))).collect();
+        }
+
+        // Clamp selection
+        if self.filtered.is_empty() {
+            self.selected = 0;
+        } else {
+            self.selected = self.selected.min(self.filtered.len() - 1);
+        }
+    }
+}
 
 /// Tab identifiers for TUI views.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +207,7 @@ pub struct AppState {
     pub selected: usize,
     pub scroll_offset: usize,
     pub show_palette: bool,
+    pub palette: PaletteState,
     running: bool,
     pub last_snapshot: Option<SystemSnapshot>,
     /// Derived: sorted + filtered process list.
@@ -80,6 +234,7 @@ impl AppState {
             selected: 0,
             scroll_offset: 0,
             show_palette: false,
+            palette: PaletteState::new(),
             running: true,
             last_snapshot: None,
             visible_processes: Vec::new(),
@@ -158,6 +313,12 @@ impl AppState {
 
     /// Handle a keyboard event.
     pub fn handle_key_event(&mut self, key: KeyEvent) {
+        // Palette mode captures most keys.
+        if self.show_palette {
+            self.handle_palette_key(key);
+            return;
+        }
+
         // Filter mode captures most keys as text input.
         if self.filter_active {
             self.handle_filter_key(key);
@@ -269,10 +430,125 @@ impl AppState {
 
             // Command palette toggle
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.show_palette = !self.show_palette;
+                self.open_palette();
             }
 
             _ => {}
+        }
+    }
+
+    /// Open the command palette with a fresh state.
+    fn open_palette(&mut self) {
+        self.show_palette = true;
+        self.palette = PaletteState::new();
+    }
+
+    /// Close the command palette and clear state.
+    fn close_palette(&mut self) {
+        self.show_palette = false;
+        self.palette.input.clear();
+        self.palette.selected = 0;
+    }
+
+    /// Handle keys while the command palette is open.
+    fn handle_palette_key(&mut self, key: KeyEvent) {
+        // Ctrl+C always quits.
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.quit();
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.close_palette();
+            }
+            // Ctrl+P also closes the palette (toggle).
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.close_palette();
+            }
+            KeyCode::Enter => {
+                if let Some(&(cmd, _)) = self.palette.filtered.get(self.palette.selected) {
+                    self.close_palette();
+                    self.execute_command(cmd);
+                }
+            }
+            KeyCode::Down => {
+                if !self.palette.filtered.is_empty() {
+                    self.palette.selected =
+                        (self.palette.selected + 1).min(self.palette.filtered.len() - 1);
+                }
+            }
+            KeyCode::Up => {
+                self.palette.selected = self.palette.selected.saturating_sub(1);
+            }
+            KeyCode::Backspace => {
+                self.palette.input.pop();
+                self.palette.refilter();
+            }
+            KeyCode::Char(c) => {
+                self.palette.input.push(c);
+                self.palette.refilter();
+            }
+            _ => {}
+        }
+    }
+
+    /// Execute a command from the palette.
+    fn execute_command(&mut self, cmd: Command) {
+        match cmd {
+            Command::Quit => self.quit(),
+            Command::ToggleTreeView => {
+                self.tree_mode = !self.tree_mode;
+                self.selected = 0;
+                self.scroll_offset = 0;
+                self.recompute_visible();
+            }
+            Command::SortByCpu => {
+                self.sort_field = SortField::Cpu;
+                self.recompute_visible();
+            }
+            Command::SortByMem => {
+                self.sort_field = SortField::Mem;
+                self.recompute_visible();
+            }
+            Command::SortByPid => {
+                self.sort_field = SortField::Pid;
+                self.recompute_visible();
+            }
+            Command::SortByName => {
+                self.sort_field = SortField::Name;
+                self.recompute_visible();
+            }
+            Command::SortByUser => {
+                self.sort_field = SortField::User;
+                self.recompute_visible();
+            }
+            Command::ToggleSortOrder => {
+                self.sort_order = match self.sort_order {
+                    SortOrder::Asc => SortOrder::Desc,
+                    SortOrder::Desc => SortOrder::Asc,
+                };
+                self.recompute_visible();
+            }
+            Command::CycleSort => {
+                self.sort_field = next_sort_field(self.sort_field);
+                self.recompute_visible();
+            }
+            Command::SwitchToGeneral => {
+                self.tab = Tab::General;
+            }
+            Command::SwitchToProcesses => {
+                self.tab = Tab::Processes;
+            }
+            Command::OpenFilter => {
+                self.filter_active = true;
+            }
+            Command::NextTab => {
+                self.tab = self.tab.next();
+            }
+            Command::PrevTab => {
+                self.tab = self.tab.prev();
+            }
         }
     }
 
@@ -869,5 +1145,256 @@ mod tests {
         app.scroll_offset = app.process_count().saturating_sub(1);
         app.handle_mouse_event(mouse_scroll(MouseEventKind::ScrollDown));
         assert_eq!(app.scroll_offset, app.process_count().saturating_sub(1));
+    }
+
+    // -- Command registry tests (Epic 6) --
+
+    #[test]
+    fn test_command_registry_count() {
+        assert!(
+            Command::ALL.len() >= 14,
+            "Registry should have at least 14 commands, got {}",
+            Command::ALL.len()
+        );
+    }
+
+    #[test]
+    fn test_command_labels_non_empty() {
+        for cmd in Command::ALL {
+            assert!(!cmd.label().is_empty(), "Command {:?} has empty label", cmd);
+        }
+    }
+
+    #[test]
+    fn test_command_shortcuts_non_empty() {
+        for cmd in Command::ALL {
+            assert!(
+                !cmd.shortcut().is_empty(),
+                "Command {:?} has empty shortcut",
+                cmd
+            );
+        }
+    }
+
+    // -- Palette state tests (Epic 6) --
+
+    #[test]
+    fn test_palette_state_new() {
+        let ps = PaletteState::new();
+        assert!(ps.input.is_empty());
+        assert_eq!(ps.selected, 0);
+        assert_eq!(ps.filtered.len(), Command::ALL.len());
+    }
+
+    #[test]
+    fn test_palette_refilter_empty_shows_all() {
+        let mut ps = PaletteState::new();
+        ps.refilter();
+        assert_eq!(ps.filtered.len(), Command::ALL.len());
+    }
+
+    #[test]
+    fn test_palette_refilter_fuzzy_match() {
+        let mut ps = PaletteState::new();
+        ps.input = "sort cpu".to_string();
+        ps.refilter();
+        assert!(!ps.filtered.is_empty(), "Should match at least one command");
+        assert_eq!(
+            ps.filtered[0].0,
+            Command::SortByCpu,
+            "First result should be Sort by CPU"
+        );
+    }
+
+    #[test]
+    fn test_palette_refilter_no_match() {
+        let mut ps = PaletteState::new();
+        ps.input = "zzzzznonexistent".to_string();
+        ps.refilter();
+        assert!(ps.filtered.is_empty(), "Should have no matches");
+    }
+
+    #[test]
+    fn test_palette_refilter_clamps_selection() {
+        let mut ps = PaletteState::new();
+        ps.selected = 100;
+        ps.input = "quit".to_string();
+        ps.refilter();
+        assert!(ps.selected < ps.filtered.len());
+    }
+
+    // -- Palette key handling tests (Epic 6) --
+
+    #[test]
+    fn test_palette_opens_with_ctrl_p() {
+        let mut app = AppState::new();
+        assert!(!app.show_palette);
+        app.handle_key_event(key_mod(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert!(app.show_palette);
+        assert!(app.palette.input.is_empty());
+    }
+
+    #[test]
+    fn test_palette_closes_with_esc() {
+        let mut app = AppState::new();
+        app.show_palette = true;
+        app.palette.input = "test".to_string();
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(!app.show_palette);
+        assert!(app.palette.input.is_empty());
+    }
+
+    #[test]
+    fn test_palette_closes_with_ctrl_p() {
+        let mut app = AppState::new();
+        app.show_palette = true;
+        app.handle_key_event(key_mod(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert!(!app.show_palette);
+    }
+
+    #[test]
+    fn test_palette_typing_captures_input() {
+        let mut app = AppState::new();
+        app.show_palette = true;
+        app.handle_key_event(key(KeyCode::Char('s')));
+        app.handle_key_event(key(KeyCode::Char('o')));
+        app.handle_key_event(key(KeyCode::Char('r')));
+        app.handle_key_event(key(KeyCode::Char('t')));
+        assert_eq!(app.palette.input, "sort");
+    }
+
+    #[test]
+    fn test_palette_backspace() {
+        let mut app = AppState::new();
+        app.show_palette = true;
+        app.palette.input = "sor".to_string();
+        app.handle_key_event(key(KeyCode::Backspace));
+        assert_eq!(app.palette.input, "so");
+    }
+
+    #[test]
+    fn test_palette_blocks_quit() {
+        let mut app = AppState::new();
+        app.show_palette = true;
+        app.handle_key_event(key(KeyCode::Char('q')));
+        assert!(app.running(), "Pressing 'q' in palette should NOT quit");
+        assert_eq!(app.palette.input, "q", "Should type 'q' into palette");
+    }
+
+    #[test]
+    fn test_palette_ctrl_c_quits() {
+        let mut app = AppState::new();
+        app.show_palette = true;
+        app.handle_key_event(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(!app.running(), "Ctrl+C should quit even with palette open");
+    }
+
+    #[test]
+    fn test_palette_navigate_down() {
+        let mut app = AppState::new();
+        app.show_palette = true;
+        app.palette.refilter();
+        assert_eq!(app.palette.selected, 0);
+        app.handle_key_event(key(KeyCode::Down));
+        assert_eq!(app.palette.selected, 1);
+    }
+
+    #[test]
+    fn test_palette_navigate_up() {
+        let mut app = AppState::new();
+        app.show_palette = true;
+        app.palette.refilter();
+        app.palette.selected = 3;
+        app.handle_key_event(key(KeyCode::Up));
+        assert_eq!(app.palette.selected, 2);
+    }
+
+    #[test]
+    fn test_palette_navigate_clamp_top() {
+        let mut app = AppState::new();
+        app.show_palette = true;
+        app.palette.selected = 0;
+        app.handle_key_event(key(KeyCode::Up));
+        assert_eq!(app.palette.selected, 0);
+    }
+
+    #[test]
+    fn test_palette_navigate_clamp_bottom() {
+        let mut app = AppState::new();
+        app.show_palette = true;
+        app.palette.refilter();
+        let max = app.palette.filtered.len() - 1;
+        app.palette.selected = max;
+        app.handle_key_event(key(KeyCode::Down));
+        assert_eq!(app.palette.selected, max);
+    }
+
+    // -- Command execution tests (Epic 6) --
+
+    #[test]
+    fn test_palette_execute_quit() {
+        let mut app = AppState::new();
+        app.execute_command(Command::Quit);
+        assert!(!app.running());
+    }
+
+    #[test]
+    fn test_palette_execute_toggle_tree() {
+        let mut app = app_with_processes();
+        assert!(!app.tree_mode);
+        app.execute_command(Command::ToggleTreeView);
+        assert!(app.tree_mode);
+    }
+
+    #[test]
+    fn test_palette_execute_sort_cpu() {
+        let mut app = app_with_processes();
+        app.sort_field = SortField::Pid;
+        app.execute_command(Command::SortByCpu);
+        assert!(matches!(app.sort_field, SortField::Cpu));
+    }
+
+    #[test]
+    fn test_palette_execute_sort_mem() {
+        let mut app = app_with_processes();
+        app.execute_command(Command::SortByMem);
+        assert!(matches!(app.sort_field, SortField::Mem));
+    }
+
+    #[test]
+    fn test_palette_execute_toggle_sort_order() {
+        let mut app = app_with_processes();
+        assert!(matches!(app.sort_order, SortOrder::Desc));
+        app.execute_command(Command::ToggleSortOrder);
+        assert!(matches!(app.sort_order, SortOrder::Asc));
+    }
+
+    #[test]
+    fn test_palette_execute_switch_tab() {
+        let mut app = AppState::new();
+        app.execute_command(Command::SwitchToProcesses);
+        assert_eq!(app.tab, Tab::Processes);
+        app.execute_command(Command::SwitchToGeneral);
+        assert_eq!(app.tab, Tab::General);
+    }
+
+    #[test]
+    fn test_palette_execute_open_filter() {
+        let mut app = AppState::new();
+        app.execute_command(Command::OpenFilter);
+        assert!(app.filter_active);
+    }
+
+    #[test]
+    fn test_palette_enter_executes_and_closes() {
+        let mut app = AppState::new();
+        app.show_palette = true;
+        app.palette.refilter();
+        // First command in the list is Quit
+        app.palette.selected = 0;
+        assert_eq!(app.palette.filtered[0].0, Command::Quit);
+        app.handle_key_event(key(KeyCode::Enter));
+        assert!(!app.show_palette);
+        assert!(!app.running());
     }
 }

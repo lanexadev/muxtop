@@ -12,6 +12,7 @@ rust-version.workspace = true
 muxtop-core = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+nucleo = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
