@@ -93,8 +93,8 @@ impl SystemSnapshot {
             .iter()
             .map(|(pid, proc_info)| {
                 let mem_pct = if total_mem > 0 {
-                    ((proc_info.memory() as f64 / total_mem as f64) * 100.0)
-                        .clamp(0.0, 100.0) as f32
+                    ((proc_info.memory() as f64 / total_mem as f64) * 100.0).clamp(0.0, 100.0)
+                        as f32
                 } else {
                     0.0
                 };
@@ -198,10 +198,7 @@ mod tests {
         sys.refresh_all();
 
         let snap = SystemSnapshot::collect(&sys);
-        assert!(
-            snap.memory.total > 0,
-            "total memory should be positive"
-        );
+        assert!(snap.memory.total > 0, "total memory should be positive");
         // used + available can slightly exceed total due to kernel accounting
         // but total should be >= used
         assert!(

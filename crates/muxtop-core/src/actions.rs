@@ -30,11 +30,9 @@ pub fn kill_process(pid: u32, signal: i32) -> Result<(), CoreError> {
     let err = std::io::Error::last_os_error();
     match err.raw_os_error() {
         Some(code) if code == libc::ESRCH => Err(CoreError::ProcessNotFound { pid }),
-        Some(code) if code == libc::EPERM => {
-            Err(CoreError::Permission(format!(
-                "permission denied sending signal {signal} to pid {pid}"
-            )))
-        }
+        Some(code) if code == libc::EPERM => Err(CoreError::Permission(format!(
+            "permission denied sending signal {signal} to pid {pid}"
+        ))),
         _ => Err(CoreError::Io(err)),
     }
 }
@@ -73,11 +71,9 @@ pub fn renice_process(pid: u32, nice_value: i32) -> Result<(), CoreError> {
     match err.raw_os_error() {
         Some(0) => Ok(()), // errno was not set — setpriority succeeded with value -1
         Some(code) if code == libc::ESRCH => Err(CoreError::ProcessNotFound { pid }),
-        Some(code) if code == libc::EPERM => {
-            Err(CoreError::Permission(format!(
-                "permission denied changing priority of pid {pid} to {nice_value}"
-            )))
-        }
+        Some(code) if code == libc::EPERM => Err(CoreError::Permission(format!(
+            "permission denied changing priority of pid {pid} to {nice_value}"
+        ))),
         _ => Err(CoreError::Io(err)),
     }
 }
@@ -89,11 +85,15 @@ pub fn renice_process(pid: u32, nice_value: i32) -> Result<(), CoreError> {
 unsafe fn set_errno_raw(value: i32) {
     #[cfg(target_os = "macos")]
     {
-        unsafe { *libc::__error() = value; }
+        unsafe {
+            *libc::__error() = value;
+        }
     }
     #[cfg(target_os = "linux")]
     {
-        unsafe { *libc::__errno_location() = value; }
+        unsafe {
+            *libc::__errno_location() = value;
+        }
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -136,10 +136,16 @@ mod tests {
         // Use a PID that is large but still a valid positive i32,
         // avoiding u32::MAX which wraps to -1 (POSIX wildcard: kill ALL processes).
         let bad_pid: u32 = i32::MAX as u32 - 1; // 2147483646 — almost certainly unused
-        log(&format!("test_kill_invalid_pid: pid={bad_pid}, signal=SIGTERM({})", libc::SIGTERM));
+        log(&format!(
+            "test_kill_invalid_pid: pid={bad_pid}, signal=SIGTERM({})",
+            libc::SIGTERM
+        ));
         let result = kill_process(bad_pid, libc::SIGTERM);
         log(&format!("test_kill_invalid_pid: result={result:?}"));
-        assert!(result.is_err(), "kill(large_pid, SIGTERM) must return an error");
+        assert!(
+            result.is_err(),
+            "kill(large_pid, SIGTERM) must return an error"
+        );
         match result.unwrap_err() {
             CoreError::ProcessNotFound { .. } | CoreError::Permission(_) | CoreError::Io(_) => {}
             other => panic!("unexpected error variant: {other:?}"),
@@ -178,7 +184,10 @@ mod tests {
         log(&format!("test_renice_self: pid={pid}, nice=10"));
         let result = renice_process(pid, 10);
         log(&format!("test_renice_self: result={result:?}"));
-        assert!(result.is_ok(), "renice(self, 10) should succeed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "renice(self, 10) should succeed: {result:?}"
+        );
     }
 
     /// Renicing a very large PID should fail.
@@ -188,7 +197,10 @@ mod tests {
         log(&format!("test_renice_invalid_pid: pid={bad_pid}, nice=10"));
         let result = renice_process(bad_pid, 10);
         log(&format!("test_renice_invalid_pid: result={result:?}"));
-        assert!(result.is_err(), "renice(large_pid, 10) must return an error");
+        assert!(
+            result.is_err(),
+            "renice(large_pid, 10) must return an error"
+        );
     }
 
     /// Verify that each error path produces the expected discriminant.
@@ -196,7 +208,9 @@ mod tests {
     fn test_kill_renice_error_types() {
         let bad_pid: u32 = i32::MAX as u32 - 1;
 
-        log(&format!("test_kill_renice_error_types: kill bad_pid={bad_pid}"));
+        log(&format!(
+            "test_kill_renice_error_types: kill bad_pid={bad_pid}"
+        ));
         let r = kill_process(bad_pid, libc::SIGTERM);
         log(&format!("test_kill_renice_error_types: kill result={r:?}"));
         if let Err(e) = r {
@@ -207,9 +221,13 @@ mod tests {
             assert!(is_expected, "unexpected error variant: {e:?}");
         }
 
-        log(&format!("test_kill_renice_error_types: renice bad_pid={bad_pid}"));
+        log(&format!(
+            "test_kill_renice_error_types: renice bad_pid={bad_pid}"
+        ));
         let r2 = renice_process(bad_pid, 0);
-        log(&format!("test_kill_renice_error_types: renice result={r2:?}"));
+        log(&format!(
+            "test_kill_renice_error_types: renice result={r2:?}"
+        ));
         if let Err(e) = r2 {
             let is_expected = matches!(
                 e,

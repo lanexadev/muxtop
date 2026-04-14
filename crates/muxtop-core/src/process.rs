@@ -60,8 +60,7 @@ pub fn filter_processes(procs: &[ProcessInfo], pattern: &str) -> Vec<ProcessInfo
     procs
         .iter()
         .filter(|p| {
-            p.name.to_lowercase().contains(&lower)
-                || p.command.to_lowercase().contains(&lower)
+            p.name.to_lowercase().contains(&lower) || p.command.to_lowercase().contains(&lower)
         })
         .cloned()
         .collect()
@@ -89,8 +88,7 @@ pub fn build_process_tree(procs: &[ProcessInfo]) -> Vec<TreeNode> {
 
     // Index: pid → list of child ProcessInfo indices.
     let mut children_map: HashMap<u32, Vec<usize>> = HashMap::with_capacity(procs.len());
-    let pid_set: std::collections::HashSet<u32> =
-        procs.iter().map(|p| p.pid).collect();
+    let pid_set: std::collections::HashSet<u32> = procs.iter().map(|p| p.pid).collect();
 
     for (i, p) in procs.iter().enumerate() {
         match p.parent_pid {
@@ -182,10 +180,10 @@ mod tests {
     fn cpu_procs() -> Vec<ProcessInfo> {
         vec![
             make_proc(1, "a", "", "alice", 10.0, 100),
-            make_proc(2, "b", "", "bob",   50.0, 200),
+            make_proc(2, "b", "", "bob", 50.0, 200),
             make_proc(3, "c", "", "carol", 30.0, 300),
-            make_proc(4, "d", "", "dave",  90.0, 400),
-            make_proc(5, "e", "", "eve",   20.0, 500),
+            make_proc(4, "d", "", "dave", 90.0, 400),
+            make_proc(5, "e", "", "eve", 20.0, 500),
         ]
     }
 
@@ -208,9 +206,9 @@ mod tests {
     #[test]
     fn test_sort_by_name_asc() {
         let mut procs = vec![
-            make_proc(1, "Zsh",    "", "u", 0.0, 0),
+            make_proc(1, "Zsh", "", "u", 0.0, 0),
             make_proc(2, "apache", "", "u", 0.0, 0),
-            make_proc(3, "Bash",   "", "u", 0.0, 0),
+            make_proc(3, "Bash", "", "u", 0.0, 0),
         ];
         sort_processes(&mut procs, SortField::Name, SortOrder::Asc);
         let names: Vec<&str> = procs.iter().map(|p| p.name.as_str()).collect();
@@ -241,9 +239,9 @@ mod tests {
     #[test]
     fn test_sort_by_user_asc() {
         let mut procs = vec![
-            make_proc(1, "a", "", "Zara",  0.0, 0),
+            make_proc(1, "a", "", "Zara", 0.0, 0),
             make_proc(2, "b", "", "alice", 0.0, 0),
-            make_proc(3, "c", "", "Bob",   0.0, 0),
+            make_proc(3, "c", "", "Bob", 0.0, 0),
         ];
         sort_processes(&mut procs, SortField::User, SortOrder::Asc);
         let users: Vec<&str> = procs.iter().map(|p| p.user.as_str()).collect();
@@ -269,9 +267,9 @@ mod tests {
     #[test]
     fn test_filter_case_insensitive() {
         let procs = vec![
-            make_proc(1, "Firefox",     "/usr/bin/firefox",     "u", 0.0, 0),
+            make_proc(1, "Firefox", "/usr/bin/firefox", "u", 0.0, 0),
             make_proc(2, "firefox-esr", "/usr/bin/firefox-esr", "u", 0.0, 0),
-            make_proc(3, "bash",        "/bin/bash",            "u", 0.0, 0),
+            make_proc(3, "bash", "/bin/bash", "u", 0.0, 0),
         ];
         let result = filter_processes(&procs, "fire");
         assert_eq!(result.len(), 2);
@@ -298,7 +296,7 @@ mod tests {
     fn test_filter_matches_command_field() {
         let procs = vec![
             make_proc(1, "proc1", "/usr/bin/rustc --edition 2021", "u", 0.0, 0),
-            make_proc(2, "proc2", "/bin/bash",                     "u", 0.0, 0),
+            make_proc(2, "proc2", "/bin/bash", "u", 0.0, 0),
         ];
         // "rustc" is only in the command field, not the name.
         let result = filter_processes(&procs, "rustc");
@@ -334,7 +332,11 @@ mod tests {
         assert_eq!(tree[0].process.pid, 1);
         assert_eq!(tree[0].children.len(), 1, "init should have 1 child");
         assert_eq!(tree[0].children[0].process.pid, 100);
-        assert_eq!(tree[0].children[0].children.len(), 1, "sshd should have 1 child");
+        assert_eq!(
+            tree[0].children[0].children.len(),
+            1,
+            "sshd should have 1 child"
+        );
         assert_eq!(tree[0].children[0].children[0].process.pid, 200);
     }
 
@@ -353,9 +355,7 @@ mod tests {
 
     #[test]
     fn test_tree_orphan_as_root() {
-        let procs = vec![
-            make_proc_with_parent(500, Some(999), "orphan"),
-        ];
+        let procs = vec![make_proc_with_parent(500, Some(999), "orphan")];
         let tree = build_process_tree(&procs);
         assert_eq!(tree.len(), 1, "orphan with missing parent should be a root");
         assert_eq!(tree[0].process.pid, 500);
@@ -369,7 +369,11 @@ mod tests {
             make_proc_with_parent(2, Some(0), "kthreadd"),
         ];
         let tree = build_process_tree(&procs);
-        assert_eq!(tree.len(), 2, "two processes with PPID=0 should both be roots");
+        assert_eq!(
+            tree.len(),
+            2,
+            "two processes with PPID=0 should both be roots"
+        );
     }
 
     #[test]

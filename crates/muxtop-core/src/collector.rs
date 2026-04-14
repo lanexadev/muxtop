@@ -30,11 +30,7 @@ impl Collector {
         tokio::spawn(Self::run(self, tx, token))
     }
 
-    async fn run(
-        mut self,
-        tx: mpsc::Sender<SystemSnapshot>,
-        token: CancellationToken,
-    ) {
+    async fn run(mut self, tx: mpsc::Sender<SystemSnapshot>, token: CancellationToken) {
         let mut interval = tokio::time::interval(self.interval);
         // Don't burst-fire missed ticks when system is under load.
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -99,7 +95,9 @@ mod tests {
         tokio::task::JoinHandle<()>,
         CancellationToken,
     ) {
-        log(&format!("make_collector: creating Collector(interval=1s, channel_cap={cap})"));
+        log(&format!(
+            "make_collector: creating Collector(interval=1s, channel_cap={cap})"
+        ));
         let (tx, rx) = mpsc::channel(cap);
         let token = CancellationToken::new();
         log("make_collector: creating Collector::new()...");
@@ -139,7 +137,9 @@ mod tests {
                     panic!("channel closed before receiving 2 snapshots");
                 }
                 Err(_) => {
-                    log(&format!("  ERROR: timeout after receiving {count} snapshots"));
+                    log(&format!(
+                        "  ERROR: timeout after receiving {count} snapshots"
+                    ));
                     panic!("timeout: only received {count} snapshots within 4s");
                 }
             }
@@ -149,7 +149,9 @@ mod tests {
         token.cancel();
         log("  awaiting handle...");
         handle.await.expect("collector task panicked");
-        log(&format!("=== test_collector_produces_snapshots END (count={count}) ==="));
+        log(&format!(
+            "=== test_collector_produces_snapshots END (count={count}) ==="
+        ));
         assert!(count >= 2, "expected at least 2 snapshots, got {count}");
     }
 
@@ -197,9 +199,7 @@ mod tests {
         let (mut rx, handle, token) = make_collector(4);
 
         // Drain in the background so the channel doesn't fill up.
-        tokio::spawn(async move {
-            while rx.recv().await.is_some() {}
-        });
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
         log("  sleeping 500ms before cancel...");
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -268,11 +268,7 @@ mod tests {
         let min = Duration::from_millis(500);
         let max = Duration::from_millis(1500);
 
-        assert!(
-            gap >= min && gap <= max,
-            "expected gap ~1s, got {:?}",
-            gap
-        );
+        assert!(gap >= min && gap <= max, "expected gap ~1s, got {:?}", gap);
         log("=== test_collector_respects_interval END ===");
     }
 }

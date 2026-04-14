@@ -2,7 +2,7 @@
 use std::time::Duration;
 
 use muxtop_core::process::{
-    build_process_tree, filter_processes, flatten_tree, sort_processes, SortField, SortOrder,
+    SortField, SortOrder, build_process_tree, filter_processes, flatten_tree, sort_processes,
 };
 use muxtop_core::system::SystemSnapshot;
 use tokio::sync::mpsc;
