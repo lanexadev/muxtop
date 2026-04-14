@@ -1,0 +1,31 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Debug symbols
+*.pdb
+*.dSYM/
+
+# Editor files
+*.swp
+*.swo
+*~
+.idea/
+*.iml
+.vscode/
+
+# macOS
+.DS_Store
+
+# Environment
+.env
+.env.*
+
+# Logs
+*.log
+
+# Benchmarks (local)
+/criterion/
+
+# FORGE output (dev-only)
+.claude/
