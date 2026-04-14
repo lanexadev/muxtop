@@ -46,9 +46,16 @@ pub fn draw_processes_tab(frame: &mut Frame, area: Rect, app: &AppState) {
 
 /// Render the column header row with a sort indicator on the active column.
 fn draw_header(frame: &mut Frame, area: Rect, app: &AppState) {
-    let arrow = match app.sort_order {
-        SortOrder::Desc => "▼",
-        SortOrder::Asc => "▲",
+    let arrow = if app.term_caps.unicode {
+        match app.sort_order {
+            SortOrder::Desc => "▼",
+            SortOrder::Asc => "▲",
+        }
+    } else {
+        match app.sort_order {
+            SortOrder::Desc => "v",
+            SortOrder::Asc => "^",
+        }
     };
     let cmd_w = (area.width as usize).saturating_sub(FIXED_COLS);
     let style = Style::default()
@@ -97,12 +104,13 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &AppState) {
     let scroll = effective_scroll(app.selected, app.scroll_offset, vis_h);
     let cmd_w = (area.width as usize).saturating_sub(FIXED_COLS);
 
+    let unicode = app.term_caps.unicode;
     let lines: Vec<Line<'static>> = if app.tree_mode {
         let entries = &app.visible_tree;
         let end = (scroll + vis_h).min(entries.len());
         (scroll..end)
             .map(|i| {
-                let pfx = tree_prefix(entries, i);
+                let pfx = tree_prefix_with_unicode(entries, i, unicode);
                 process_row(&entries[i].0, cmd_w, i == app.selected, Some(&pfx))
             })
             .collect()
@@ -119,6 +127,7 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &AppState) {
 
 /// Render the filter input bar at the bottom of the content area.
 fn draw_filter_bar(frame: &mut Frame, area: Rect, app: &AppState) {
+    let cursor = if app.term_caps.unicode { "█" } else { "_" };
     let line = Line::from(vec![
         Span::styled(
             "Filter: ",
@@ -127,7 +136,7 @@ fn draw_filter_bar(frame: &mut Frame, area: Rect, app: &AppState) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("{}█", app.filter_input),
+            format!("{}{cursor}", app.filter_input),
             Style::default().fg(Color::White),
         ),
     ]);
@@ -239,16 +248,24 @@ fn is_last_at_depth(entries: &[(ProcessInfo, usize)], idx: usize) -> bool {
     true
 }
 
-/// Build the tree-connector prefix string for the entry at `idx`.
+/// Build the tree-connector prefix string (Unicode mode — used in tests).
+#[cfg(test)]
 fn tree_prefix(entries: &[(ProcessInfo, usize)], idx: usize) -> String {
+    tree_prefix_with_unicode(entries, idx, true)
+}
+
+/// Build the tree-connector prefix string, with optional ASCII fallback.
+fn tree_prefix_with_unicode(entries: &[(ProcessInfo, usize)], idx: usize, unicode: bool) -> String {
     let depth = entries[idx].1;
     if depth == 0 {
         return String::new();
     }
     let connector = if is_last_at_depth(entries, idx) {
-        "└── "
-    } else {
+        if unicode { "└── " } else { "\\-- " }
+    } else if unicode {
         "├── "
+    } else {
+        "|-- "
     };
     let indent = "  ".repeat(depth.saturating_sub(1));
     format!("{indent}{connector}")

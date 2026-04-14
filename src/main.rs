@@ -6,7 +6,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use muxtop_core::collector::Collector;
+use muxtop_core::process::SortField;
 use muxtop_core::system::SystemSnapshot;
+use muxtop_tui::CliConfig;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -25,12 +27,16 @@ struct Cli {
     filter: Option<String>,
 
     /// Initial sort field (cpu, mem, pid, name, user)
-    #[arg(long, default_value = "cpu")]
-    sort: String,
+    #[arg(long, default_value = "cpu", value_parser = clap::value_parser!(SortField))]
+    sort: SortField,
 
     /// Start in tree view mode
     #[arg(long)]
     tree: bool,
+
+    /// Show version, license, repository, and privacy pledge
+    #[arg(long)]
+    about: bool,
 }
 
 fn init_tracing() -> Result<()> {
@@ -70,9 +76,20 @@ fn init_tracing() -> Result<()> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    if cli.about {
+        print_about();
+        return Ok(());
+    }
+
     init_tracing()?;
 
     tracing::info!("muxtop starting");
+
+    let config = CliConfig {
+        filter: cli.filter,
+        sort_field: cli.sort,
+        tree_mode: cli.tree,
+    };
 
     // Create channel for collector → TUI communication.
     let (tx, rx) = mpsc::channel::<SystemSnapshot>(4);
@@ -84,7 +101,7 @@ async fn main() -> Result<()> {
 
     // G-05: Run the TUI on a dedicated blocking thread so it doesn't
     // block the tokio runtime (crossterm::event::poll is a blocking syscall).
-    let tui_result = tokio::task::spawn_blocking(move || muxtop_tui::run(rx))
+    let tui_result = tokio::task::spawn_blocking(move || muxtop_tui::run(rx, config))
         .await
         .context("TUI thread panicked")?;
 
@@ -100,4 +117,17 @@ async fn main() -> Result<()> {
     tui_result.context("TUI error")?;
 
     Ok(())
+}
+
+fn print_about() {
+    let version = env!("CARGO_PKG_VERSION");
+    println!("muxtop v{version}");
+    println!("A modern, multiplexed system monitor for the terminal");
+    println!();
+    println!("License:     MIT OR Apache-2.0");
+    println!("Repository:  https://github.com/lanexadev/muxtop");
+    println!("Authors:     Lucas Schimmel");
+    println!();
+    println!("Privacy:     muxtop collects NO telemetry, NO analytics,");
+    println!("             and phones home to NOBODY. Ever.");
 }

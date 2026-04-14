@@ -19,6 +19,8 @@ pub fn draw_general_tab(frame: &mut Frame, area: Rect, app: &AppState) {
         return;
     };
 
+    let unicode = app.term_caps.unicode;
+
     let [cpu_area, mem_area, info_area] = Layout::vertical([
         Constraint::Min(3),
         Constraint::Length(2),
@@ -26,8 +28,8 @@ pub fn draw_general_tab(frame: &mut Frame, area: Rect, app: &AppState) {
     ])
     .areas(area);
 
-    draw_cpu_bars(frame, cpu_area, snapshot);
-    draw_memory_bars(frame, mem_area, snapshot);
+    draw_cpu_bars(frame, cpu_area, snapshot, unicode);
+    draw_memory_bars(frame, mem_area, snapshot, unicode);
     draw_system_info(frame, info_area, snapshot);
 }
 
@@ -63,7 +65,7 @@ fn format_bytes_gb(bytes: u64) -> String {
 }
 
 /// Render RAM bar and optional Swap bar.
-fn draw_memory_bars(frame: &mut Frame, area: Rect, snapshot: &SystemSnapshot) {
+fn draw_memory_bars(frame: &mut Frame, area: Rect, snapshot: &SystemSnapshot, unicode: bool) {
     let mem = &snapshot.memory;
     let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -73,6 +75,7 @@ fn draw_memory_bars(frame: &mut Frame, area: Rect, snapshot: &SystemSnapshot) {
         mem.total,
         Color::Green,
         area.width,
+        unicode,
     ));
 
     if mem.swap_total > 0 {
@@ -82,12 +85,19 @@ fn draw_memory_bars(frame: &mut Frame, area: Rect, snapshot: &SystemSnapshot) {
             mem.swap_total,
             Color::Cyan,
             area.width,
+            unicode,
         ));
     }
 
     let para = Paragraph::new(lines);
     frame.render_widget(para, area);
 }
+
+/// Bar characters — Unicode vs ASCII fallback.
+const BAR_FILLED_UNICODE: &str = "█";
+const BAR_EMPTY_UNICODE: &str = "░";
+const BAR_FILLED_ASCII: &str = "#";
+const BAR_EMPTY_ASCII: &str = "-";
 
 /// Build a single horizontal bar line (used for both RAM and Swap).
 fn make_bar_line(
@@ -96,6 +106,7 @@ fn make_bar_line(
     total: u64,
     fill_color: Color,
     width: u16,
+    unicode: bool,
 ) -> Line<'static> {
     let pct = if total > 0 {
         (used as f64 / total as f64 * 100.0).clamp(0.0, 100.0)
@@ -113,6 +124,12 @@ fn make_bar_line(
     let filled = ((bar_w as f64) * (pct / 100.0)).round() as u16;
     let empty = bar_w.saturating_sub(filled);
 
+    let (fill_char, empty_char) = if unicode {
+        (BAR_FILLED_UNICODE, BAR_EMPTY_UNICODE)
+    } else {
+        (BAR_FILLED_ASCII, BAR_EMPTY_ASCII)
+    };
+
     Line::from(vec![
         Span::styled(
             label_part,
@@ -121,9 +138,12 @@ fn make_bar_line(
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("["),
-        Span::styled("█".repeat(filled as usize), Style::default().fg(fill_color)),
         Span::styled(
-            "░".repeat(empty as usize),
+            fill_char.repeat(filled as usize),
+            Style::default().fg(fill_color),
+        ),
+        Span::styled(
+            empty_char.repeat(empty as usize),
             Style::default().fg(Color::DarkGray),
         ),
         Span::raw("]"),
@@ -132,7 +152,7 @@ fn make_bar_line(
 }
 
 /// Render per-core CPU usage bars inside a "CPU" bordered block.
-fn draw_cpu_bars(frame: &mut Frame, area: Rect, snapshot: &SystemSnapshot) {
+fn draw_cpu_bars(frame: &mut Frame, area: Rect, snapshot: &SystemSnapshot, unicode: bool) {
     let block = Block::default().title("CPU").borders(Borders::ALL);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -145,7 +165,7 @@ fn draw_cpu_bars(frame: &mut Frame, area: Rect, snapshot: &SystemSnapshot) {
     if cores.len() <= 16 {
         let lines: Vec<Line<'static>> = cores
             .iter()
-            .map(|c| make_cpu_bar_line(c, inner.width))
+            .map(|c| make_cpu_bar_line(c, inner.width, unicode))
             .collect();
         frame.render_widget(Paragraph::new(lines), inner);
     } else {
@@ -156,11 +176,11 @@ fn draw_cpu_bars(frame: &mut Frame, area: Rect, snapshot: &SystemSnapshot) {
         let mid = cores.len().div_ceil(2);
         let left_lines: Vec<Line<'static>> = cores[..mid]
             .iter()
-            .map(|c| make_cpu_bar_line(c, left_area.width))
+            .map(|c| make_cpu_bar_line(c, left_area.width, unicode))
             .collect();
         let right_lines: Vec<Line<'static>> = cores[mid..]
             .iter()
-            .map(|c| make_cpu_bar_line(c, right_area.width))
+            .map(|c| make_cpu_bar_line(c, right_area.width, unicode))
             .collect();
 
         frame.render_widget(Paragraph::new(left_lines), left_area);
@@ -168,8 +188,8 @@ fn draw_cpu_bars(frame: &mut Frame, area: Rect, snapshot: &SystemSnapshot) {
     }
 }
 
-/// Build a single CPU core bar line: "cpu0  [████░░░░]  10.0%".
-fn make_cpu_bar_line(core: &CoreSnapshot, width: u16) -> Line<'static> {
+/// Build a single CPU core bar line: "cpu0  [####----]  10.0%" (ASCII) or "cpu0  [████░░░░]  10.0%" (Unicode).
+fn make_cpu_bar_line(core: &CoreSnapshot, width: u16, unicode: bool) -> Line<'static> {
     let pct = core.usage.clamp(0.0, 100.0);
     let label = format!("{:<6}", core.name);
     let info = format!("  {pct:.1}%");
@@ -180,15 +200,21 @@ fn make_cpu_bar_line(core: &CoreSnapshot, width: u16) -> Line<'static> {
     let filled = ((bar_w as f64) * (pct as f64 / 100.0)).round() as u16;
     let empty = bar_w.saturating_sub(filled);
 
+    let (fill_char, empty_char) = if unicode {
+        (BAR_FILLED_UNICODE, BAR_EMPTY_UNICODE)
+    } else {
+        (BAR_FILLED_ASCII, BAR_EMPTY_ASCII)
+    };
+
     Line::from(vec![
         Span::styled(label, Style::default().fg(Color::White)),
         Span::raw("["),
         Span::styled(
-            "█".repeat(filled as usize),
+            fill_char.repeat(filled as usize),
             Style::default().fg(Color::Green),
         ),
         Span::styled(
-            "░".repeat(empty as usize),
+            empty_char.repeat(empty as usize),
             Style::default().fg(Color::DarkGray),
         ),
         Span::raw("]"),
