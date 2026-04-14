@@ -1,11 +1,11 @@
 // General tab — CPU bars, memory bars, system info line.
 
 use ratatui::{
+    Frame,
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
-    Frame,
 };
 
 use crate::app::AppState;
@@ -67,7 +67,13 @@ fn draw_memory_bars(frame: &mut Frame, area: Rect, snapshot: &SystemSnapshot) {
     let mem = &snapshot.memory;
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    lines.push(make_bar_line("Mem", mem.used, mem.total, Color::Green, area.width));
+    lines.push(make_bar_line(
+        "Mem",
+        mem.used,
+        mem.total,
+        Color::Green,
+        area.width,
+    ));
 
     if mem.swap_total > 0 {
         lines.push(make_bar_line(
@@ -84,7 +90,13 @@ fn draw_memory_bars(frame: &mut Frame, area: Rect, snapshot: &SystemSnapshot) {
 }
 
 /// Build a single horizontal bar line (used for both RAM and Swap).
-fn make_bar_line(label: &str, used: u64, total: u64, fill_color: Color, width: u16) -> Line<'static> {
+fn make_bar_line(
+    label: &str,
+    used: u64,
+    total: u64,
+    fill_color: Color,
+    width: u16,
+) -> Line<'static> {
     let pct = if total > 0 {
         (used as f64 / total as f64 * 100.0).clamp(0.0, 100.0)
     } else {
@@ -102,10 +114,18 @@ fn make_bar_line(label: &str, used: u64, total: u64, fill_color: Color, width: u
     let empty = bar_w.saturating_sub(filled);
 
     Line::from(vec![
-        Span::styled(label_part, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            label_part,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw("["),
         Span::styled("█".repeat(filled as usize), Style::default().fg(fill_color)),
-        Span::styled("░".repeat(empty as usize), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "░".repeat(empty as usize),
+            Style::default().fg(Color::DarkGray),
+        ),
         Span::raw("]"),
         Span::styled(info, Style::default().fg(Color::Gray)),
     ])
@@ -123,8 +143,10 @@ fn draw_cpu_bars(frame: &mut Frame, area: Rect, snapshot: &SystemSnapshot) {
     }
 
     if cores.len() <= 16 {
-        let lines: Vec<Line<'static>> =
-            cores.iter().map(|c| make_cpu_bar_line(c, inner.width)).collect();
+        let lines: Vec<Line<'static>> = cores
+            .iter()
+            .map(|c| make_cpu_bar_line(c, inner.width))
+            .collect();
         frame.render_widget(Paragraph::new(lines), inner);
     } else {
         let [left_area, right_area] =
@@ -132,10 +154,14 @@ fn draw_cpu_bars(frame: &mut Frame, area: Rect, snapshot: &SystemSnapshot) {
                 .areas(inner);
 
         let mid = cores.len().div_ceil(2);
-        let left_lines: Vec<Line<'static>> =
-            cores[..mid].iter().map(|c| make_cpu_bar_line(c, left_area.width)).collect();
-        let right_lines: Vec<Line<'static>> =
-            cores[mid..].iter().map(|c| make_cpu_bar_line(c, right_area.width)).collect();
+        let left_lines: Vec<Line<'static>> = cores[..mid]
+            .iter()
+            .map(|c| make_cpu_bar_line(c, left_area.width))
+            .collect();
+        let right_lines: Vec<Line<'static>> = cores[mid..]
+            .iter()
+            .map(|c| make_cpu_bar_line(c, right_area.width))
+            .collect();
 
         frame.render_widget(Paragraph::new(left_lines), left_area);
         frame.render_widget(Paragraph::new(right_lines), right_area);
@@ -157,8 +183,14 @@ fn make_cpu_bar_line(core: &CoreSnapshot, width: u16) -> Line<'static> {
     Line::from(vec![
         Span::styled(label, Style::default().fg(Color::White)),
         Span::raw("["),
-        Span::styled("█".repeat(filled as usize), Style::default().fg(Color::Green)),
-        Span::styled("░".repeat(empty as usize), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "█".repeat(filled as usize),
+            Style::default().fg(Color::Green),
+        ),
+        Span::styled(
+            "░".repeat(empty as usize),
+            Style::default().fg(Color::DarkGray),
+        ),
         Span::raw("]"),
         Span::styled(info, Style::default().fg(Color::Gray)),
     ])
@@ -168,7 +200,7 @@ fn make_cpu_bar_line(core: &CoreSnapshot, width: u16) -> Line<'static> {
 mod tests {
     use super::*;
     use crate::app::AppState;
-    use ratatui::{backend::TestBackend, Terminal};
+    use ratatui::{Terminal, backend::TestBackend};
 
     fn render_with(app: &AppState, width: u16, height: u16) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(width, height);
@@ -229,7 +261,10 @@ mod tests {
         }
 
         SystemSnapshot {
-            cpu: CpuSnapshot { global_usage: 42.5, cores },
+            cpu: CpuSnapshot {
+                global_usage: 42.5,
+                cores,
+            },
             memory: MemorySnapshot {
                 total: 16_000_000_000,
                 used: 8_000_000_000,
@@ -322,7 +357,10 @@ mod tests {
     #[test]
     fn test_format_bytes_gb() {
         let result = format_bytes_gb(16_000_000_000);
-        assert!(result.contains('.'), "Should contain decimal point: {result}");
+        assert!(
+            result.contains('.'),
+            "Should contain decimal point: {result}"
+        );
         assert!(!result.is_empty());
     }
 
