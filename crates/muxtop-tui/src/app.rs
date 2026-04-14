@@ -3,8 +3,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
 use muxtop_core::process::{
-    build_process_tree, filter_processes, flatten_tree, sort_processes, ProcessInfo, SortField,
-    SortOrder,
+    ProcessInfo, SortField, SortOrder, build_process_tree, filter_processes, flatten_tree,
+    sort_processes,
 };
 use muxtop_core::system::SystemSnapshot;
 
@@ -138,9 +138,8 @@ impl AppState {
         // Tree — only build when tree_mode is active (G-09: skip when off).
         // G-07: tree is built from filtered list, not raw snapshot.
         if self.tree_mode {
-            let tree = build_process_tree(
-                &filter_processes(&snapshot.processes, &self.filter_input),
-            );
+            let tree =
+                build_process_tree(&filter_processes(&snapshot.processes, &self.filter_input));
             self.visible_tree = flatten_tree(&tree);
         } else {
             self.visible_tree.clear();
@@ -178,6 +177,14 @@ impl AppState {
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.selected = self.selected.saturating_sub(1);
+            }
+            KeyCode::PageDown => {
+                if self.process_count() > 0 {
+                    self.selected = (self.selected + 20).min(self.process_count() - 1);
+                }
+            }
+            KeyCode::PageUp => {
+                self.selected = self.selected.saturating_sub(20);
             }
             KeyCode::Home | KeyCode::Char('g') => {
                 self.selected = 0;
@@ -234,11 +241,26 @@ impl AppState {
             }
 
             // F-key sort shortcuts
-            KeyCode::F(1) => { self.sort_field = SortField::Pid; self.recompute_visible(); }
-            KeyCode::F(2) => { self.sort_field = SortField::Name; self.recompute_visible(); }
-            KeyCode::F(3) => { self.sort_field = SortField::Cpu; self.recompute_visible(); }
-            KeyCode::F(4) => { self.sort_field = SortField::Mem; self.recompute_visible(); }
-            KeyCode::F(5) => { self.sort_field = SortField::User; self.recompute_visible(); }
+            KeyCode::F(1) => {
+                self.sort_field = SortField::Pid;
+                self.recompute_visible();
+            }
+            KeyCode::F(2) => {
+                self.sort_field = SortField::Name;
+                self.recompute_visible();
+            }
+            KeyCode::F(3) => {
+                self.sort_field = SortField::Cpu;
+                self.recompute_visible();
+            }
+            KeyCode::F(4) => {
+                self.sort_field = SortField::Mem;
+                self.recompute_visible();
+            }
+            KeyCode::F(5) => {
+                self.sort_field = SortField::User;
+                self.recompute_visible();
+            }
 
             // Filter mode
             KeyCode::Char('/') => {
@@ -445,7 +467,11 @@ mod tests {
             make_process(3, "mid", 50.0, 300),
         ]);
         app.apply_snapshot(snap);
-        let cpus: Vec<f32> = app.visible_processes.iter().map(|p| p.cpu_percent).collect();
+        let cpus: Vec<f32> = app
+            .visible_processes
+            .iter()
+            .map(|p| p.cpu_percent)
+            .collect();
         assert_eq!(cpus, vec![90.0, 50.0, 10.0]);
     }
 
@@ -460,7 +486,11 @@ mod tests {
         ]);
         app.apply_snapshot(snap);
         assert_eq!(app.visible_processes.len(), 2);
-        assert!(app.visible_processes.iter().all(|p| p.name.contains("fire")));
+        assert!(
+            app.visible_processes
+                .iter()
+                .all(|p| p.name.contains("fire"))
+        );
     }
 
     #[test]
