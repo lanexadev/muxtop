@@ -13,6 +13,9 @@ use muxtop_core::process::{
 };
 use muxtop_core::system::SystemSnapshot;
 
+use crate::CliConfig;
+use crate::terminal::TermCaps;
+
 // ---------------------------------------------------------------------------
 // Confirm dialog
 // ---------------------------------------------------------------------------
@@ -275,6 +278,8 @@ pub struct AppState {
     pub confirm: Option<ConfirmAction>,
     /// Status message with creation time (auto-clears after timeout).
     pub status_message: Option<(String, Instant)>,
+    /// Detected terminal capabilities.
+    pub term_caps: TermCaps,
     running: bool,
     pub last_snapshot: Option<SystemSnapshot>,
     /// Derived: sorted + filtered process list.
@@ -304,10 +309,22 @@ impl AppState {
             palette: PaletteState::new(),
             confirm: None,
             status_message: None,
+            term_caps: TermCaps::default(),
             running: true,
             last_snapshot: None,
             visible_processes: Vec::new(),
             visible_tree: Vec::new(),
+        }
+    }
+
+    /// Create AppState from CLI configuration and detected terminal capabilities.
+    pub fn with_config(config: CliConfig, term_caps: TermCaps) -> Self {
+        Self {
+            sort_field: config.sort_field,
+            tree_mode: config.tree_mode,
+            filter_input: config.filter.unwrap_or_default(),
+            term_caps,
+            ..Self::new()
         }
     }
 

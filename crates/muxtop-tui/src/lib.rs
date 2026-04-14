@@ -7,18 +7,44 @@ pub mod ui;
 pub use app::{AppState, Command, ConfirmAction, PaletteState, Tab};
 pub use error::TuiError;
 pub use event::{Event, EventHandler, TICK_RATE};
-pub use terminal::{TerminalGuard, Tui, init_terminal, install_panic_hook, restore_terminal};
+pub use terminal::{
+    ColorSupport, TermCaps, TerminalGuard, Tui, detect_terminal_caps, init_terminal,
+    install_panic_hook, restore_terminal,
+};
 
+use muxtop_core::process::SortField;
 use muxtop_core::system::SystemSnapshot;
 use tokio::sync::mpsc;
+
+/// Configuration passed from CLI arguments to the TUI.
+#[derive(Debug, Clone)]
+pub struct CliConfig {
+    /// Initial process filter pattern (from `--filter`).
+    pub filter: Option<String>,
+    /// Initial sort field (from `--sort`).
+    pub sort_field: SortField,
+    /// Start in tree view mode (from `--tree`).
+    pub tree_mode: bool,
+}
+
+impl Default for CliConfig {
+    fn default() -> Self {
+        Self {
+            filter: None,
+            sort_field: SortField::Cpu,
+            tree_mode: false,
+        }
+    }
+}
 
 /// Run the TUI event loop. Blocks until the user quits.
 /// The TerminalGuard ensures the terminal is restored on any exit path
 /// (normal return, error propagation via ?, or panic unwind).
-pub fn run(rx: mpsc::Receiver<SystemSnapshot>) -> Result<(), TuiError> {
+pub fn run(rx: mpsc::Receiver<SystemSnapshot>, config: CliConfig) -> Result<(), TuiError> {
     install_panic_hook();
     let mut guard = init_terminal()?;
-    let mut app = app::AppState::new();
+    let term_caps = detect_terminal_caps();
+    let mut app = app::AppState::with_config(config, term_caps);
     let mut handler = EventHandler::new(rx);
 
     while app.running() {
