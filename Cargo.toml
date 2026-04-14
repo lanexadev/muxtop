@@ -46,6 +46,9 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # Utilities
 dirs = "6"
 
+# Benchmarking
+criterion = { version = "0.5", features = ["html_reports"] }
+
 # Internal crates
 muxtop-core = { path = "crates/muxtop-core" }
 muxtop-tui = { path = "crates/muxtop-tui" }
