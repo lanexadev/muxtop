@@ -2,6 +2,7 @@ pub mod app;
 pub mod error;
 pub mod event;
 pub mod terminal;
+pub mod ui;
 
 pub use app::{AppState, Tab};
 pub use error::TuiError;
@@ -21,8 +22,7 @@ pub fn run(rx: mpsc::Receiver<SystemSnapshot>) -> Result<(), TuiError> {
     let mut handler = EventHandler::new(rx);
 
     while app.running() {
-        // Draw placeholder (empty frame — rendering comes in Epic 3+)
-        guard.0.draw(|_frame| {})?;
+        guard.0.draw(|frame| ui::draw_root(frame, &app))?;
 
         match handler.poll_event()? {
             Event::Key(key) => app.handle_key_event(key),

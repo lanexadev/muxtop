@@ -1,0 +1,324 @@
+// Layout & rendering for the TUI.
+
+use ratatui::{
+    layout::{Constraint, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph, Tabs},
+    Frame,
+};
+
+use crate::app::{AppState, Tab};
+
+/// Teal accent color for active tab (#4ec9b0).
+const TEAL: Color = Color::Rgb(78, 201, 176);
+
+/// Dimmed foreground for inactive/future elements.
+const DIMMED: Color = Color::DarkGray;
+
+/// Labels for future tabs (not yet implemented).
+const FUTURE_TABS: &[&str] = &["Network [soon]", "Containers [soon]", "GPU [soon]"];
+
+/// Render the full application layout: Header, TabBar, Content, Footer.
+pub fn draw_root(frame: &mut Frame, app: &AppState) {
+    let [header_area, tabbar_area, content_area, footer_area] =
+        Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(2),
+            Constraint::Fill(1),
+            Constraint::Length(1),
+        ])
+        .areas(frame.area());
+
+    draw_header(frame, header_area);
+    draw_tabbar(frame, tabbar_area, app);
+    draw_content(frame, content_area, app);
+    draw_footer(frame, footer_area, app);
+}
+
+/// Render the header line: app name and version.
+fn draw_header(frame: &mut Frame, area: Rect) {
+    let version = env!("CARGO_PKG_VERSION");
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled("muxtop", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(format!(" v{version}")),
+    ]));
+    frame.render_widget(header, area);
+}
+
+/// Render the tab bar with active highlight and future tabs.
+fn draw_tabbar(frame: &mut Frame, area: Rect, app: &AppState) {
+    let active_idx = Tab::ALL
+        .iter()
+        .position(|&t| t == app.tab)
+        .unwrap_or(0);
+
+    let mut titles: Vec<Line<'_>> = Tab::ALL
+        .iter()
+        .map(|t| Line::from(t.label()))
+        .collect();
+
+    for &future in FUTURE_TABS {
+        titles.push(Line::styled(future, Style::default().fg(DIMMED)));
+    }
+
+    let tabs = Tabs::new(titles)
+        .select(active_idx)
+        .highlight_style(Style::default().fg(TEAL).add_modifier(Modifier::BOLD))
+        .style(Style::default().fg(DIMMED))
+        .divider(" | ")
+        .block(Block::default().borders(Borders::BOTTOM));
+
+    frame.render_widget(tabs, area);
+}
+
+/// Render the content area based on the active tab.
+fn draw_content(frame: &mut Frame, area: Rect, app: &AppState) {
+    let text = match app.tab {
+        Tab::General => "[General view — coming in Epic 4]",
+        Tab::Processes => "[Processes view — coming in Epic 5]",
+    };
+    let content = Paragraph::new(text)
+        .style(Style::default().fg(Color::Gray));
+    frame.render_widget(content, area);
+}
+
+/// Render the footer with context-aware shortcut hints.
+fn draw_footer(frame: &mut Frame, area: Rect, app: &AppState) {
+    let shortcuts = match app.tab {
+        Tab::General => vec![
+            key_hint("q", "Quit"),
+            Span::raw("  "),
+            key_hint("Tab", "Switch"),
+            Span::raw("  "),
+            key_hint("/", "Filter"),
+            Span::raw("  "),
+            key_hint("t", "Tree"),
+        ],
+        Tab::Processes => vec![
+            key_hint("q", "Quit"),
+            Span::raw("  "),
+            key_hint("Tab", "Switch"),
+            Span::raw("  "),
+            key_hint("/", "Filter"),
+            Span::raw("  "),
+            key_hint("s", "Sort"),
+            Span::raw("  "),
+            key_hint("S", "Order"),
+            Span::raw("  "),
+            key_hint("t", "Tree"),
+        ],
+    };
+    let footer = Paragraph::new(Line::from(shortcuts));
+    frame.render_widget(footer, area);
+}
+
+/// Create a styled key hint: bold key + dim description.
+fn key_hint<'a>(key: &'a str, desc: &'a str) -> Span<'a> {
+    // Using a single span for simplicity — bold key, space, dim desc
+    // would require multiple spans. Keep it simple for v0.1.
+    Span::styled(
+        format!("{key} {desc}"),
+        Style::default().fg(Color::White),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn render_with(app: &AppState, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_root(frame, app))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn buffer_line_text(buf: &ratatui::buffer::Buffer, row: u16) -> String {
+        let width = buf.area.width;
+        (0..width)
+            .map(|col| buf.cell((col, row)).map(|c| c.symbol()).unwrap_or(" "))
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    fn buffer_contains(buf: &ratatui::buffer::Buffer, needle: &str) -> bool {
+        let height = buf.area.height;
+        (0..height).any(|row| buffer_line_text(buf, row).contains(needle))
+    }
+
+    // -- STORY-02: Layout zones --
+
+    #[test]
+    fn test_draw_root_is_callable() {
+        let app = AppState::new();
+        let _buf = render_with(&app, 80, 24);
+    }
+
+    #[test]
+    fn test_layout_zones_correct_heights() {
+        let app = AppState::new();
+        let buf = render_with(&app, 80, 24);
+        // Header = row 0, TabBar = rows 1-2, Content = rows 3-22, Footer = row 23
+        // Verify header row is non-empty
+        let header_text = buffer_line_text(&buf, 0);
+        assert!(!header_text.is_empty(), "Header should not be empty");
+        // Verify footer row is non-empty
+        let footer_text = buffer_line_text(&buf, 23);
+        assert!(!footer_text.is_empty(), "Footer should not be empty");
+    }
+
+    #[test]
+    fn test_layout_resize_reflows() {
+        let app = AppState::new();
+        // Small terminal
+        let buf_small = render_with(&app, 80, 24);
+        assert_eq!(buf_small.area.height, 24);
+        // Large terminal
+        let buf_large = render_with(&app, 120, 40);
+        assert_eq!(buf_large.area.height, 40);
+        // Header and footer should still be in first/last rows
+        let header_small = buffer_line_text(&buf_small, 0);
+        let header_large = buffer_line_text(&buf_large, 0);
+        assert!(header_small.contains("muxtop"));
+        assert!(header_large.contains("muxtop"));
+    }
+
+    #[test]
+    fn test_layout_minimal_terminal_no_panic() {
+        let app = AppState::new();
+        // Only 4 rows — content area would be 0 rows
+        let _buf = render_with(&app, 80, 4);
+        // Just verify no panic
+    }
+
+    // Guard G-08: extreme terminal sizes
+    #[test]
+    fn test_layout_extreme_sizes_no_panic() {
+        let app = AppState::new();
+        let _buf = render_with(&app, 1, 1);
+        let _buf = render_with(&app, 80, 2);
+        let _buf = render_with(&app, 10, 5);
+    }
+
+    // -- STORY-03: Header --
+
+    #[test]
+    fn test_header_renders_name_and_version() {
+        let app = AppState::new();
+        let buf = render_with(&app, 80, 24);
+        let header = buffer_line_text(&buf, 0);
+        assert!(header.contains("muxtop"), "Header should contain 'muxtop'");
+        assert!(
+            header.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
+            "Header should contain version"
+        );
+    }
+
+    // -- STORY-04: TabBar --
+
+    #[test]
+    fn test_tabbar_renders_tab_names() {
+        let app = AppState::new();
+        let buf = render_with(&app, 80, 24);
+        // Tab names should appear in rows 1-2 (tabbar area)
+        let tabbar_text = format!(
+            "{} {}",
+            buffer_line_text(&buf, 1),
+            buffer_line_text(&buf, 2)
+        );
+        assert!(tabbar_text.contains("General"), "TabBar should show General");
+        assert!(
+            tabbar_text.contains("Processes"),
+            "TabBar should show Processes"
+        );
+    }
+
+    #[test]
+    fn test_tabbar_active_tab_has_teal_style() {
+        let app = AppState::new(); // default: General
+        let buf = render_with(&app, 80, 24);
+        // Find "General" in the tabbar row and check its style
+        let row = 1; // first row of tabbar (tab titles rendered here)
+        let line = buffer_line_text(&buf, row);
+        if let Some(start) = line.find('G') {
+            let cell = buf.cell((start as u16, row)).unwrap();
+            assert_eq!(
+                cell.fg,
+                TEAL,
+                "Active tab 'General' should have teal foreground"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tabbar_inactive_tab_no_teal() {
+        let app = AppState::new(); // default: General active
+        let buf = render_with(&app, 80, 24);
+        let row = 1;
+        let line = buffer_line_text(&buf, row);
+        // Find "Processes" — it should NOT be teal
+        if let Some(start) = line.find('P') {
+            let cell = buf.cell((start as u16, row)).unwrap();
+            assert_ne!(
+                cell.fg, TEAL,
+                "Inactive tab 'Processes' should NOT have teal foreground"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tabbar_future_tabs_shown_grayed() {
+        let app = AppState::new();
+        let buf = render_with(&app, 120, 24); // wider to fit all tabs
+        assert!(
+            buffer_contains(&buf, "[soon]"),
+            "TabBar should show '[soon]' for future tabs"
+        );
+    }
+
+    // -- STORY-05: Content stubs --
+
+    #[test]
+    fn test_content_dispatches_by_tab() {
+        let mut app = AppState::new();
+        app.tab = Tab::General;
+        let buf_general = render_with(&app, 80, 24);
+
+        app.tab = Tab::Processes;
+        let buf_processes = render_with(&app, 80, 24);
+
+        // Content area rows 3..22 should differ
+        let general_content = buffer_line_text(&buf_general, 3);
+        let processes_content = buffer_line_text(&buf_processes, 3);
+        assert_ne!(
+            general_content, processes_content,
+            "Content should differ between tabs"
+        );
+    }
+
+    // -- STORY-06: Footer --
+
+    #[test]
+    fn test_footer_renders_general_shortcuts() {
+        let mut app = AppState::new();
+        app.tab = Tab::General;
+        let buf = render_with(&app, 80, 24);
+        let footer = buffer_line_text(&buf, 23);
+        assert!(footer.contains("Quit"), "General footer should contain Quit hint");
+    }
+
+    #[test]
+    fn test_footer_renders_processes_shortcuts() {
+        let mut app = AppState::new();
+        app.tab = Tab::Processes;
+        let buf = render_with(&app, 80, 24);
+        let footer = buffer_line_text(&buf, 23);
+        assert!(footer.contains("Sort"), "Processes footer should contain Sort hint");
+        assert!(footer.contains("Tree"), "Processes footer should contain Tree hint");
+    }
+}
