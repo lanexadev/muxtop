@@ -1,0 +1,16 @@
+[package]
+name = "muxtop-tui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Terminal UI for muxtop"
+rust-version.workspace = true
+
+[dependencies]
+muxtop-core = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

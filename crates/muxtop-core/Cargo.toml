@@ -1,0 +1,15 @@
+[package]
+name = "muxtop-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core data collection engine for muxtop"
+rust-version.workspace = true
+
+[dependencies]
+sysinfo = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
