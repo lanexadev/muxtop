@@ -3,18 +3,16 @@
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
+use super::theme::Theme;
 use crate::app::AppState;
 
-/// Yellow accent for warning dialogs.
-const YELLOW: Color = Color::Rgb(229, 192, 123);
-
 /// Render the confirmation dialog as a centered overlay.
-pub fn draw_confirm(frame: &mut Frame, app: &AppState) {
+pub fn draw_confirm(frame: &mut Frame, app: &AppState, theme: &Theme) {
     let Some(ref action) = app.confirm else {
         return;
     };
@@ -37,11 +35,18 @@ pub fn draw_confirm(frame: &mut Frame, app: &AppState) {
 
     let block = Block::default()
         .title(" Confirm ")
-        .title_style(Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(theme.bg)
+                .bg(theme.warning)
+                .add_modifier(Modifier::BOLD),
+        )
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(YELLOW));
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Style::default().fg(theme.warning).bg(theme.bg));
 
     let inner = block.inner(popup);
+    frame.render_widget(Clear, popup); // Clear must be matched precisely to widget bounds.
     frame.render_widget(block, popup);
 
     if inner.height == 0 || inner.width == 0 {
@@ -50,7 +55,7 @@ pub fn draw_confirm(frame: &mut Frame, app: &AppState) {
 
     let line = Line::from(vec![Span::styled(
         format!(" {prompt}"),
-        Style::default().fg(Color::White),
+        Style::default().fg(theme.fg),
     )]);
 
     frame.render_widget(Paragraph::new(line), inner);

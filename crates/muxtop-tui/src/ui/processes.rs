@@ -5,9 +5,10 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Block, Borders, Paragraph},
 };
 
+use super::theme::Theme;
 use crate::app::AppState;
 use muxtop_core::process::{ProcessInfo, SortField, SortOrder};
 
@@ -20,32 +21,39 @@ const COL_MEM: usize = 7;
 const FIXED_COLS: usize = COL_PID + COL_USER + COL_STATUS + COL_CPU + COL_MEM;
 
 /// Render the Processes tab content area.
-pub fn draw_processes_tab(frame: &mut Frame, area: Rect, app: &AppState) {
+pub fn draw_processes_tab(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
     if app.last_snapshot.is_none() {
         let para = Paragraph::new("Waiting for data...").alignment(Alignment::Center);
         frame.render_widget(para, area);
         return;
     }
 
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Style::default().fg(theme.text_dim));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
     let filter_h = u16::from(app.filter_active);
     let [table_area, filter_area] =
-        Layout::vertical([Constraint::Fill(1), Constraint::Length(filter_h)]).areas(area);
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(filter_h)]).areas(inner);
 
     if table_area.height >= 2 {
         let [header_area, body_area] =
             Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(table_area);
 
-        draw_header(frame, header_area, app);
-        draw_body(frame, body_area, app);
+        draw_header(frame, header_area, app, theme);
+        draw_body(frame, body_area, app, theme);
     }
 
     if app.filter_active {
-        draw_filter_bar(frame, filter_area, app);
+        draw_filter_bar(frame, filter_area, app, theme);
     }
 }
 
 /// Render the column header row with a sort indicator on the active column.
-fn draw_header(frame: &mut Frame, area: Rect, app: &AppState) {
+fn draw_header(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
     let arrow = if app.term_caps.unicode {
         match app.sort_order {
             SortOrder::Desc => "▼",
@@ -59,8 +67,8 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &AppState) {
     };
     let cmd_w = (area.width as usize).saturating_sub(FIXED_COLS);
     let style = Style::default()
-        .fg(Color::Black)
-        .bg(Color::White)
+        .fg(theme.accent_primary)
+        .bg(theme.header_bg)
         .add_modifier(Modifier::BOLD);
 
     let header = format!(
@@ -95,7 +103,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &AppState) {
 }
 
 /// Render the process rows with virtualized scrolling.
-fn draw_body(frame: &mut Frame, area: Rect, app: &AppState) {
+fn draw_body(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
     let vis_h = area.height as usize;
     if vis_h == 0 {
         return;
@@ -111,14 +119,32 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &AppState) {
         (scroll..end)
             .map(|i| {
                 let pfx = tree_prefix_with_unicode(entries, i, unicode);
-                process_row(&entries[i].0, cmd_w, i == app.selected, Some(&pfx))
+                process_row(
+                    &entries[i].0,
+                    cmd_w,
+                    i == app.selected,
+                    Some(&pfx),
+                    theme,
+                    unicode,
+                    i,
+                )
             })
             .collect()
     } else {
         let entries = &app.visible_processes;
         let end = (scroll + vis_h).min(entries.len());
         (scroll..end)
-            .map(|i| process_row(&entries[i], cmd_w, i == app.selected, None))
+            .map(|i| {
+                process_row(
+                    &entries[i],
+                    cmd_w,
+                    i == app.selected,
+                    None,
+                    theme,
+                    unicode,
+                    i,
+                )
+            })
             .collect()
     };
 
@@ -126,18 +152,18 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &AppState) {
 }
 
 /// Render the filter input bar at the bottom of the content area.
-fn draw_filter_bar(frame: &mut Frame, area: Rect, app: &AppState) {
+fn draw_filter_bar(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
     let cursor = if app.term_caps.unicode { "█" } else { "_" };
     let line = Line::from(vec![
         Span::styled(
             "Filter: ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme.accent_primary)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("{}{cursor}", app.filter_input),
-            Style::default().fg(Color::White),
+            Style::default().fg(theme.fg),
         ),
     ]);
     frame.render_widget(Paragraph::new(line), area);
@@ -153,24 +179,37 @@ fn process_row(
     cmd_w: usize,
     selected: bool,
     tree_pfx: Option<&str>,
+    theme: &Theme,
+    unicode: bool,
+    row_idx: usize,
 ) -> Line<'static> {
-    let (sc, sc_color) = status_style(&proc.status);
+    let (sc, sc_color) = status_style(&proc.status, theme, unicode);
     let cmd_text = match tree_pfx {
         Some(pfx) => format!("{pfx}{}", proc.command),
         None => proc.command.clone(),
     };
 
     let bg = if selected {
-        Color::DarkGray
+        theme.selection_bg
+    } else if row_idx % 2 == 1 {
+        theme.surface
     } else {
-        Color::Reset
+        theme.bg
     };
-    let fg = if selected { Color::White } else { Color::Reset };
-    let base = Style::default().bg(bg).fg(fg);
-    let st = if selected {
-        base
+    let fg = if selected {
+        theme.selection_fg
     } else {
-        Style::default().fg(sc_color)
+        theme.fg
+    };
+    let base = if selected {
+        Style::default().bg(bg).fg(fg).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().bg(bg).fg(fg)
+    };
+    let st = if selected {
+        base.fg(sc_color)
+    } else {
+        Style::default().fg(sc_color).bg(bg)
     };
 
     Line::from(vec![
@@ -220,13 +259,23 @@ fn effective_scroll(selected: usize, scroll_offset: usize, visible_height: usize
 }
 
 /// Map a process status string to a single character and color.
-fn status_style(status: &str) -> (char, Color) {
-    match status {
-        "Running" => ('R', Color::Green),
-        "Sleeping" | "Idle" => ('S', Color::DarkGray),
-        "Zombie" => ('Z', Color::Red),
-        "Stopped" => ('T', Color::Yellow),
-        _ => ('?', Color::Gray),
+fn status_style(status: &str, theme: &Theme, unicode: bool) -> (char, Color) {
+    if unicode {
+        match status {
+            "Running" => ('●', theme.success),
+            "Sleeping" | "Idle" => ('○', theme.sleeping),
+            "Zombie" => ('⚠', theme.danger),
+            "Stopped" => ('⏸', theme.warning),
+            _ => ('?', theme.text_dim),
+        }
+    } else {
+        match status {
+            "Running" => ('R', theme.success),
+            "Sleeping" | "Idle" => ('S', theme.sleeping),
+            "Zombie" => ('Z', theme.danger),
+            "Stopped" => ('T', theme.warning),
+            _ => ('?', theme.text_dim),
+        }
     }
 }
 
@@ -390,34 +439,39 @@ mod tests {
 
     #[test]
     fn test_status_running() {
-        let (c, color) = status_style("Running");
+        let theme = super::super::theme::Theme::default();
+        let (c, color) = status_style("Running", &theme, false);
         assert_eq!(c, 'R');
-        assert_eq!(color, Color::Green);
+        assert_eq!(color, theme.success);
     }
 
     #[test]
     fn test_status_sleeping() {
-        let (c, _) = status_style("Sleeping");
+        let theme = super::super::theme::Theme::default();
+        let (c, _) = status_style("Sleeping", &theme, false);
         assert_eq!(c, 'S');
     }
 
     #[test]
     fn test_status_zombie() {
-        let (c, color) = status_style("Zombie");
+        let theme = super::super::theme::Theme::default();
+        let (c, color) = status_style("Zombie", &theme, false);
         assert_eq!(c, 'Z');
-        assert_eq!(color, Color::Red);
+        assert_eq!(color, theme.danger);
     }
 
     #[test]
     fn test_status_stopped() {
-        let (c, color) = status_style("Stopped");
+        let theme = super::super::theme::Theme::default();
+        let (c, color) = status_style("Stopped", &theme, false);
         assert_eq!(c, 'T');
-        assert_eq!(color, Color::Yellow);
+        assert_eq!(color, theme.warning);
     }
 
     #[test]
     fn test_status_unknown() {
-        let (c, _) = status_style("SomethingElse");
+        let theme = super::super::theme::Theme::default();
+        let (c, _) = status_style("SomethingElse", &theme, false);
         assert_eq!(c, '?');
     }
 
@@ -558,13 +612,12 @@ mod tests {
         ]);
         app.selected = 0;
         let buf = render_with(&app, 80, 24);
-        // Row 3 = table header (in content area after header+tabbar)
-        // Row 4 = first data row (selected)
-        let cell = buf.cell((1, 4)).unwrap();
+        // The table is bordered, so row 3 is the top border, row 4 is header, row 5 is selected process data.
+        let cell = buf.cell((2, 5)).unwrap(); // column 2 just inside border
+        let theme = super::super::theme::Theme::default();
         assert_eq!(
-            cell.bg,
-            Color::DarkGray,
-            "Selected row should have DarkGray background"
+            cell.bg, theme.selection_bg,
+            "Selected row should have selection background"
         );
     }
 
@@ -723,6 +776,6 @@ mod tests {
         proc.status = "Zombie".to_string();
         let app = processes_app(vec![proc]);
         let buf = render_with(&app, 80, 24);
-        assert!(buffer_contains(&buf, "Z"));
+        assert!(buffer_contains(&buf, "⚠") || buffer_contains(&buf, "Z"));
     }
 }

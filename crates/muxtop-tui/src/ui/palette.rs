@@ -3,18 +3,16 @@
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
+use super::theme::Theme;
 use crate::app::AppState;
 
-/// Teal accent color (matches tab bar).
-const TEAL: Color = Color::Rgb(78, 201, 176);
-
 /// Render the command palette as a centered overlay.
-pub fn draw_palette(frame: &mut Frame, app: &AppState) {
+pub fn draw_palette(frame: &mut Frame, app: &AppState, theme: &Theme) {
     let area = frame.area();
 
     // Palette dimensions: 60 wide (or area width - 4), up to 16 tall.
@@ -40,12 +38,17 @@ pub fn draw_palette(frame: &mut Frame, app: &AppState) {
     // Clear the area behind the popup.
     frame.render_widget(Clear, popup);
 
-    // Draw the border.
     let block = Block::default()
         .title(" Command Palette ")
-        .title_style(Style::default().fg(TEAL).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(theme.bg)
+                .bg(theme.accent_primary)
+                .add_modifier(Modifier::BOLD),
+        )
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(TEAL));
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Style::default().fg(theme.accent_primary).bg(theme.bg));
 
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
@@ -63,7 +66,7 @@ pub fn draw_palette(frame: &mut Frame, app: &AppState) {
     let input_text = format!("> {}\u{2588}", app.palette.input); // block cursor
     let input_line = Paragraph::new(Line::from(Span::styled(
         input_text,
-        Style::default().fg(Color::White),
+        Style::default().fg(theme.fg),
     )));
     frame.render_widget(input_line, input_area);
 
@@ -72,7 +75,7 @@ pub fn draw_palette(frame: &mut Frame, app: &AppState) {
         if results_area.height > 0 {
             let no_match = Paragraph::new(Line::from(Span::styled(
                 "  No matches",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.text_dim),
             )));
             frame.render_widget(no_match, results_area);
         }
@@ -112,15 +115,17 @@ pub fn draw_palette(frame: &mut Frame, app: &AppState) {
         let (label_style, shortcut_style) = if is_selected {
             (
                 Style::default()
-                    .fg(TEAL)
+                    .fg(theme.selection_fg)
                     .add_modifier(Modifier::BOLD)
-                    .bg(Color::DarkGray),
-                Style::default().fg(Color::White).bg(Color::DarkGray),
+                    .bg(theme.selection_bg),
+                Style::default()
+                    .fg(theme.selection_fg)
+                    .bg(theme.selection_bg),
             )
         } else {
             (
-                Style::default().fg(Color::White),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.fg),
+                Style::default().fg(theme.text_dim),
             )
         };
 
@@ -137,7 +142,7 @@ pub fn draw_palette(frame: &mut Frame, app: &AppState) {
             Span::styled(
                 padding,
                 if is_selected {
-                    Style::default().bg(Color::DarkGray)
+                    Style::default().bg(theme.selection_bg)
                 } else {
                     Style::default()
                 },
@@ -148,7 +153,7 @@ pub fn draw_palette(frame: &mut Frame, app: &AppState) {
         // For selected row, fill the background.
         if is_selected {
             let bg = Paragraph::new(Line::from(" ".repeat(row_area.width as usize)))
-                .style(Style::default().bg(Color::DarkGray));
+                .style(Style::default().bg(theme.selection_bg));
             frame.render_widget(bg, row_area);
         }
 
