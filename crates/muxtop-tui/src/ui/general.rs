@@ -8,11 +8,12 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
+use super::theme::Theme;
 use crate::app::AppState;
 use muxtop_core::system::{CoreSnapshot, SystemSnapshot};
 
 /// Render the General tab content area.
-pub fn draw_general_tab(frame: &mut Frame, area: Rect, app: &AppState) {
+pub fn draw_general_tab(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
     let Some(ref snapshot) = app.last_snapshot else {
         let para = Paragraph::new("Waiting for data...").alignment(Alignment::Center);
         frame.render_widget(para, area);
@@ -21,16 +22,29 @@ pub fn draw_general_tab(frame: &mut Frame, area: Rect, app: &AppState) {
 
     let unicode = app.term_caps.unicode;
 
-    let [cpu_area, mem_area, info_area] = Layout::vertical([
-        Constraint::Min(3),
-        Constraint::Length(2),
-        Constraint::Length(1),
-    ])
-    .areas(area);
+    // Compute heights dynamically to avoid wasted empty space.
+    let n_cores = snapshot.cpu.cores.len();
+    let cpu_h = if n_cores == 0 {
+        3
+    } else if n_cores <= 16 {
+        n_cores as u16 + 2 // cores + border top/bottom
+    } else {
+        (n_cores.div_ceil(2)) as u16 + 2 // two-column layout
+    };
+    let has_swap = snapshot.memory.swap_total > 0;
+    let mem_h = if has_swap { 4 } else { 3 }; // border(2) + RAM(1) + optional Swap(1)
 
-    draw_cpu_bars(frame, cpu_area, snapshot, unicode);
-    draw_memory_bars(frame, mem_area, snapshot, unicode);
-    draw_system_info(frame, info_area, snapshot);
+    let chunks = Layout::vertical([
+        Constraint::Length(cpu_h),
+        Constraint::Length(mem_h),
+        Constraint::Length(1),
+        Constraint::Min(0), // absorb remaining space
+    ])
+    .split(area);
+
+    draw_cpu_bars(frame, chunks[0], snapshot, unicode, theme);
+    draw_memory_bars(frame, chunks[1], snapshot, unicode, theme);
+    draw_system_info(frame, chunks[2], snapshot, theme);
 }
 
 /// Format uptime in seconds as "Xd Yh Zm".
@@ -42,7 +56,7 @@ fn format_uptime(secs: u64) -> String {
 }
 
 /// Render a single-line system info bar: uptime, load averages, task counts.
-fn draw_system_info(frame: &mut Frame, area: Rect, snapshot: &SystemSnapshot) {
+fn draw_system_info(frame: &mut Frame, area: Rect, snapshot: &SystemSnapshot, theme: &Theme) {
     let running = snapshot
         .processes
         .iter()
@@ -50,11 +64,30 @@ fn draw_system_info(frame: &mut Frame, area: Rect, snapshot: &SystemSnapshot) {
         .count();
     let total = snapshot.processes.len();
     let uptime = format_uptime(snapshot.load.uptime_secs);
-    let text = format!(
-        "Uptime: {uptime} | Load: {:.2} {:.2} {:.2} | Tasks: {total} ({running} running)",
-        snapshot.load.one, snapshot.load.five, snapshot.load.fifteen,
-    );
-    let para = Paragraph::new(text).style(Style::default().fg(Color::Gray));
+
+    let line = Line::from(vec![
+        Span::styled(
+            format!(" Uptime: {uptime} "),
+            Style::default()
+                .fg(theme.fg)
+                .bg(theme.selection_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("   "),
+        Span::styled(
+            format!(
+                " Load: {:.2} {:.2} {:.2} ",
+                snapshot.load.one, snapshot.load.five, snapshot.load.fifteen
+            ),
+            Style::default().fg(theme.fg).bg(theme.selection_bg),
+        ),
+        Span::raw("   "),
+        Span::styled(
+            format!(" Tasks: {total} ({running} running) "),
+            Style::default().fg(theme.fg).bg(theme.selection_bg),
+        ),
+    ]);
+    let para = Paragraph::new(line).style(Style::default().bg(theme.bg));
     frame.render_widget(para, area);
 }
 
@@ -64,33 +97,64 @@ fn format_bytes_gb(bytes: u64) -> String {
     format!("{gib:.1}")
 }
 
-/// Render RAM bar and optional Swap bar.
-fn draw_memory_bars(frame: &mut Frame, area: Rect, snapshot: &SystemSnapshot, unicode: bool) {
+/// Render RAM bar and optional Swap bar inside a bordered block.
+fn draw_memory_bars(
+    frame: &mut Frame,
+    area: Rect,
+    snapshot: &SystemSnapshot,
+    unicode: bool,
+    theme: &Theme,
+) {
+    let block = Block::default()
+        .title(" Memory ")
+        .title_style(
+            Style::default()
+                .fg(theme.accent_primary)
+                .add_modifier(Modifier::BOLD),
+        )
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Style::default().fg(theme.text_dim));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
     let mem = &snapshot.memory;
     let mut lines: Vec<Line<'static>> = Vec::new();
 
+    let ram_pct = if mem.total > 0 {
+        mem.used as f64 / mem.total as f64 * 100.0
+    } else {
+        0.0
+    };
     lines.push(make_bar_line(
         "Mem",
         mem.used,
         mem.total,
-        Color::Green,
-        area.width,
+        theme.gauge_color(ram_pct),
+        inner.width,
         unicode,
+        theme,
     ));
 
     if mem.swap_total > 0 {
+        let swap_pct = if mem.swap_total > 0 {
+            mem.swap_used as f64 / mem.swap_total as f64 * 100.0
+        } else {
+            0.0
+        };
         lines.push(make_bar_line(
             "Swp",
             mem.swap_used,
             mem.swap_total,
-            Color::Cyan,
-            area.width,
+            theme.gauge_color(swap_pct),
+            inner.width,
             unicode,
+            theme,
         ));
     }
 
     let para = Paragraph::new(lines);
-    frame.render_widget(para, area);
+    frame.render_widget(para, inner);
 }
 
 /// Bar characters — Unicode vs ASCII fallback.
@@ -107,6 +171,7 @@ fn make_bar_line(
     fill_color: Color,
     width: u16,
     unicode: bool,
+    theme: &Theme,
 ) -> Line<'static> {
     let pct = if total > 0 {
         (used as f64 / total as f64 * 100.0).clamp(0.0, 100.0)
@@ -133,27 +198,40 @@ fn make_bar_line(
     Line::from(vec![
         Span::styled(
             label_part,
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
         ),
-        Span::raw("["),
+        Span::styled("[", Style::default().fg(theme.text_dim)),
         Span::styled(
             fill_char.repeat(filled as usize),
             Style::default().fg(fill_color),
         ),
         Span::styled(
             empty_char.repeat(empty as usize),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.bar_empty),
         ),
-        Span::raw("]"),
-        Span::styled(info, Style::default().fg(Color::Gray)),
+        Span::styled("]", Style::default().fg(theme.text_dim)),
+        Span::styled(info, Style::default().fg(theme.text_dim)),
     ])
 }
 
 /// Render per-core CPU usage bars inside a "CPU" bordered block.
-fn draw_cpu_bars(frame: &mut Frame, area: Rect, snapshot: &SystemSnapshot, unicode: bool) {
-    let block = Block::default().title("CPU").borders(Borders::ALL);
+fn draw_cpu_bars(
+    frame: &mut Frame,
+    area: Rect,
+    snapshot: &SystemSnapshot,
+    unicode: bool,
+    theme: &Theme,
+) {
+    let block = Block::default()
+        .title(" CPU ")
+        .title_style(
+            Style::default()
+                .fg(theme.accent_primary)
+                .add_modifier(Modifier::BOLD),
+        )
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Style::default().fg(theme.text_dim));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -165,7 +243,7 @@ fn draw_cpu_bars(frame: &mut Frame, area: Rect, snapshot: &SystemSnapshot, unico
     if cores.len() <= 16 {
         let lines: Vec<Line<'static>> = cores
             .iter()
-            .map(|c| make_cpu_bar_line(c, inner.width, unicode))
+            .map(|c| make_cpu_bar_line(c, inner.width, unicode, theme))
             .collect();
         frame.render_widget(Paragraph::new(lines), inner);
     } else {
@@ -176,11 +254,11 @@ fn draw_cpu_bars(frame: &mut Frame, area: Rect, snapshot: &SystemSnapshot, unico
         let mid = cores.len().div_ceil(2);
         let left_lines: Vec<Line<'static>> = cores[..mid]
             .iter()
-            .map(|c| make_cpu_bar_line(c, left_area.width, unicode))
+            .map(|c| make_cpu_bar_line(c, left_area.width, unicode, theme))
             .collect();
         let right_lines: Vec<Line<'static>> = cores[mid..]
             .iter()
-            .map(|c| make_cpu_bar_line(c, right_area.width, unicode))
+            .map(|c| make_cpu_bar_line(c, right_area.width, unicode, theme))
             .collect();
 
         frame.render_widget(Paragraph::new(left_lines), left_area);
@@ -189,7 +267,12 @@ fn draw_cpu_bars(frame: &mut Frame, area: Rect, snapshot: &SystemSnapshot, unico
 }
 
 /// Build a single CPU core bar line: "cpu0  [####----]  10.0%" (ASCII) or "cpu0  [████░░░░]  10.0%" (Unicode).
-fn make_cpu_bar_line(core: &CoreSnapshot, width: u16, unicode: bool) -> Line<'static> {
+fn make_cpu_bar_line(
+    core: &CoreSnapshot,
+    width: u16,
+    unicode: bool,
+    theme: &Theme,
+) -> Line<'static> {
     let pct = core.usage.clamp(0.0, 100.0);
     let label = format!("{:<6}", core.name);
     let info = format!("  {pct:.1}%");
@@ -207,18 +290,18 @@ fn make_cpu_bar_line(core: &CoreSnapshot, width: u16, unicode: bool) -> Line<'st
     };
 
     Line::from(vec![
-        Span::styled(label, Style::default().fg(Color::White)),
-        Span::raw("["),
+        Span::styled(label, Style::default().fg(theme.fg)),
+        Span::styled("[", Style::default().fg(theme.text_dim)),
         Span::styled(
             fill_char.repeat(filled as usize),
-            Style::default().fg(Color::Green),
+            Style::default().fg(theme.gauge_color(pct as f64)),
         ),
         Span::styled(
             empty_char.repeat(empty as usize),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.bar_empty),
         ),
-        Span::raw("]"),
-        Span::styled(info, Style::default().fg(Color::Gray)),
+        Span::styled("]", Style::default().fg(theme.text_dim)),
+        Span::styled(info, Style::default().fg(theme.text_dim)),
     ])
 }
 
@@ -231,8 +314,13 @@ mod tests {
     fn render_with(app: &AppState, width: u16, height: u16) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
+        let theme = super::super::theme::Theme::new(crate::terminal::ColorSupport::TrueColor);
         terminal
-            .draw(|frame| crate::ui::draw_root(frame, app))
+            .draw(|frame| {
+                // Directly call draw_general_tab since using draw_root uses its own theme internal creation logic! Wait,
+                // the simplest is to just call draw_root and it will re-invoke all correctly.
+                crate::ui::draw_root(frame, app)
+            })
             .unwrap();
         terminal.backend().buffer().clone()
     }
@@ -375,7 +463,7 @@ mod tests {
         let mut app = AppState::new();
         app.apply_snapshot(make_test_snapshot(4, 2));
         let buf = render_with(&app, 80, 24);
-        assert!(buffer_contains(&buf, "|"));
+        assert!(buffer_contains(&buf, "Tasks: 5 (2 running)"));
     }
 
     // -- STORY-04: Memory bars --

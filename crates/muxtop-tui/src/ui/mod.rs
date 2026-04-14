@@ -4,28 +4,26 @@ mod confirm;
 mod general;
 mod palette;
 mod processes;
+pub mod theme;
 
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Tabs},
 };
 
 use crate::app::{AppState, Tab};
-
-/// Teal accent color for active tab (#4ec9b0).
-const TEAL: Color = Color::Rgb(78, 201, 176);
-
-/// Dimmed foreground for inactive/future elements.
-const DIMMED: Color = Color::DarkGray;
+use theme::Theme;
 
 /// Labels for future tabs (not yet implemented).
 const FUTURE_TABS: &[&str] = &["Network [soon]", "Containers [soon]", "GPU [soon]"];
 
 /// Render the full application layout: Header, TabBar, Content, Footer.
 pub fn draw_root(frame: &mut Frame, app: &AppState) {
+    let theme = Theme::new(app.term_caps.color_support);
+
     let [header_area, tabbar_area, content_area, footer_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(2),
@@ -34,111 +32,129 @@ pub fn draw_root(frame: &mut Frame, app: &AppState) {
     ])
     .areas(frame.area());
 
-    draw_header(frame, header_area);
-    draw_tabbar(frame, tabbar_area, app);
-    draw_content(frame, content_area, app);
-    draw_footer(frame, footer_area, app);
+    draw_header(frame, header_area, &theme);
+    draw_tabbar(frame, tabbar_area, app, &theme);
+    draw_content(frame, content_area, app, &theme);
+    draw_footer(frame, footer_area, app, &theme);
 
     // Confirm dialog overlay.
     if app.confirm.is_some() {
-        confirm::draw_confirm(frame, app);
+        confirm::draw_confirm(frame, app, &theme);
     }
 
     // Command palette overlay (renders on top of everything).
     if app.show_palette {
-        palette::draw_palette(frame, app);
+        palette::draw_palette(frame, app, &theme);
     }
 }
 
 /// Render the header line: app name and version.
-fn draw_header(frame: &mut Frame, area: Rect) {
+fn draw_header(frame: &mut Frame, area: Rect, theme: &Theme) {
     let version = env!("CARGO_PKG_VERSION");
     let header = Paragraph::new(Line::from(vec![
-        Span::styled("muxtop", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(format!(" v{version}")),
+        Span::styled(
+            " muxtop ",
+            Style::default()
+                .bg(theme.accent_primary)
+                .fg(theme.bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" v{version} "),
+            Style::default().bg(theme.header_bg).fg(theme.fg),
+        ),
     ]));
     frame.render_widget(header, area);
 }
 
 /// Render the tab bar with active highlight and future tabs.
-fn draw_tabbar(frame: &mut Frame, area: Rect, app: &AppState) {
+fn draw_tabbar(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
     let active_idx = Tab::ALL.iter().position(|&t| t == app.tab).unwrap_or(0);
 
     let mut titles: Vec<Line<'_>> = Tab::ALL.iter().map(|t| Line::from(t.label())).collect();
 
     for &future in FUTURE_TABS {
-        titles.push(Line::styled(future, Style::default().fg(DIMMED)));
+        titles.push(Line::styled(future, Style::default().fg(theme.text_dim)));
     }
 
     let tabs = Tabs::new(titles)
         .select(active_idx)
-        .highlight_style(Style::default().fg(TEAL).add_modifier(Modifier::BOLD))
-        .style(Style::default().fg(DIMMED))
+        .highlight_style(
+            Style::default()
+                .fg(theme.accent_primary)
+                .add_modifier(Modifier::BOLD),
+        )
+        .style(Style::default().fg(theme.text_dim))
         .divider(" | ")
-        .block(Block::default().borders(Borders::BOTTOM));
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_type(ratatui::widgets::BorderType::Rounded),
+        );
 
     frame.render_widget(tabs, area);
 }
 
 /// Render the content area based on the active tab.
-fn draw_content(frame: &mut Frame, area: Rect, app: &AppState) {
+fn draw_content(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
     match app.tab {
-        Tab::General => general::draw_general_tab(frame, area, app),
-        Tab::Processes => processes::draw_processes_tab(frame, area, app),
+        Tab::General => general::draw_general_tab(frame, area, app, theme),
+        Tab::Processes => processes::draw_processes_tab(frame, area, app, theme),
     }
 }
 
 /// Render the footer with context-aware shortcut hints or a status message.
-fn draw_footer(frame: &mut Frame, area: Rect, app: &AppState) {
+fn draw_footer(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
     // Status message takes priority over shortcuts.
     if let Some(status) = app.active_status() {
         let style = if status.contains("failed") || status.contains("denied") {
-            Style::default().fg(Color::Red)
+            Style::default().fg(theme.bg).bg(theme.danger)
         } else {
-            Style::default().fg(Color::Green)
+            Style::default().fg(theme.bg).bg(theme.success)
         };
-        let footer = Paragraph::new(Line::from(Span::styled(format!(" {status}"), style)));
+        let footer = Paragraph::new(Line::from(Span::styled(format!(" {status} "), style)));
         frame.render_widget(footer, area);
         return;
     }
 
     let shortcuts = match app.tab {
         Tab::General => vec![
-            key_hint("q", "Quit"),
-            Span::raw("  "),
-            key_hint("Tab", "Switch"),
-            Span::raw("  "),
-            key_hint("/", "Filter"),
-            Span::raw("  "),
-            key_hint("t", "Tree"),
-            Span::raw("  "),
-            key_hint("^P", "Palette"),
+            key_hint("q", "Quit", theme),
+            Span::raw(" "),
+            key_hint("Tab", "Switch", theme),
+            Span::raw(" "),
+            key_hint("/", "Filter", theme),
+            Span::raw(" "),
+            key_hint("t", "Tree", theme),
+            Span::raw(" "),
+            key_hint("^P", "Palette", theme),
         ],
         Tab::Processes => vec![
-            key_hint("q", "Quit"),
-            Span::raw("  "),
-            key_hint("/", "Filter"),
-            Span::raw("  "),
-            key_hint("s", "Sort"),
-            Span::raw("  "),
-            key_hint("t", "Tree"),
-            Span::raw("  "),
-            key_hint("F9", "Kill"),
-            Span::raw("  "),
-            key_hint("F7/F8", "Nice"),
-            Span::raw("  "),
-            key_hint("^P", "Palette"),
+            key_hint("q", "Quit", theme),
+            Span::raw(" "),
+            key_hint("/", "Filter", theme),
+            Span::raw(" "),
+            key_hint("s", "Sort", theme),
+            Span::raw(" "),
+            key_hint("t", "Tree", theme),
+            Span::raw(" "),
+            key_hint("F9", "Kill", theme),
+            Span::raw(" "),
+            key_hint("F7/F8", "Nice", theme),
+            Span::raw(" "),
+            key_hint("^P", "Palette", theme),
         ],
     };
-    let footer = Paragraph::new(Line::from(shortcuts));
+    let footer = Paragraph::new(Line::from(shortcuts)).style(Style::default().bg(theme.header_bg));
     frame.render_widget(footer, area);
 }
 
 /// Create a styled key hint: bold key + dim description.
-fn key_hint<'a>(key: &'a str, desc: &'a str) -> Span<'a> {
-    // Using a single span for simplicity — bold key, space, dim desc
-    // would require multiple spans. Keep it simple for v0.1.
-    Span::styled(format!("{key} {desc}"), Style::default().fg(Color::White))
+fn key_hint<'a>(key: &'a str, desc: &'a str, theme: &Theme) -> Span<'a> {
+    Span::styled(
+        format!(" {key} {desc} "),
+        Style::default().fg(theme.fg).bg(theme.selection_bg),
+    )
 }
 
 #[cfg(test)]
@@ -266,9 +282,11 @@ mod tests {
         let line = buffer_line_text(&buf, row);
         if let Some(start) = line.find('G') {
             let cell = buf.cell((start as u16, row)).unwrap();
+            // The FG color should match accent_primary
+            let theme = theme::Theme::new(crate::terminal::ColorSupport::TrueColor);
             assert_eq!(
-                cell.fg, TEAL,
-                "Active tab 'General' should have teal foreground"
+                cell.fg, theme.accent_primary,
+                "Active tab 'General' should have accent foreground"
             );
         }
     }
@@ -279,12 +297,13 @@ mod tests {
         let buf = render_with(&app, 80, 24);
         let row = 1;
         let line = buffer_line_text(&buf, row);
-        // Find "Processes" — it should NOT be teal
+        // Find "Processes" — it should NOT be accent_primary
         if let Some(start) = line.find('P') {
             let cell = buf.cell((start as u16, row)).unwrap();
+            let theme = theme::Theme::new(crate::terminal::ColorSupport::TrueColor);
             assert_ne!(
-                cell.fg, TEAL,
-                "Inactive tab 'Processes' should NOT have teal foreground"
+                cell.fg, theme.accent_primary,
+                "Inactive tab 'Processes' should NOT have accent foreground"
             );
         }
     }
