@@ -1,6 +1,7 @@
 // Layout & rendering for the TUI.
 
 mod general;
+mod palette;
 mod processes;
 
 use ratatui::{
@@ -36,6 +37,11 @@ pub fn draw_root(frame: &mut Frame, app: &AppState) {
     draw_tabbar(frame, tabbar_area, app);
     draw_content(frame, content_area, app);
     draw_footer(frame, footer_area, app);
+
+    // Command palette overlay (renders on top of everything).
+    if app.show_palette {
+        palette::draw_palette(frame, app);
+    }
 }
 
 /// Render the header line: app name and version.
@@ -87,6 +93,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &AppState) {
             key_hint("/", "Filter"),
             Span::raw("  "),
             key_hint("t", "Tree"),
+            Span::raw("  "),
+            key_hint("^P", "Palette"),
         ],
         Tab::Processes => vec![
             key_hint("q", "Quit"),
@@ -100,6 +108,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &AppState) {
             key_hint("S", "Order"),
             Span::raw("  "),
             key_hint("t", "Tree"),
+            Span::raw("  "),
+            key_hint("^P", "Palette"),
         ],
     };
     let footer = Paragraph::new(Line::from(shortcuts));
