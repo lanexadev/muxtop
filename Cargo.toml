@@ -13,7 +13,7 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
 
 # System information
 sysinfo = "0.34"
@@ -36,6 +36,12 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 tracing-appender = "0.2"
+
+# System
+libc = "0.2"
+
+# Async utilities
+tokio-util = { version = "0.7", features = ["rt"] }
 
 # Utilities
 dirs = "6"

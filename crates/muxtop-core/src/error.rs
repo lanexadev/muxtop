@@ -10,4 +10,49 @@ pub enum CoreError {
 
     #[error("permission denied: {0}")]
     Permission(String),
+
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("channel closed")]
+    ChannelClosed,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_error_display() {
+        let variants: Vec<CoreError> = vec![
+            CoreError::Collection("test".into()),
+            CoreError::ProcessNotFound { pid: 42 },
+            CoreError::Permission("denied".into()),
+            CoreError::Io(std::io::Error::other("io err")),
+            CoreError::ChannelClosed,
+        ];
+        for err in &variants {
+            let msg = format!("{err}");
+            assert!(!msg.is_empty(), "Display for {err:?} was empty");
+        }
+    }
+
+    #[test]
+    fn test_error_from_io() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "not found");
+        let core_err: CoreError = io_err.into();
+        assert!(matches!(core_err, CoreError::Io(_)));
+    }
+
+    #[test]
+    fn test_error_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<CoreError>();
+    }
+
+    #[test]
+    fn test_error_is_std_error() {
+        let err = CoreError::ChannelClosed;
+        let _boxed: Box<dyn std::error::Error> = Box::new(err);
+    }
 }
