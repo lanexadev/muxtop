@@ -1,5 +1,7 @@
 // Layout & rendering for the TUI.
 
+mod general;
+
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -74,13 +76,14 @@ fn draw_tabbar(frame: &mut Frame, area: Rect, app: &AppState) {
 
 /// Render the content area based on the active tab.
 fn draw_content(frame: &mut Frame, area: Rect, app: &AppState) {
-    let text = match app.tab {
-        Tab::General => "[General view — coming in Epic 4]",
-        Tab::Processes => "[Processes view — coming in Epic 5]",
-    };
-    let content = Paragraph::new(text)
-        .style(Style::default().fg(Color::Gray));
-    frame.render_widget(content, area);
+    match app.tab {
+        Tab::General => general::draw_general_tab(frame, area, app),
+        Tab::Processes => {
+            let content = Paragraph::new("[Processes view — coming in Epic 5]")
+                .style(Style::default().fg(Color::Gray));
+            frame.render_widget(content, area);
+        }
+    }
 }
 
 /// Render the footer with context-aware shortcut hints.
