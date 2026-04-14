@@ -13,13 +13,42 @@ pub struct ProcessInfo {
 }
 
 /// Fields by which a process list can be sorted.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortField {
     Cpu,
     Mem,
     Pid,
     Name,
     User,
+}
+
+impl std::fmt::Display for SortField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SortField::Cpu => write!(f, "cpu"),
+            SortField::Mem => write!(f, "mem"),
+            SortField::Pid => write!(f, "pid"),
+            SortField::Name => write!(f, "name"),
+            SortField::User => write!(f, "user"),
+        }
+    }
+}
+
+impl std::str::FromStr for SortField {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "cpu" => Ok(SortField::Cpu),
+            "mem" | "memory" => Ok(SortField::Mem),
+            "pid" => Ok(SortField::Pid),
+            "name" => Ok(SortField::Name),
+            "user" => Ok(SortField::User),
+            _ => Err(format!(
+                "invalid sort field '{s}': expected one of cpu, mem, pid, name, user"
+            )),
+        }
+    }
 }
 
 /// Direction of a sort operation.
@@ -416,6 +445,46 @@ mod tests {
         let flat = flatten_tree(&tree);
         let depths: Vec<usize> = flat.iter().map(|(_, d)| *d).collect();
         assert_eq!(depths, vec![0, 1, 2]);
+    }
+
+    // ---- SortField FromStr tests (STORY-01) ----
+
+    #[test]
+    fn test_sort_field_from_str_valid() {
+        assert_eq!("cpu".parse::<SortField>().unwrap(), SortField::Cpu);
+        assert_eq!("mem".parse::<SortField>().unwrap(), SortField::Mem);
+        assert_eq!("memory".parse::<SortField>().unwrap(), SortField::Mem);
+        assert_eq!("pid".parse::<SortField>().unwrap(), SortField::Pid);
+        assert_eq!("name".parse::<SortField>().unwrap(), SortField::Name);
+        assert_eq!("user".parse::<SortField>().unwrap(), SortField::User);
+    }
+
+    #[test]
+    fn test_sort_field_from_str_case_insensitive() {
+        assert_eq!("CPU".parse::<SortField>().unwrap(), SortField::Cpu);
+        assert_eq!("Mem".parse::<SortField>().unwrap(), SortField::Mem);
+        assert_eq!("PID".parse::<SortField>().unwrap(), SortField::Pid);
+    }
+
+    #[test]
+    fn test_sort_field_from_str_invalid() {
+        let err = "invalid".parse::<SortField>().unwrap_err();
+        assert!(err.contains("invalid sort field"));
+        assert!(err.contains("cpu, mem, pid, name, user"));
+    }
+
+    #[test]
+    fn test_sort_field_display_roundtrip() {
+        for &field in &[
+            SortField::Cpu,
+            SortField::Mem,
+            SortField::Pid,
+            SortField::Name,
+            SortField::User,
+        ] {
+            let s = field.to_string();
+            assert_eq!(s.parse::<SortField>().unwrap(), field);
+        }
     }
 
     #[test]
