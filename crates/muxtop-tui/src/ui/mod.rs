@@ -1,5 +1,6 @@
 // Layout & rendering for the TUI.
 
+mod confirm;
 mod general;
 mod palette;
 mod processes;
@@ -37,6 +38,11 @@ pub fn draw_root(frame: &mut Frame, app: &AppState) {
     draw_tabbar(frame, tabbar_area, app);
     draw_content(frame, content_area, app);
     draw_footer(frame, footer_area, app);
+
+    // Confirm dialog overlay.
+    if app.confirm.is_some() {
+        confirm::draw_confirm(frame, app);
+    }
 
     // Command palette overlay (renders on top of everything).
     if app.show_palette {
@@ -82,8 +88,20 @@ fn draw_content(frame: &mut Frame, area: Rect, app: &AppState) {
     }
 }
 
-/// Render the footer with context-aware shortcut hints.
+/// Render the footer with context-aware shortcut hints or a status message.
 fn draw_footer(frame: &mut Frame, area: Rect, app: &AppState) {
+    // Status message takes priority over shortcuts.
+    if let Some(status) = app.active_status() {
+        let style = if status.contains("failed") || status.contains("denied") {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default().fg(Color::Green)
+        };
+        let footer = Paragraph::new(Line::from(Span::styled(format!(" {status}"), style)));
+        frame.render_widget(footer, area);
+        return;
+    }
+
     let shortcuts = match app.tab {
         Tab::General => vec![
             key_hint("q", "Quit"),
@@ -99,15 +117,15 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &AppState) {
         Tab::Processes => vec![
             key_hint("q", "Quit"),
             Span::raw("  "),
-            key_hint("Tab", "Switch"),
-            Span::raw("  "),
             key_hint("/", "Filter"),
             Span::raw("  "),
             key_hint("s", "Sort"),
             Span::raw("  "),
-            key_hint("S", "Order"),
-            Span::raw("  "),
             key_hint("t", "Tree"),
+            Span::raw("  "),
+            key_hint("F9", "Kill"),
+            Span::raw("  "),
+            key_hint("F7/F8", "Nice"),
             Span::raw("  "),
             key_hint("^P", "Palette"),
         ],
