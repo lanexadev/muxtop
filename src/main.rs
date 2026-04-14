@@ -1,5 +1,12 @@
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use clap::Parser;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
+use muxtop_core::collector::Collector;
+use muxtop_core::system::SystemSnapshot;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -61,16 +68,36 @@ fn init_tracing() -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _cli = Cli::parse();
+    let cli = Cli::parse();
 
     init_tracing()?;
 
     tracing::info!("muxtop starting");
 
-    // TODO(epic-1): Initialize collector
-    // TODO(epic-2): Initialize TUI event loop
+    // Create channel for collector → TUI communication.
+    let (tx, rx) = mpsc::channel::<SystemSnapshot>(4);
+    let token = CancellationToken::new();
+
+    // Spawn the async collector on a background tokio task.
+    let collector = Collector::new(Duration::from_secs(cli.refresh));
+    let collector_handle = collector.spawn(tx, token.clone());
+
+    // G-05: Run the TUI on a dedicated blocking thread so it doesn't
+    // block the tokio runtime (crossterm::event::poll is a blocking syscall).
+    let tui_result = tokio::task::spawn_blocking(move || muxtop_tui::run(rx))
+        .await
+        .context("TUI thread panicked")?;
+
+    // After TUI exits, shut down the collector.
+    token.cancel();
+    // G-10: Log collector panics instead of silently discarding.
+    if let Err(e) = collector_handle.await {
+        tracing::error!("collector task panicked: {e:?}");
+    }
 
     tracing::info!("muxtop shutting down");
+
+    tui_result.context("TUI error")?;
 
     Ok(())
 }
