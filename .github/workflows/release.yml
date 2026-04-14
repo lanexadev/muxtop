@@ -91,6 +91,7 @@ jobs:
           files: |
             artifacts/*.tar.gz
             artifacts/*.sha256
+            scripts/install.sh
 
   publish:
     name: Publish to crates.io
