@@ -346,10 +346,10 @@ impl AppState {
 
     /// Clear expired status messages.
     fn clear_status_if_expired(&mut self) {
-        if let Some((_, created)) = &self.status_message {
-            if created.elapsed().as_secs() >= STATUS_TIMEOUT_SECS {
-                self.status_message = None;
-            }
+        if let Some((_, created)) = &self.status_message
+            && created.elapsed().as_secs() >= STATUS_TIMEOUT_SECS
+        {
+            self.status_message = None;
         }
     }
 

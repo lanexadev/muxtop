@@ -2,9 +2,6 @@
 
 **A modern, multiplexed system monitor for the terminal.**
 
-<!-- TODO: Replace with asciicast GIF (8-10 seconds, see scripts/ for recording instructions) -->
-<!-- ![muxtop demo](https://raw.githubusercontent.com/lanexadev/muxtop/main/assets/demo.gif) -->
-
 [![CI](https://github.com/lanexadev/muxtop/actions/workflows/ci.yml/badge.svg)](https://github.com/lanexadev/muxtop/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/muxtop.svg)](https://crates.io/crates/muxtop)
 [![License](https://img.shields.io/crates/l/muxtop.svg)](LICENSE-MIT)
