@@ -37,6 +37,65 @@ impl Default for CliConfig {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_config_default() {
+        let config = CliConfig::default();
+        assert!(config.filter.is_none());
+        assert!(matches!(config.sort_field, SortField::Cpu));
+        assert!(!config.tree_mode);
+    }
+
+    #[test]
+    fn test_cli_config_with_filter() {
+        let config = CliConfig {
+            filter: Some("firefox".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(config.filter.as_deref(), Some("firefox"));
+    }
+
+    #[test]
+    fn test_cli_config_with_sort() {
+        let config = CliConfig {
+            sort_field: SortField::Mem,
+            ..Default::default()
+        };
+        assert!(matches!(config.sort_field, SortField::Mem));
+    }
+
+    #[test]
+    fn test_cli_config_with_tree() {
+        let config = CliConfig {
+            tree_mode: true,
+            ..Default::default()
+        };
+        assert!(config.tree_mode);
+    }
+
+    #[test]
+    fn test_cli_config_clone() {
+        let config = CliConfig {
+            filter: Some("test".to_string()),
+            sort_field: SortField::Pid,
+            tree_mode: true,
+        };
+        let cloned = config.clone();
+        assert_eq!(cloned.filter, config.filter);
+        assert!(matches!(cloned.sort_field, SortField::Pid));
+        assert!(cloned.tree_mode);
+    }
+
+    #[test]
+    fn test_cli_config_debug() {
+        let config = CliConfig::default();
+        assert!(!format!("{config:?}").is_empty());
+    }
+}
+
 /// Run the TUI event loop. Blocks until the user quits.
 /// The TerminalGuard ensures the terminal is restored on any exit path
 /// (normal return, error propagation via ?, or panic unwind).

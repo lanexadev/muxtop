@@ -1847,4 +1847,170 @@ mod tests {
         app.execute_command(Command::ClearFilter);
         assert!(app.filter_input.is_empty());
     }
+
+    // -- Epic 9: ConfirmAction::prompt() tests --
+
+    #[test]
+    fn test_confirm_prompt_kill_sigterm() {
+        let action = ConfirmAction::Kill {
+            pid: 1234,
+            name: "firefox".to_string(),
+            signal: libc::SIGTERM,
+        };
+        let prompt = action.prompt();
+        assert!(prompt.contains("SIGTERM"), "Should contain SIGTERM");
+        assert!(prompt.contains("firefox"), "Should contain process name");
+        assert!(prompt.contains("1234"), "Should contain PID");
+        assert!(prompt.contains("[y/n]"), "Should contain y/n prompt");
+    }
+
+    #[test]
+    fn test_confirm_prompt_kill_sigkill() {
+        let action = ConfirmAction::Kill {
+            pid: 999,
+            name: "chrome".to_string(),
+            signal: libc::SIGKILL,
+        };
+        let prompt = action.prompt();
+        assert!(prompt.contains("SIGKILL"), "Should contain SIGKILL");
+        assert!(prompt.contains("chrome"), "Should contain process name");
+        assert!(prompt.contains("999"), "Should contain PID");
+    }
+
+    #[test]
+    fn test_confirm_prompt_renice_down() {
+        let action = ConfirmAction::Renice {
+            pid: 42,
+            name: "bash".to_string(),
+            delta: 1,
+        };
+        let prompt = action.prompt();
+        assert!(
+            prompt.contains("lower priority"),
+            "delta>0 should say 'lower priority'"
+        );
+        assert!(prompt.contains("bash"), "Should contain process name");
+        assert!(prompt.contains("42"), "Should contain PID");
+    }
+
+    #[test]
+    fn test_confirm_prompt_renice_up() {
+        let action = ConfirmAction::Renice {
+            pid: 77,
+            name: "vim".to_string(),
+            delta: -1,
+        };
+        let prompt = action.prompt();
+        assert!(
+            prompt.contains("higher priority"),
+            "delta<0 should say 'higher priority'"
+        );
+        assert!(prompt.contains("vim"), "Should contain process name");
+    }
+
+    // -- Epic 9: next_sort_field() tests --
+
+    #[test]
+    fn test_next_sort_field_full_cycle() {
+        let mut field = SortField::Cpu;
+        field = next_sort_field(field);
+        assert!(matches!(field, SortField::Mem));
+        field = next_sort_field(field);
+        assert!(matches!(field, SortField::Pid));
+        field = next_sort_field(field);
+        assert!(matches!(field, SortField::Name));
+        field = next_sort_field(field);
+        assert!(matches!(field, SortField::User));
+        field = next_sort_field(field);
+        assert!(matches!(field, SortField::Cpu), "Should cycle back to Cpu");
+    }
+
+    #[test]
+    fn test_next_sort_field_is_deterministic() {
+        // Same input always gives same output
+        assert!(matches!(next_sort_field(SortField::Cpu), SortField::Mem));
+        assert!(matches!(next_sort_field(SortField::Cpu), SortField::Mem));
+    }
+
+    // -- Epic 9: with_config tests --
+
+    #[test]
+    fn test_with_config_sort_field() {
+        let config = crate::CliConfig {
+            sort_field: SortField::Name,
+            ..Default::default()
+        };
+        let app = AppState::with_config(config, TermCaps::default());
+        assert!(matches!(app.sort_field, SortField::Name));
+    }
+
+    #[test]
+    fn test_with_config_tree_mode() {
+        let config = crate::CliConfig {
+            tree_mode: true,
+            ..Default::default()
+        };
+        let app = AppState::with_config(config, TermCaps::default());
+        assert!(app.tree_mode);
+    }
+
+    #[test]
+    fn test_with_config_filter() {
+        let config = crate::CliConfig {
+            filter: Some("rust".to_string()),
+            ..Default::default()
+        };
+        let app = AppState::with_config(config, TermCaps::default());
+        assert_eq!(app.filter_input, "rust");
+    }
+
+    #[test]
+    fn test_with_config_no_filter() {
+        let config = crate::CliConfig::default();
+        let app = AppState::with_config(config, TermCaps::default());
+        assert!(app.filter_input.is_empty());
+    }
+
+    // -- Epic 9: AppState edge cases --
+
+    #[test]
+    fn test_apply_empty_snapshot() {
+        let mut app = AppState::new();
+        let snap = make_snapshot(vec![]);
+        app.apply_snapshot(snap);
+        assert!(app.visible_processes.is_empty());
+        assert_eq!(app.process_count(), 0);
+        assert!(app.selected_process().is_none());
+    }
+
+    #[test]
+    fn test_page_down_navigation() {
+        let mut app = app_with_processes();
+        app.handle_key_event(key(KeyCode::PageDown));
+        // 5 processes, PageDown moves by 20, clamped to 4
+        assert_eq!(app.selected, 4);
+    }
+
+    #[test]
+    fn test_page_up_from_bottom() {
+        let mut app = app_with_processes();
+        app.selected = 4;
+        app.handle_key_event(key(KeyCode::PageUp));
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn test_home_key_navigation() {
+        let mut app = app_with_processes();
+        app.selected = 3;
+        app.handle_key_event(key(KeyCode::Home));
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn test_end_key_navigation() {
+        let mut app = app_with_processes();
+        app.handle_key_event(key(KeyCode::End));
+        assert_eq!(app.selected, app.process_count() - 1);
+    }
 }
