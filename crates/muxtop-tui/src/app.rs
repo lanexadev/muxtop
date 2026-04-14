@@ -16,8 +16,21 @@ pub enum Tab {
     Processes,
 }
 
+impl std::fmt::Display for Tab {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 impl Tab {
     pub const ALL: &[Tab] = &[Tab::General, Tab::Processes];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Tab::General => "General",
+            Tab::Processes => "Processes",
+        }
+    }
 
     pub fn next(self) -> Tab {
         let idx = Self::ALL.iter().position(|&t| t == self).unwrap_or(0);
@@ -173,6 +186,22 @@ impl AppState {
                 if self.process_count() > 0 {
                     self.selected = self.process_count() - 1;
                 }
+            }
+
+            // Direct tab selection (Alt+1/Alt+2)
+            KeyCode::Char('1') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.tab = Tab::General;
+            }
+            KeyCode::Char('2') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.tab = Tab::Processes;
+            }
+
+            // Arrow tab navigation
+            KeyCode::Right => {
+                self.tab = self.tab.next();
+            }
+            KeyCode::Left => {
+                self.tab = self.tab.prev();
             }
 
             // Tab switching
@@ -340,6 +369,18 @@ mod tests {
     fn test_tab_prev_cycles() {
         assert_eq!(Tab::Processes.prev(), Tab::General);
         assert_eq!(Tab::General.prev(), Tab::Processes);
+    }
+
+    #[test]
+    fn test_tab_label_values() {
+        assert_eq!(Tab::General.label(), "General");
+        assert_eq!(Tab::Processes.label(), "Processes");
+    }
+
+    #[test]
+    fn test_tab_display() {
+        assert_eq!(format!("{}", Tab::General), "General");
+        assert_eq!(format!("{}", Tab::Processes), "Processes");
     }
 
     #[test]
@@ -678,6 +719,41 @@ mod tests {
         assert_eq!(app.filter_input, "test"); // kept
     }
 
+    // -- Guard fixes: missing test coverage --
+
+    #[test]
+    fn test_ctrl_c_quits_in_filter_mode() {
+        let mut app = AppState::new();
+        app.filter_active = true;
+        app.handle_key_event(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(!app.running());
+    }
+
+    // -- Alt+1/Alt+2 tab switching (STORY-08) --
+
+    #[test]
+    fn test_tab_alt1_switches_to_general() {
+        let mut app = AppState::new();
+        app.tab = Tab::Processes;
+        app.handle_key_event(key_mod(KeyCode::Char('1'), KeyModifiers::ALT));
+        assert_eq!(app.tab, Tab::General);
+    }
+
+    #[test]
+    fn test_tab_alt2_switches_to_processes() {
+        let mut app = AppState::new();
+        app.handle_key_event(key_mod(KeyCode::Char('2'), KeyModifiers::ALT));
+        assert_eq!(app.tab, Tab::Processes);
+    }
+
+    #[test]
+    fn test_tab_alt1_idempotent_on_general() {
+        let mut app = AppState::new();
+        assert_eq!(app.tab, Tab::General);
+        app.handle_key_event(key_mod(KeyCode::Char('1'), KeyModifiers::ALT));
+        assert_eq!(app.tab, Tab::General);
+    }
+
     #[test]
     fn test_palette_toggle() {
         let mut app = AppState::new();
@@ -686,6 +762,40 @@ mod tests {
         assert!(app.show_palette);
         app.handle_key_event(key_mod(KeyCode::Char('p'), KeyModifiers::CONTROL));
         assert!(!app.show_palette);
+    }
+
+    // -- Left/Right arrow tab cycling (STORY-09) --
+
+    #[test]
+    fn test_tab_right_arrow_next() {
+        let mut app = AppState::new();
+        assert_eq!(app.tab, Tab::General);
+        app.handle_key_event(key(KeyCode::Right));
+        assert_eq!(app.tab, Tab::Processes);
+    }
+
+    #[test]
+    fn test_tab_left_arrow_prev() {
+        let mut app = AppState::new();
+        app.tab = Tab::Processes;
+        app.handle_key_event(key(KeyCode::Left));
+        assert_eq!(app.tab, Tab::General);
+    }
+
+    #[test]
+    fn test_tab_left_arrow_wraps() {
+        let mut app = AppState::new();
+        assert_eq!(app.tab, Tab::General);
+        app.handle_key_event(key(KeyCode::Left));
+        assert_eq!(app.tab, Tab::Processes);
+    }
+
+    #[test]
+    fn test_tab_right_arrow_wraps() {
+        let mut app = AppState::new();
+        app.tab = Tab::Processes;
+        app.handle_key_event(key(KeyCode::Right));
+        assert_eq!(app.tab, Tab::General);
     }
 
     // -- Mouse handling (STORY-04) --
