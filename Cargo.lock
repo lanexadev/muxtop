@@ -863,6 +863,7 @@ dependencies = [
  "muxtop-core",
  "muxtop-tui",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -888,6 +889,7 @@ dependencies = [
  "muxtop-core",
  "ratatui",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 

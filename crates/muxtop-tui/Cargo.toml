@@ -13,4 +13,5 @@ muxtop-core = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
