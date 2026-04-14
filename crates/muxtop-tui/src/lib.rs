@@ -37,6 +37,32 @@ impl Default for CliConfig {
     }
 }
 
+/// Run the TUI event loop. Blocks until the user quits.
+/// The TerminalGuard ensures the terminal is restored on any exit path
+/// (normal return, error propagation via ?, or panic unwind).
+pub fn run(rx: mpsc::Receiver<SystemSnapshot>, config: CliConfig) -> Result<(), TuiError> {
+    install_panic_hook();
+    let mut guard = init_terminal()?;
+    let term_caps = detect_terminal_caps();
+    let mut app = app::AppState::with_config(config, term_caps);
+    let mut handler = EventHandler::new(rx);
+
+    while app.running() {
+        guard.0.draw(|frame| ui::draw_root(frame, &app))?;
+
+        match handler.poll_event()? {
+            Event::Key(key) => app.handle_key_event(key),
+            Event::Mouse(mouse) => app.handle_mouse_event(mouse),
+            Event::Snapshot(snap) => app.apply_snapshot(snap),
+            Event::Resize(_, _) | Event::Tick => {}
+        }
+    }
+
+    // Explicit restore for clean exit (TerminalGuard Drop is the safety net).
+    restore_terminal(&mut guard.0)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,30 +120,4 @@ mod tests {
         let config = CliConfig::default();
         assert!(!format!("{config:?}").is_empty());
     }
-}
-
-/// Run the TUI event loop. Blocks until the user quits.
-/// The TerminalGuard ensures the terminal is restored on any exit path
-/// (normal return, error propagation via ?, or panic unwind).
-pub fn run(rx: mpsc::Receiver<SystemSnapshot>, config: CliConfig) -> Result<(), TuiError> {
-    install_panic_hook();
-    let mut guard = init_terminal()?;
-    let term_caps = detect_terminal_caps();
-    let mut app = app::AppState::with_config(config, term_caps);
-    let mut handler = EventHandler::new(rx);
-
-    while app.running() {
-        guard.0.draw(|frame| ui::draw_root(frame, &app))?;
-
-        match handler.poll_event()? {
-            Event::Key(key) => app.handle_key_event(key),
-            Event::Mouse(mouse) => app.handle_mouse_event(mouse),
-            Event::Snapshot(snap) => app.apply_snapshot(snap),
-            Event::Resize(_, _) | Event::Tick => {}
-        }
-    }
-
-    // Explicit restore for clean exit (TerminalGuard Drop is the safety net).
-    restore_terminal(&mut guard.0)?;
-    Ok(())
 }

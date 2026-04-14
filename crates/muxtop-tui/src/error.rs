@@ -36,7 +36,7 @@ mod tests {
 
     #[test]
     fn test_tui_error_from_io() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "test");
+        let io_err = std::io::Error::other("test");
         let tui_err: TuiError = io_err.into();
         assert!(matches!(tui_err, TuiError::Terminal(_)));
     }
