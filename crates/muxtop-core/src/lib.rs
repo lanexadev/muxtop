@@ -1,3 +1,4 @@
+pub mod actions;
 pub mod collector;
 pub mod error;
 pub mod process;
