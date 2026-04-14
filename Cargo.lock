@@ -905,6 +905,7 @@ name = "muxtop-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "libc",
  "muxtop-core",
  "nucleo",
  "ratatui",

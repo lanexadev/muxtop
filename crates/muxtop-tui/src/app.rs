@@ -1,14 +1,54 @@
 // Application state machine.
 
+use std::time::Instant;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use nucleo::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo::{Config, Matcher, Utf32Str};
 
+use muxtop_core::actions;
 use muxtop_core::process::{
     ProcessInfo, SortField, SortOrder, build_process_tree, filter_processes, flatten_tree,
     sort_processes,
 };
 use muxtop_core::system::SystemSnapshot;
+
+// ---------------------------------------------------------------------------
+// Confirm dialog
+// ---------------------------------------------------------------------------
+
+/// A pending action that requires user confirmation (y/n).
+#[derive(Debug, Clone)]
+pub enum ConfirmAction {
+    /// Kill a process with the given signal.
+    Kill { pid: u32, name: String, signal: i32 },
+    /// Change the nice value of a process.
+    Renice { pid: u32, name: String, delta: i32 },
+}
+
+impl ConfirmAction {
+    /// Human-readable description for the confirmation dialog.
+    pub fn prompt(&self) -> String {
+        match self {
+            ConfirmAction::Kill { pid, name, signal } => {
+                let sig_name = if *signal == libc::SIGKILL {
+                    "SIGKILL"
+                } else {
+                    "SIGTERM"
+                };
+                format!("Send {sig_name} to {name} (PID {pid})?  [y/n]")
+            }
+            ConfirmAction::Renice { pid, name, delta } => {
+                let direction = if *delta > 0 {
+                    "lower priority (+1)"
+                } else {
+                    "higher priority (-1)"
+                };
+                format!("Renice {name} (PID {pid}) to {direction}?  [y/n]")
+            }
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Command registry
@@ -31,6 +71,11 @@ pub enum Command {
     OpenFilter,
     NextTab,
     PrevTab,
+    KillProcess,
+    ForceKillProcess,
+    NiceDown,
+    NiceUp,
+    ClearFilter,
 }
 
 impl Command {
@@ -49,6 +94,11 @@ impl Command {
         Command::OpenFilter,
         Command::NextTab,
         Command::PrevTab,
+        Command::KillProcess,
+        Command::ForceKillProcess,
+        Command::NiceDown,
+        Command::NiceUp,
+        Command::ClearFilter,
     ];
 
     pub fn label(self) -> &'static str {
@@ -67,6 +117,11 @@ impl Command {
             Command::OpenFilter => "Open filter",
             Command::NextTab => "Next tab",
             Command::PrevTab => "Previous tab",
+            Command::KillProcess => "Kill process (SIGTERM)",
+            Command::ForceKillProcess => "Force kill (SIGKILL)",
+            Command::NiceDown => "Lower priority (+1)",
+            Command::NiceUp => "Raise priority (-1)",
+            Command::ClearFilter => "Clear filter",
         }
     }
 
@@ -86,6 +141,11 @@ impl Command {
             Command::OpenFilter => "/",
             Command::NextTab => "Tab",
             Command::PrevTab => "Shift+Tab",
+            Command::KillProcess => "F9",
+            Command::ForceKillProcess => "F10",
+            Command::NiceDown => "F7",
+            Command::NiceUp => "F8",
+            Command::ClearFilter => "Esc",
         }
     }
 
@@ -196,6 +256,9 @@ impl Tab {
     }
 }
 
+/// Duration before a status message auto-clears.
+const STATUS_TIMEOUT_SECS: u64 = 5;
+
 /// Full application state for the TUI.
 pub struct AppState {
     pub tab: Tab,
@@ -208,6 +271,10 @@ pub struct AppState {
     pub scroll_offset: usize,
     pub show_palette: bool,
     pub palette: PaletteState,
+    /// Pending confirm dialog (kill/renice).
+    pub confirm: Option<ConfirmAction>,
+    /// Status message with creation time (auto-clears after timeout).
+    pub status_message: Option<(String, Instant)>,
     running: bool,
     pub last_snapshot: Option<SystemSnapshot>,
     /// Derived: sorted + filtered process list.
@@ -235,10 +302,37 @@ impl AppState {
             scroll_offset: 0,
             show_palette: false,
             palette: PaletteState::new(),
+            confirm: None,
+            status_message: None,
             running: true,
             last_snapshot: None,
             visible_processes: Vec::new(),
             visible_tree: Vec::new(),
+        }
+    }
+
+    /// Returns the current status message if it hasn't expired.
+    pub fn active_status(&self) -> Option<&str> {
+        self.status_message.as_ref().and_then(|(msg, created)| {
+            if created.elapsed().as_secs() < STATUS_TIMEOUT_SECS {
+                Some(msg.as_str())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Set a status message (auto-expires after STATUS_TIMEOUT_SECS).
+    fn set_status(&mut self, msg: String) {
+        self.status_message = Some((msg, Instant::now()));
+    }
+
+    /// Clear expired status messages.
+    fn clear_status_if_expired(&mut self) {
+        if let Some((_, created)) = &self.status_message {
+            if created.elapsed().as_secs() >= STATUS_TIMEOUT_SECS {
+                self.status_message = None;
+            }
         }
     }
 
@@ -313,6 +407,15 @@ impl AppState {
 
     /// Handle a keyboard event.
     pub fn handle_key_event(&mut self, key: KeyEvent) {
+        // Clear expired status on any key press.
+        self.clear_status_if_expired();
+
+        // Confirm dialog captures y/n/Esc only.
+        if self.confirm.is_some() {
+            self.handle_confirm_key(key);
+            return;
+        }
+
         // Palette mode captures most keys.
         if self.show_palette {
             self.handle_palette_key(key);
@@ -324,6 +427,9 @@ impl AppState {
             self.handle_filter_key(key);
             return;
         }
+
+        // Clear status on any normal key press.
+        self.status_message = None;
 
         match key.code {
             // Quit
@@ -393,7 +499,7 @@ impl AppState {
                 self.sort_field = next_sort_field(self.sort_field);
                 self.recompute_visible();
             }
-            KeyCode::Char('S') => {
+            KeyCode::Char('S') | KeyCode::Char('I') => {
                 self.sort_order = match self.sort_order {
                     SortOrder::Asc => SortOrder::Desc,
                     SortOrder::Desc => SortOrder::Asc,
@@ -423,6 +529,40 @@ impl AppState {
                 self.recompute_visible();
             }
 
+            // Kill process — F9 (Processes tab only)
+            KeyCode::F(9) => {
+                if self.tab == Tab::Processes {
+                    self.request_kill(libc::SIGTERM);
+                }
+            }
+
+            // Force kill — F10 (Processes tab only)
+            KeyCode::F(10) => {
+                if self.tab == Tab::Processes {
+                    self.request_kill(libc::SIGKILL);
+                }
+            }
+
+            // Renice — F7 lower priority (+1), F8 higher priority (-1)
+            KeyCode::F(7) => {
+                if self.tab == Tab::Processes {
+                    self.request_renice(1);
+                }
+            }
+            KeyCode::F(8) => {
+                if self.tab == Tab::Processes {
+                    self.request_renice(-1);
+                }
+            }
+
+            // Clear filter with Esc (when not in filter input mode)
+            KeyCode::Esc => {
+                if !self.filter_input.is_empty() {
+                    self.filter_input.clear();
+                    self.recompute_visible();
+                }
+            }
+
             // Filter mode
             KeyCode::Char('/') => {
                 self.filter_active = true;
@@ -434,6 +574,89 @@ impl AppState {
             }
 
             _ => {}
+        }
+    }
+
+    /// Request to kill the currently selected process (opens confirm dialog).
+    fn request_kill(&mut self, signal: i32) {
+        if let Some(proc) = self.selected_process() {
+            self.confirm = Some(ConfirmAction::Kill {
+                pid: proc.pid,
+                name: proc.name.clone(),
+                signal,
+            });
+        }
+    }
+
+    /// Request to renice the currently selected process (opens confirm dialog).
+    fn request_renice(&mut self, delta: i32) {
+        if let Some(proc) = self.selected_process() {
+            self.confirm = Some(ConfirmAction::Renice {
+                pid: proc.pid,
+                name: proc.name.clone(),
+                delta,
+            });
+        }
+    }
+
+    /// Handle keys while the confirm dialog is open.
+    fn handle_confirm_key(&mut self, key: KeyEvent) {
+        // Ctrl+C always quits.
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.quit();
+            return;
+        }
+
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Some(action) = self.confirm.take() {
+                    self.execute_confirm(action);
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.confirm = None;
+            }
+            _ => {} // Block all other keys
+        }
+    }
+
+    /// Execute a confirmed action and set status message.
+    fn execute_confirm(&mut self, action: ConfirmAction) {
+        match action {
+            ConfirmAction::Kill { pid, name, signal } => {
+                let sig_name = if signal == libc::SIGKILL {
+                    "SIGKILL"
+                } else {
+                    "SIGTERM"
+                };
+                match actions::kill_process(pid, signal) {
+                    Ok(()) => self.set_status(format!("Sent {sig_name} to {name} (PID {pid})")),
+                    Err(e) => self.set_status(format!("Kill failed: {e}")),
+                }
+            }
+            ConfirmAction::Renice { pid, name, delta } => {
+                // We don't know the current nice value, so we read it first
+                // via libc::getpriority, then apply the delta.
+                let current = unsafe {
+                    // Clear errno before getpriority (it can return -1 legitimately).
+                    #[cfg(target_os = "macos")]
+                    {
+                        *libc::__error() = 0;
+                    }
+                    #[cfg(target_os = "linux")]
+                    {
+                        *libc::__errno_location() = 0;
+                    }
+                    libc::getpriority(libc::PRIO_PROCESS, pid as libc::id_t)
+                };
+                let new_nice = current + delta;
+                match actions::renice_process(pid, new_nice) {
+                    Ok(()) => {
+                        self.set_status(format!("Reniced {name} (PID {pid}) to nice={new_nice}"))
+                    }
+                    Err(e) => self.set_status(format!("Renice failed: {e}")),
+                }
+            }
         }
     }
 
@@ -548,6 +771,30 @@ impl AppState {
             }
             Command::PrevTab => {
                 self.tab = self.tab.prev();
+            }
+            Command::KillProcess => {
+                if self.tab == Tab::Processes {
+                    self.request_kill(libc::SIGTERM);
+                }
+            }
+            Command::ForceKillProcess => {
+                if self.tab == Tab::Processes {
+                    self.request_kill(libc::SIGKILL);
+                }
+            }
+            Command::NiceDown => {
+                if self.tab == Tab::Processes {
+                    self.request_renice(1);
+                }
+            }
+            Command::NiceUp => {
+                if self.tab == Tab::Processes {
+                    self.request_renice(-1);
+                }
+            }
+            Command::ClearFilter => {
+                self.filter_input.clear();
+                self.recompute_visible();
             }
         }
     }
@@ -1396,5 +1643,191 @@ mod tests {
         app.handle_key_event(key(KeyCode::Enter));
         assert!(!app.show_palette);
         assert!(!app.running());
+    }
+
+    // -- Epic 7: Confirm dialog tests --
+
+    #[test]
+    fn test_confirm_dialog_opens_on_f9() {
+        let mut app = app_with_processes();
+        app.tab = Tab::Processes;
+        app.handle_key_event(key(KeyCode::F(9)));
+        assert!(app.confirm.is_some());
+        if let Some(ConfirmAction::Kill { signal, .. }) = &app.confirm {
+            assert_eq!(*signal, libc::SIGTERM);
+        } else {
+            panic!("Expected Kill confirm action");
+        }
+    }
+
+    #[test]
+    fn test_confirm_dialog_opens_on_f10_sigkill() {
+        let mut app = app_with_processes();
+        app.tab = Tab::Processes;
+        app.handle_key_event(key(KeyCode::F(10)));
+        assert!(app.confirm.is_some());
+        if let Some(ConfirmAction::Kill { signal, .. }) = &app.confirm {
+            assert_eq!(*signal, libc::SIGKILL);
+        } else {
+            panic!("Expected Kill confirm with SIGKILL");
+        }
+    }
+
+    #[test]
+    fn test_confirm_cancel_with_n() {
+        let mut app = app_with_processes();
+        app.tab = Tab::Processes;
+        app.handle_key_event(key(KeyCode::F(9)));
+        assert!(app.confirm.is_some());
+        app.handle_key_event(key(KeyCode::Char('n')));
+        assert!(app.confirm.is_none());
+    }
+
+    #[test]
+    fn test_confirm_cancel_with_esc() {
+        let mut app = app_with_processes();
+        app.tab = Tab::Processes;
+        app.handle_key_event(key(KeyCode::F(9)));
+        assert!(app.confirm.is_some());
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(app.confirm.is_none());
+    }
+
+    #[test]
+    fn test_confirm_blocks_other_keys() {
+        let mut app = app_with_processes();
+        app.tab = Tab::Processes;
+        app.handle_key_event(key(KeyCode::F(9)));
+        assert!(app.confirm.is_some());
+        // Pressing 'q' should NOT quit
+        app.handle_key_event(key(KeyCode::Char('q')));
+        assert!(app.running());
+        assert!(app.confirm.is_some());
+    }
+
+    #[test]
+    fn test_confirm_ctrl_c_quits() {
+        let mut app = app_with_processes();
+        app.tab = Tab::Processes;
+        app.handle_key_event(key(KeyCode::F(9)));
+        assert!(app.confirm.is_some());
+        app.handle_key_event(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(!app.running());
+    }
+
+    #[test]
+    fn test_kill_no_op_on_general_tab() {
+        let mut app = app_with_processes();
+        app.tab = Tab::General;
+        app.handle_key_event(key(KeyCode::F(9)));
+        assert!(app.confirm.is_none());
+    }
+
+    #[test]
+    fn test_kill_no_op_without_process() {
+        let mut app = AppState::new();
+        app.tab = Tab::Processes;
+        // No snapshot → no selected process
+        app.handle_key_event(key(KeyCode::F(9)));
+        assert!(app.confirm.is_none());
+    }
+
+    #[test]
+    fn test_renice_opens_confirm_on_f7() {
+        let mut app = app_with_processes();
+        app.tab = Tab::Processes;
+        app.handle_key_event(key(KeyCode::F(7)));
+        assert!(app.confirm.is_some());
+        if let Some(ConfirmAction::Renice { delta, .. }) = &app.confirm {
+            assert_eq!(*delta, 1);
+        } else {
+            panic!("Expected Renice confirm action");
+        }
+    }
+
+    #[test]
+    fn test_renice_opens_confirm_on_f8() {
+        let mut app = app_with_processes();
+        app.tab = Tab::Processes;
+        app.handle_key_event(key(KeyCode::F(8)));
+        assert!(app.confirm.is_some());
+        if let Some(ConfirmAction::Renice { delta, .. }) = &app.confirm {
+            assert_eq!(*delta, -1);
+        } else {
+            panic!("Expected Renice confirm action with delta -1");
+        }
+    }
+
+    // -- Epic 7: Clear filter & reverse sort --
+
+    #[test]
+    fn test_esc_clears_filter() {
+        let mut app = app_with_processes();
+        app.filter_input = "firefox".to_string();
+        app.recompute_visible();
+        let before = app.visible_processes.len();
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(app.filter_input.is_empty());
+        assert!(app.visible_processes.len() >= before);
+    }
+
+    #[test]
+    fn test_esc_no_op_when_filter_empty() {
+        let mut app = app_with_processes();
+        assert!(app.filter_input.is_empty());
+        let count = app.process_count();
+        app.handle_key_event(key(KeyCode::Esc));
+        assert_eq!(app.process_count(), count);
+    }
+
+    #[test]
+    fn test_i_reverses_sort_order() {
+        let mut app = app_with_processes();
+        assert!(matches!(app.sort_order, SortOrder::Desc));
+        app.handle_key_event(key(KeyCode::Char('I')));
+        assert!(matches!(app.sort_order, SortOrder::Asc));
+    }
+
+    // -- Epic 7: Status message --
+
+    #[test]
+    fn test_status_message_set_and_read() {
+        let mut app = AppState::new();
+        app.set_status("Test message".to_string());
+        assert_eq!(app.active_status(), Some("Test message"));
+    }
+
+    #[test]
+    fn test_status_clears_on_key_press() {
+        let mut app = app_with_processes();
+        app.set_status("Test message".to_string());
+        assert!(app.status_message.is_some());
+        // Any normal key press should clear status
+        app.handle_key_event(key(KeyCode::Down));
+        assert!(app.status_message.is_none());
+    }
+
+    // -- Epic 7: Command registry expanded --
+
+    #[test]
+    fn test_command_registry_has_new_commands() {
+        assert!(
+            Command::ALL.len() >= 19,
+            "Registry should have at least 19 commands, got {}",
+            Command::ALL.len()
+        );
+        assert!(Command::ALL.contains(&Command::KillProcess));
+        assert!(Command::ALL.contains(&Command::ForceKillProcess));
+        assert!(Command::ALL.contains(&Command::NiceDown));
+        assert!(Command::ALL.contains(&Command::NiceUp));
+        assert!(Command::ALL.contains(&Command::ClearFilter));
+    }
+
+    #[test]
+    fn test_palette_execute_clear_filter() {
+        let mut app = app_with_processes();
+        app.filter_input = "test".to_string();
+        app.execute_command(Command::ClearFilter);
+        assert!(app.filter_input.is_empty());
     }
 }

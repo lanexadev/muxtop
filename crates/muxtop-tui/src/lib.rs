@@ -4,7 +4,7 @@ pub mod event;
 pub mod terminal;
 pub mod ui;
 
-pub use app::{AppState, Command, PaletteState, Tab};
+pub use app::{AppState, Command, ConfirmAction, PaletteState, Tab};
 pub use error::TuiError;
 pub use event::{Event, EventHandler, TICK_RATE};
 pub use terminal::{TerminalGuard, Tui, init_terminal, install_panic_hook, restore_terminal};
