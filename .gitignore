@@ -30,3 +30,4 @@
 # FORGE output (dev-only)
 .claude/
 CONTRACT-*.md
+xtop.md
