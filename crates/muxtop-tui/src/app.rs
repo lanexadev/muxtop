@@ -6,7 +6,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKi
 use nucleo::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo::{Config, Matcher, Utf32Str};
 
-use muxtop_core::actions;
+use muxtop_core::actions::{self, Signal};
 use muxtop_core::process::{
     ProcessInfo, SortField, SortOrder, build_process_tree, filter_processes, flatten_tree,
     sort_processes,
@@ -24,7 +24,7 @@ use crate::terminal::TermCaps;
 #[derive(Debug, Clone)]
 pub enum ConfirmAction {
     /// Kill a process with the given signal.
-    Kill { pid: u32, name: String, signal: i32 },
+    Kill { pid: u32, name: String, signal: Signal },
     /// Change the nice value of a process.
     Renice { pid: u32, name: String, delta: i32 },
 }
@@ -34,10 +34,9 @@ impl ConfirmAction {
     pub fn prompt(&self) -> String {
         match self {
             ConfirmAction::Kill { pid, name, signal } => {
-                let sig_name = if *signal == libc::SIGKILL {
-                    "SIGKILL"
-                } else {
-                    "SIGTERM"
+                let sig_name = match signal {
+                    Signal::Kill => "SIGKILL",
+                    Signal::Term => "SIGTERM",
                 };
                 format!("Send {sig_name} to {name} (PID {pid})?  [y/n]")
             }
@@ -549,14 +548,14 @@ impl AppState {
             // Kill process — F9 (Processes tab only)
             KeyCode::F(9) => {
                 if self.tab == Tab::Processes {
-                    self.request_kill(libc::SIGTERM);
+                    self.request_kill(Signal::Term);
                 }
             }
 
             // Force kill — F10 (Processes tab only)
             KeyCode::F(10) => {
                 if self.tab == Tab::Processes {
-                    self.request_kill(libc::SIGKILL);
+                    self.request_kill(Signal::Kill);
                 }
             }
 
@@ -595,7 +594,7 @@ impl AppState {
     }
 
     /// Request to kill the currently selected process (opens confirm dialog).
-    fn request_kill(&mut self, signal: i32) {
+    fn request_kill(&mut self, signal: Signal) {
         if let Some(proc) = self.selected_process() {
             self.confirm = Some(ConfirmAction::Kill {
                 pid: proc.pid,
@@ -641,10 +640,9 @@ impl AppState {
     fn execute_confirm(&mut self, action: ConfirmAction) {
         match action {
             ConfirmAction::Kill { pid, name, signal } => {
-                let sig_name = if signal == libc::SIGKILL {
-                    "SIGKILL"
-                } else {
-                    "SIGTERM"
+                let sig_name = match signal {
+                    Signal::Kill => "SIGKILL",
+                    Signal::Term => "SIGTERM",
                 };
                 match actions::kill_process(pid, signal) {
                     Ok(()) => self.set_status(format!("Sent {sig_name} to {name} (PID {pid})")),
@@ -652,20 +650,8 @@ impl AppState {
                 }
             }
             ConfirmAction::Renice { pid, name, delta } => {
-                // We don't know the current nice value, so we read it first
-                // via libc::getpriority, then apply the delta.
-                let current = unsafe {
-                    // Clear errno before getpriority (it can return -1 legitimately).
-                    #[cfg(target_os = "macos")]
-                    {
-                        *libc::__error() = 0;
-                    }
-                    #[cfg(target_os = "linux")]
-                    {
-                        *libc::__errno_location() = 0;
-                    }
-                    libc::getpriority(libc::PRIO_PROCESS, pid as libc::id_t)
-                };
+                // Read current nice value via the centralized core wrapper, then apply delta.
+                let current = actions::get_process_priority(pid).unwrap_or(0);
                 let new_nice = current + delta;
                 match actions::renice_process(pid, new_nice) {
                     Ok(()) => {
@@ -791,12 +777,12 @@ impl AppState {
             }
             Command::KillProcess => {
                 if self.tab == Tab::Processes {
-                    self.request_kill(libc::SIGTERM);
+                    self.request_kill(Signal::Term);
                 }
             }
             Command::ForceKillProcess => {
                 if self.tab == Tab::Processes {
-                    self.request_kill(libc::SIGKILL);
+                    self.request_kill(Signal::Kill);
                 }
             }
             Command::NiceDown => {
@@ -815,6 +801,9 @@ impl AppState {
             }
         }
     }
+
+    /// Maximum number of characters accepted in the process filter input.
+    const MAX_FILTER_LEN: usize = 256;
 
     /// Handle keys while in filter input mode.
     fn handle_filter_key(&mut self, key: KeyEvent) {
@@ -837,8 +826,10 @@ impl AppState {
                 self.recompute_visible();
             }
             KeyCode::Char(c) => {
-                self.filter_input.push(c);
-                self.recompute_visible();
+                if self.filter_input.len() < Self::MAX_FILTER_LEN {
+                    self.filter_input.push(c);
+                    self.recompute_visible();
+                }
             }
             _ => {}
         }
@@ -1671,7 +1662,7 @@ mod tests {
         app.handle_key_event(key(KeyCode::F(9)));
         assert!(app.confirm.is_some());
         if let Some(ConfirmAction::Kill { signal, .. }) = &app.confirm {
-            assert_eq!(*signal, libc::SIGTERM);
+            assert_eq!(*signal, Signal::Term);
         } else {
             panic!("Expected Kill confirm action");
         }
@@ -1684,7 +1675,7 @@ mod tests {
         app.handle_key_event(key(KeyCode::F(10)));
         assert!(app.confirm.is_some());
         if let Some(ConfirmAction::Kill { signal, .. }) = &app.confirm {
-            assert_eq!(*signal, libc::SIGKILL);
+            assert_eq!(*signal, Signal::Kill);
         } else {
             panic!("Expected Kill confirm with SIGKILL");
         }
@@ -1855,7 +1846,7 @@ mod tests {
         let action = ConfirmAction::Kill {
             pid: 1234,
             name: "firefox".to_string(),
-            signal: libc::SIGTERM,
+            signal: Signal::Term,
         };
         let prompt = action.prompt();
         assert!(prompt.contains("SIGTERM"), "Should contain SIGTERM");
@@ -1869,7 +1860,7 @@ mod tests {
         let action = ConfirmAction::Kill {
             pid: 999,
             name: "chrome".to_string(),
-            signal: libc::SIGKILL,
+            signal: Signal::Kill,
         };
         let prompt = action.prompt();
         assert!(prompt.contains("SIGKILL"), "Should contain SIGKILL");
