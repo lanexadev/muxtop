@@ -330,7 +330,6 @@ mod tests {
     use crate::app::{AppState, Tab};
     use muxtop_core::system::*;
     use ratatui::{Terminal, backend::TestBackend};
-    use std::time::Instant;
 
     fn render_with(app: &AppState, width: u16, height: u16) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(width, height);
@@ -408,7 +407,7 @@ mod tests {
                 total_rx: 0,
                 total_tx: 0,
             },
-            timestamp: Instant::now(),
+            timestamp_ms: 0,
         }
     }
 

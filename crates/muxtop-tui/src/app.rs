@@ -1042,7 +1042,6 @@ fn next_net_sort_field(field: NetworkSortField) -> NetworkSortField {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
 
     fn make_process(pid: u32, name: &str, cpu: f32, mem: u64) -> ProcessInfo {
         ProcessInfo {
@@ -1085,7 +1084,7 @@ mod tests {
                 total_rx: 0,
                 total_tx: 0,
             },
-            timestamp: Instant::now(),
+            timestamp_ms: 0,
         }
     }
 

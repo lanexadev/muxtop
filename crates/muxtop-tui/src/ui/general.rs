@@ -356,7 +356,6 @@ mod tests {
     ) -> muxtop_core::system::SystemSnapshot {
         use muxtop_core::process::ProcessInfo;
         use muxtop_core::system::*;
-        use std::time::Instant;
 
         let cores = (0..core_count)
             .map(|i| CoreSnapshot {
@@ -409,7 +408,7 @@ mod tests {
                 total_rx: 0,
                 total_tx: 0,
             },
-            timestamp: Instant::now(),
+            timestamp_ms: 0,
         }
     }
 

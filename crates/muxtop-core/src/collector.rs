@@ -195,9 +195,10 @@ mod tests {
         token.cancel();
         handle.await.expect("collector task panicked");
 
-        let gap = second.timestamp.duration_since(first.timestamp);
-        let min = Duration::from_millis(500);
-        let max = Duration::from_millis(1500);
-        assert!(gap >= min && gap <= max, "expected gap ~1s, got {:?}", gap);
+        let gap_ms = second.timestamp_ms.saturating_sub(first.timestamp_ms);
+        assert!(
+            (500..=1500).contains(&gap_ms),
+            "expected gap ~1000ms, got {gap_ms}ms"
+        );
     }
 }

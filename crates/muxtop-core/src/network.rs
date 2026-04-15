@@ -1,8 +1,11 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
+use bincode::{Decode, Encode};
+use serde::{Deserialize, Serialize};
+
 /// Per-interface network snapshot.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct NetworkInterfaceSnapshot {
     pub name: String,
     pub bytes_rx: u64,
@@ -19,7 +22,7 @@ pub struct NetworkInterfaceSnapshot {
 }
 
 /// Aggregated network snapshot across all interfaces.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct NetworkSnapshot {
     pub interfaces: Vec<NetworkInterfaceSnapshot>,
     pub total_rx: u64,

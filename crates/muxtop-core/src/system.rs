@@ -1,10 +1,13 @@
-use std::time::Instant;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use bincode::{Decode, Encode};
+use serde::{Deserialize, Serialize};
 
 use crate::network::NetworkSnapshot;
 use crate::process::ProcessInfo;
 
 /// Per-core CPU snapshot.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct CoreSnapshot {
     pub name: String,
     pub usage: f32,
@@ -12,14 +15,14 @@ pub struct CoreSnapshot {
 }
 
 /// Aggregated CPU snapshot with global usage and per-core data.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct CpuSnapshot {
     pub global_usage: f32,
     pub cores: Vec<CoreSnapshot>,
 }
 
 /// Memory and swap snapshot (all values in bytes).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct MemorySnapshot {
     pub total: u64,
     pub used: u64,
@@ -29,7 +32,7 @@ pub struct MemorySnapshot {
 }
 
 /// System load averages and uptime.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct LoadSnapshot {
     pub one: f64,
     pub five: f64,
@@ -38,14 +41,15 @@ pub struct LoadSnapshot {
 }
 
 /// Full system snapshot aggregating all subsystems.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct SystemSnapshot {
     pub cpu: CpuSnapshot,
     pub memory: MemorySnapshot,
     pub load: LoadSnapshot,
     pub processes: Vec<ProcessInfo>,
     pub networks: NetworkSnapshot,
-    pub timestamp: Instant,
+    /// Milliseconds since Unix epoch.
+    pub timestamp_ms: u64,
 }
 
 impl SystemSnapshot {
@@ -140,7 +144,10 @@ impl SystemSnapshot {
             load,
             processes,
             networks,
-            timestamp: Instant::now(),
+            timestamp_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock before Unix epoch")
+                .as_millis() as u64,
         }
     }
 }

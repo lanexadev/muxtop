@@ -1,5 +1,8 @@
+use bincode::{Decode, Encode};
+use serde::{Deserialize, Serialize};
+
 /// Information about a single process.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct ProcessInfo {
     pub pid: u32,
     pub parent_pid: Option<u32>,

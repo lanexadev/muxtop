@@ -1,5 +1,4 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use std::time::Instant;
 
 use muxtop_core::process::ProcessInfo;
 use muxtop_core::system::{
@@ -59,7 +58,7 @@ fn make_snapshot(n: usize) -> SystemSnapshot {
             total_rx: 0,
             total_tx: 0,
         },
-        timestamp: Instant::now(),
+        timestamp_ms: 0,
     }
 }
 

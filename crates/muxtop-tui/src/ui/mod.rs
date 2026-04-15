@@ -337,7 +337,6 @@ mod tests {
     fn test_content_dispatches_by_tab() {
         use muxtop_core::process::ProcessInfo;
         use muxtop_core::system::*;
-        use std::time::Instant;
 
         // Provide a snapshot so tabs render distinct content (not both "Waiting for data...")
         let snap = SystemSnapshot {
@@ -378,7 +377,7 @@ mod tests {
                 total_rx: 0,
                 total_tx: 0,
             },
-            timestamp: Instant::now(),
+            timestamp_ms: 0,
         };
 
         let mut app = AppState::new();
@@ -471,7 +470,6 @@ mod tests {
     fn test_network_tab_with_interfaces() {
         use muxtop_core::network::{NetworkInterfaceSnapshot, NetworkSnapshot};
         use muxtop_core::system::*;
-        use std::time::Instant;
 
         let snap = SystemSnapshot {
             cpu: CpuSnapshot {
@@ -520,7 +518,7 @@ mod tests {
                 total_rx: 1_000_100,
                 total_tx: 500_100,
             },
-            timestamp: Instant::now(),
+            timestamp_ms: 0,
         };
 
         let mut app = AppState::new();
@@ -561,7 +559,6 @@ mod tests {
     fn test_network_tab_summary_bar() {
         use muxtop_core::network::{NetworkInterfaceSnapshot, NetworkSnapshot};
         use muxtop_core::system::*;
-        use std::time::Instant;
 
         let snap = SystemSnapshot {
             cpu: CpuSnapshot {
@@ -597,7 +594,7 @@ mod tests {
                 total_rx: 1000,
                 total_tx: 500,
             },
-            timestamp: Instant::now(),
+            timestamp_ms: 0,
         };
 
         let mut app = AppState::new();
@@ -618,7 +615,6 @@ mod tests {
     fn test_network_tab_shows_header_columns() {
         use muxtop_core::network::{NetworkInterfaceSnapshot, NetworkSnapshot};
         use muxtop_core::system::*;
-        use std::time::Instant;
 
         let snap = SystemSnapshot {
             cpu: CpuSnapshot {
@@ -654,7 +650,7 @@ mod tests {
                 total_rx: 0,
                 total_tx: 0,
             },
-            timestamp: Instant::now(),
+            timestamp_ms: 0,
         };
 
         let mut app = AppState::new();
