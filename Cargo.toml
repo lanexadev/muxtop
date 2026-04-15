@@ -4,7 +4,7 @@ resolver = "3"
 
 [workspace.package]
 edition = "2024"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Lucas Schimmel"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lanexadev/muxtop"
@@ -50,8 +50,8 @@ dirs = "6"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 # Internal crates
-muxtop-core = { path = "crates/muxtop-core", version = "0.1.0" }
-muxtop-tui = { path = "crates/muxtop-tui", version = "0.1.0" }
+muxtop-core = { path = "crates/muxtop-core", version = "0.1.1" }
+muxtop-tui = { path = "crates/muxtop-tui", version = "0.1.1" }
 
 [package]
 name = "muxtop"
