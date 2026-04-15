@@ -274,9 +274,13 @@ fn build_htop_bar(
     let g_end = ((max_filled as f64) * 0.50).round() as usize;
     let y_end = ((max_filled as f64) * 0.80).round() as usize;
 
-    let green_n  = filled.min(g_end);
-    let yellow_n = if filled > g_end  { (filled - g_end ).min(y_end - g_end) } else { 0 };
-    let red_n    = filled.saturating_sub(y_end);
+    let green_n = filled.min(g_end);
+    let yellow_n = if filled > g_end {
+        (filled - g_end).min(y_end - g_end)
+    } else {
+        0
+    };
+    let red_n = filled.saturating_sub(y_end);
 
     let empty = bar_w - filled - info_len;
 
@@ -287,9 +291,24 @@ fn build_htop_bar(
         ),
         Span::styled("[", Style::default().fg(theme.accent_primary)),
     ];
-    if green_n  > 0 { spans.push(Span::styled("|".repeat(green_n),  Style::default().fg(theme.success))); }
-    if yellow_n > 0 { spans.push(Span::styled("|".repeat(yellow_n), Style::default().fg(theme.warning))); }
-    if red_n    > 0 { spans.push(Span::styled("|".repeat(red_n),    Style::default().fg(theme.danger)));  }
+    if green_n > 0 {
+        spans.push(Span::styled(
+            "|".repeat(green_n),
+            Style::default().fg(theme.success),
+        ));
+    }
+    if yellow_n > 0 {
+        spans.push(Span::styled(
+            "|".repeat(yellow_n),
+            Style::default().fg(theme.warning),
+        ));
+    }
+    if red_n > 0 {
+        spans.push(Span::styled(
+            "|".repeat(red_n),
+            Style::default().fg(theme.danger),
+        ));
+    }
     spans.push(Span::raw(" ".repeat(empty)));
     spans.push(Span::styled(info, Style::default().fg(theme.text_dim)));
     spans.push(Span::styled("]", Style::default().fg(theme.accent_primary)));
