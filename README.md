@@ -26,18 +26,16 @@ brew tap lanexadev/tap
 brew install muxtop
 ```
 
-### Via .deb (Debian / Ubuntu)
-
-Téléchargez le `.deb` correspondant à votre architecture depuis la [dernière release](https://github.com/lanexadev/muxtop/releases/latest) :
+### Via APT (Debian / Ubuntu)
 
 ```sh
-# x86_64
-wget https://github.com/lanexadev/muxtop/releases/latest/download/muxtop-x86_64-unknown-linux-musl.deb
-sudo dpkg -i muxtop-x86_64-unknown-linux-musl.deb
+# Ajout du repo (une seule fois)
+curl -fsSL https://lanexadev.github.io/apt/gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/lanexadev.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/lanexadev.gpg] https://lanexadev.github.io/apt stable main" | sudo tee /etc/apt/sources.list.d/lanexadev.list
 
-# aarch64
-wget https://github.com/lanexadev/muxtop/releases/latest/download/muxtop-aarch64-unknown-linux-musl.deb
-sudo dpkg -i muxtop-aarch64-unknown-linux-musl.deb
+# Installation
+sudo apt update
+sudo apt install muxtop
 ```
 
 ### Binaire pré-compilé (Linux / macOS)
