@@ -6,119 +6,161 @@
 [![Crates.io](https://img.shields.io/crates/v/muxtop.svg)](https://crates.io/crates/muxtop)
 [![License](https://img.shields.io/crates/l/muxtop.svg)](LICENSE-MIT)
 
-muxtop replaces the `htop` + `iftop` + `ctop` workflow with a single tabbed interface.
-Think htop, but with a multiplexer UX (like tmux/zellij) and a VS Code-style command palette.
+muxtop remplace le workflow `htop` + `iftop` + `ctop` par une interface à onglets unique.
+Pensez htop, mais avec une UX de multiplexeur (à la tmux/zellij) et une palette de commandes à la VS Code.
 
-## Install
+---
 
-### From crates.io
+## Installation
+
+### Via crates.io
 
 ```sh
 cargo install muxtop
 ```
 
-### From binary (Linux / macOS)
+### Binaire pré-compilé (Linux / macOS)
 
 ```sh
 curl -sSfL https://raw.githubusercontent.com/lanexadev/muxtop/main/scripts/install.sh | sh
 ```
 
-### From source
+### Depuis les sources
 
 ```sh
 git clone https://github.com/lanexadev/muxtop.git
 cd muxtop
 cargo build --release
-# Binary at target/release/muxtop
+# Binaire disponible dans target/release/muxtop
 ```
 
-## Features
+> MSRV : Rust **1.88**
 
-- **Tabbed interface** — General and Processes tabs, switch with `Alt+1`/`Alt+2`
-- **Command palette** — `Ctrl+P` to open, type `kill firefox` or `sort memory` in natural language
-- **htop-compatible keybindings** — `F3` search, `F4` filter, `F5` tree view, `F6` sort, `F9` kill, `F10` quit
-- **Fuzzy search** — powered by [nucleo](https://github.com/helix-editor/nucleo) (from the Helix editor)
-- **Process tree view** — `F5` toggles hierarchical parent/child display
-- **Async data collection** — tokio-based collector never blocks the UI, even at 3000+ processes
-- **Zero dependencies** — single static musl binary, deploys like ripgrep
-- **Zero telemetry** — no network calls, ever (see [Privacy](#privacy--telemetry))
+---
+
+## Fonctionnalités
+
+| Fonctionnalité | Détail |
+|---|---|
+| **Onglets** | General (CPU, mémoire, charge) et Processes — `Alt+1` / `Alt+2` |
+| **Palette de commandes** | `Ctrl+P` — `kill firefox`, `sort memory`, etc. |
+| **Raccourcis htop** | `F3` recherche, `F4` filtre, `F5` arbre, `F6` tri, `F9` kill, `F10` quitter |
+| **Recherche fuzzy** | Propulsé par [nucleo](https://github.com/helix-editor/nucleo) (issu de l'éditeur Helix) |
+| **Vue arborescente** | `F5` bascule l'affichage hiérarchique parent/enfant |
+| **Renice** | `+` / `-` pour ajuster la priorité d'un processus |
+| **Collecte asynchrone** | Basé sur tokio — le UI n'est jamais bloqué, même à 3000+ processus |
+| **Thème Tokyo Night** | TrueColor natif, repli automatique sur les terminaux ANSI/16 couleurs |
+| **Binaire statique** | Un seul binaire musl, aucune dépendance système |
+| **Zéro télémétrie** | Aucun appel réseau, jamais (voir [Vie privée](#vie-privée--télémétrie)) |
+
+---
+
+## Utilisation
+
+```sh
+muxtop                          # lancement normal
+muxtop --refresh 2              # rafraîchissement toutes les 2 secondes
+muxtop --filter firefox         # démarre avec un filtre de processus
+muxtop --sort mem               # tri par mémoire au démarrage
+muxtop --tree                   # démarre en vue arborescente
+muxtop --about                  # version, licence, déclaration de confidentialité
+```
+
+### Raccourcis clavier
+
+| Touche | Action |
+|--------|--------|
+| `Ctrl+P` | Palette de commandes |
+| `Alt+1` / `Alt+2` | Changer d'onglet |
+| `F1` | Aide |
+| `F3` / `/` | Recherche |
+| `F4` | Filtre de processus |
+| `F5` | Vue arborescente |
+| `F6` | Menu de tri |
+| `F9` | Tuer le processus |
+| `F10` / `q` | Quitter |
+| `j` / `k` | Navigation (style vim) |
+| `+` / `-` | Renice (priorité) |
+
+---
 
 ## Benchmarks
 
-Tested on macOS with 500+ processes (Thomas benchmark):
+Testé sur macOS avec 500+ processus (benchmark Thomas) :
 
-| Metric | Target | muxtop |
-|--------|--------|--------|
-| Startup (`--about`) | < 100ms | ~5ms |
-| Binary size | < 10 MB | ~4 MB |
+| Métrique | Cible | muxtop |
+|----------|-------|--------|
+| Démarrage (`--about`) | < 100 ms | ~5 ms |
+| Taille du binaire | < 10 MB | ~4 MB |
 | FPS (TUI) | > 30 | ~60 |
 | RAM | < 10 MB | < 8 MB |
 
-Run the benchmark yourself:
+Lancez le benchmark vous-même :
 
 ```sh
 just bench-thomas
-# or
+# ou
 ./scripts/bench-thomas.sh
 ```
 
-## Usage
+---
 
-```sh
-muxtop                          # launch normally
-muxtop --refresh 2              # refresh every 2 seconds
-muxtop --filter firefox         # start with a process filter
-muxtop --sort mem               # sort by memory
-muxtop --tree                   # start in tree view
-muxtop --about                  # version, license, privacy pledge
+## Architecture
+
+```
+muxtop/
+├── src/                    # Point d'entrée (CLI clap + bootstrap tokio)
+└── crates/
+    ├── muxtop-core/        # Collecte système, modèles de données, actions
+    │   ├── src/collector.rs  # Boucle async sysinfo
+    │   ├── src/process.rs    # Tri, filtrage, arbre de processus
+    │   └── src/system.rs     # Snapshots CPU / mémoire / charge
+    └── muxtop-tui/         # Interface ratatui
+        ├── src/app.rs        # Machine à états, gestion des événements
+        └── src/ui/           # Onglets General, Processes, palette, thème
 ```
 
-### Key bindings
+---
 
-| Key | Action |
-|-----|--------|
-| `Ctrl+P` | Command palette |
-| `Alt+1` / `Alt+2` | Switch tabs |
-| `F1` | Help |
-| `F3` / `/` | Search |
-| `F4` | Filter processes |
-| `F5` | Toggle tree view |
-| `F6` | Sort menu |
-| `F9` | Kill process |
-| `F10` / `q` | Quit |
-| `j` / `k` | Navigate (vim-style) |
-
-## Roadmap
-
-| Version | Focus |
-|---------|-------|
-| **v0.1** | htop replacement — tabs, command palette, tree view |
-| v0.2 | Network tab (replaces iftop) + client-server architecture |
-| v0.3 | Containers tab (Docker/Podman/K8s) + GPU monitoring |
-| v1.0 | WASM plugin system + themes + config file |
-
-## Privacy & Telemetry
-
-muxtop collects **NO** telemetry, **NO** analytics, and phones home to **NOBODY**. Ever.
-
-It makes zero network calls. It is designed for air-gapped production servers.
-If you observe any outbound network activity from muxtop, it is a bug — please [report it](https://github.com/lanexadev/muxtop/issues).
-
-## Contributing
-
-Contributions are welcome. Please open an issue first to discuss what you'd like to change.
+## Développement
 
 ```sh
-just check    # fmt + clippy + test
-just bench    # criterion micro-benchmarks
-just dev      # continuous checking with bacon
+just check    # fmt + clippy + tests
+just bench    # micro-benchmarks criterion
+just dev      # vérification continue avec bacon
 ```
 
-## License
+---
 
-Licensed under either of:
+## Feuille de route
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
-- MIT License ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+| Version | Objectif |
+|---------|----------|
+| **v0.1** | Remplacement htop — onglets, palette de commandes, vue arborescente |
+| v0.2 | Onglet Réseau (remplace iftop) + architecture client-serveur |
+| v0.3 | Onglet Conteneurs (Docker / Podman / K8s) + monitoring GPU |
+| v1.0 | Système de plugins WASM + thèmes + fichier de configuration |
 
-at your option.
+---
+
+## Vie privée & télémétrie
+
+muxtop ne collecte **AUCUNE** télémétrie, **AUCUNE** statistique et ne contacte **PERSONNE**. Jamais.
+
+Il ne fait aucun appel réseau. Il est conçu pour les serveurs de production air-gappés.
+Si vous observez une activité réseau sortante depuis muxtop, c'est un bug — veuillez le [signaler](https://github.com/lanexadev/muxtop/issues).
+
+---
+
+## Contribuer
+
+Les contributions sont les bienvenues. Merci d'ouvrir d'abord une issue pour discuter des changements envisagés.
+
+---
+
+## Licence
+
+Disponible sous l'un ou l'autre des licences suivantes, à votre choix :
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT License ([LICENSE-MIT](LICENSE-MIT))
