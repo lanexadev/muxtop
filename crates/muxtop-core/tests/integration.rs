@@ -83,10 +83,12 @@ async fn test_full_pipeline_tree_build() {
 
 #[tokio::test]
 async fn test_full_pipeline_actions() {
-    // Signal 0 is a no-op existence check for our own process.
-    let pid = std::process::id();
-    let result = muxtop_core::actions::kill_process(pid, 0);
-    assert!(result.is_ok(), "kill(self, 0) should succeed: {result:?}");
+    // Verify that kill_process rejects an out-of-range PID without panicking.
+    let result = muxtop_core::actions::kill_process(u32::MAX, muxtop_core::actions::Signal::Term);
+    assert!(
+        matches!(result, Err(muxtop_core::CoreError::ProcessNotFound { .. })),
+        "kill(u32::MAX) must return ProcessNotFound: {result:?}"
+    );
 }
 
 #[tokio::test]

@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-04-15
+
+### Added
+
+#### Distribution
+- `.deb` package generation for Linux targets (x86_64 and aarch64) via `cargo-deb`, attached to GitHub Releases for Debian/Ubuntu installation.
+- Homebrew tap (`lanexadev/homebrew-tap`) with a formula supporting macOS (Intel + Apple Silicon) and Linux (x86_64 + aarch64).
+- Automatic Homebrew formula update in the release workflow on each new tag.
+
+### Fixed
+
+#### Security
+- Addressed findings from security audit SEC-20260415: refactored action handling in `muxtop-core`, hardened confirmation dialog, and reduced collector surface area.
+
 ## [0.1.0] - 2026-04-15
 
 Initial release of **muxtop** — a modern, multiplexed system monitor for the terminal.

@@ -992,7 +992,7 @@ dependencies = [
 
 [[package]]
 name = "muxtop"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1008,7 +1008,7 @@ dependencies = [
 
 [[package]]
 name = "muxtop-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "criterion",
  "libc",
@@ -1021,11 +1021,10 @@ dependencies = [
 
 [[package]]
 name = "muxtop-tui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "criterion",
  "crossterm",
- "libc",
  "muxtop-core",
  "nucleo",
  "ratatui",

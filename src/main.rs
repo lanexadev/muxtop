@@ -18,8 +18,8 @@ use muxtop_tui::CliConfig;
     author
 )]
 struct Cli {
-    /// Refresh interval in seconds
-    #[arg(long, default_value_t = 1)]
+    /// Refresh interval in seconds (1–3600)
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..=3600))]
     refresh: u64,
 
     /// Initial process filter pattern

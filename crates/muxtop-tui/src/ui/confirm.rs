@@ -71,7 +71,9 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use crate::app::{AppState, ConfirmAction};
-    use ratatui::{Terminal, backend::TestBackend};
+    use muxtop_core::actions::Signal;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn render_with(app: &AppState, width: u16, height: u16) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(width, height);
@@ -108,7 +110,7 @@ mod tests {
         app.confirm = Some(ConfirmAction::Kill {
             pid: 1234,
             name: "firefox".to_string(),
-            signal: libc::SIGTERM,
+            signal: Signal::Term,
         });
         let buf = render_with(&app, 80, 24);
         assert!(buffer_contains(&buf, "Confirm"));
@@ -123,7 +125,7 @@ mod tests {
         app.confirm = Some(ConfirmAction::Kill {
             pid: 42,
             name: "chrome".to_string(),
-            signal: libc::SIGKILL,
+            signal: Signal::Kill,
         });
         let buf = render_with(&app, 80, 24);
         assert!(buffer_contains(&buf, "SIGKILL"));
@@ -149,7 +151,7 @@ mod tests {
         app.confirm = Some(ConfirmAction::Kill {
             pid: 1,
             name: "init".to_string(),
-            signal: libc::SIGTERM,
+            signal: Signal::Term,
         });
         let _buf = render_with(&app, 10, 5);
         let _buf = render_with(&app, 1, 1);
@@ -160,7 +162,7 @@ mod tests {
         let kill = ConfirmAction::Kill {
             pid: 100,
             name: "test".to_string(),
-            signal: libc::SIGTERM,
+            signal: Signal::Term,
         };
         assert!(kill.prompt().contains("SIGTERM"));
         assert!(kill.prompt().contains("100"));
