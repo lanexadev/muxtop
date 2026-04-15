@@ -276,7 +276,7 @@ fn build_htop_bar(
 
     let green_n  = filled.min(g_end);
     let yellow_n = if filled > g_end  { (filled - g_end ).min(y_end - g_end) } else { 0 };
-    let red_n    = if filled > y_end  {  filled - y_end                       } else { 0 };
+    let red_n    = filled.saturating_sub(y_end);
 
     let empty = bar_w - filled - info_len;
 
@@ -306,7 +306,7 @@ mod tests {
     fn render_with(app: &AppState, width: u16, height: u16) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
-        let theme = super::super::theme::Theme::new(crate::terminal::ColorSupport::TrueColor);
+        let _theme = super::super::theme::Theme::new(crate::terminal::ColorSupport::TrueColor);
         terminal
             .draw(|frame| {
                 // Directly call draw_general_tab since using draw_root uses its own theme internal creation logic! Wait,
