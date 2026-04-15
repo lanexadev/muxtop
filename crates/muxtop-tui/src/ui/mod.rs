@@ -470,7 +470,6 @@ mod tests {
     #[test]
     fn test_network_tab_with_interfaces() {
         use muxtop_core::network::{NetworkInterfaceSnapshot, NetworkSnapshot};
-        use muxtop_core::process::ProcessInfo;
         use muxtop_core::system::*;
         use std::time::Instant;
 
