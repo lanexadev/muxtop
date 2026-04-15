@@ -1,5 +1,6 @@
 use std::time::Instant;
 
+use crate::network::NetworkSnapshot;
 use crate::process::ProcessInfo;
 
 /// Per-core CPU snapshot.
@@ -43,12 +44,13 @@ pub struct SystemSnapshot {
     pub memory: MemorySnapshot,
     pub load: LoadSnapshot,
     pub processes: Vec<ProcessInfo>,
+    pub networks: NetworkSnapshot,
     pub timestamp: Instant,
 }
 
 impl SystemSnapshot {
     /// Collect a full system snapshot from sysinfo.
-    pub fn collect(sys: &sysinfo::System) -> Self {
+    pub fn collect(sys: &sysinfo::System, networks: &sysinfo::Networks) -> Self {
         use sysinfo::System as SysSystem;
 
         let global_usage = sys.global_cpu_usage();
@@ -130,11 +132,14 @@ impl SystemSnapshot {
             })
             .collect();
 
+        let networks = NetworkSnapshot::collect(networks);
+
         Self {
             cpu,
             memory,
             load,
             processes,
+            networks,
             timestamp: Instant::now(),
         }
     }
@@ -163,7 +168,8 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(200));
         sys.refresh_all();
 
-        let snap = SystemSnapshot::collect(&sys);
+        let networks = sysinfo::Networks::new_with_refreshed_list();
+        let snap = SystemSnapshot::collect(&sys, &networks);
         assert!(!snap.cpu.cores.is_empty(), "should have CPU cores");
         assert!(snap.memory.total > 0, "should have total memory");
         assert!(!snap.processes.is_empty(), "should have processes");
@@ -176,7 +182,8 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(200));
         sys.refresh_all();
 
-        let snap = SystemSnapshot::collect(&sys);
+        let networks = sysinfo::Networks::new_with_refreshed_list();
+        let snap = SystemSnapshot::collect(&sys, &networks);
         assert!(
             snap.cpu.global_usage >= 0.0 && snap.cpu.global_usage <= 100.0,
             "global CPU usage should be 0..=100, got {}",
@@ -197,7 +204,8 @@ mod tests {
         let mut sys = System::new_all();
         sys.refresh_all();
 
-        let snap = SystemSnapshot::collect(&sys);
+        let networks = sysinfo::Networks::new_with_refreshed_list();
+        let snap = SystemSnapshot::collect(&sys, &networks);
         assert!(snap.memory.total > 0, "total memory should be positive");
         // used + available can slightly exceed total due to kernel accounting
         // but total should be >= used
@@ -206,6 +214,30 @@ mod tests {
             "total ({}) should be >= used ({})",
             snap.memory.total,
             snap.memory.used
+        );
+    }
+
+    #[test]
+    fn test_system_snapshot_has_networks() {
+        use sysinfo::System;
+        let mut sys = System::new_all();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        sys.refresh_all();
+        let networks = sysinfo::Networks::new_with_refreshed_list();
+
+        let snap = SystemSnapshot::collect(&sys, &networks);
+        assert!(
+            !snap.networks.interfaces.is_empty(),
+            "should have network interfaces"
+        );
+        assert_eq!(
+            snap.networks.total_rx,
+            snap.networks
+                .interfaces
+                .iter()
+                .map(|i| i.bytes_rx)
+                .sum::<u64>(),
+            "total_rx should be consistent"
         );
     }
 

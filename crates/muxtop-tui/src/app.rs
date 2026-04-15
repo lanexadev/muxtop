@@ -885,6 +885,7 @@ mod tests {
     }
 
     fn make_snapshot(processes: Vec<ProcessInfo>) -> SystemSnapshot {
+        use muxtop_core::network::NetworkSnapshot;
         use muxtop_core::system::{CpuSnapshot, LoadSnapshot, MemorySnapshot};
         SystemSnapshot {
             cpu: CpuSnapshot {
@@ -905,6 +906,11 @@ mod tests {
                 uptime_secs: 3600,
             },
             processes,
+            networks: NetworkSnapshot {
+                interfaces: vec![],
+                total_rx: 0,
+                total_tx: 0,
+            },
             timestamp: Instant::now(),
         }
     }

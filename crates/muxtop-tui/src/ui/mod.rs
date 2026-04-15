@@ -360,6 +360,11 @@ mod tests {
                 memory_percent: 1.0,
                 status: "Running".to_string(),
             }],
+            networks: muxtop_core::network::NetworkSnapshot {
+                interfaces: vec![],
+                total_rx: 0,
+                total_tx: 0,
+            },
             timestamp: Instant::now(),
         };
 
