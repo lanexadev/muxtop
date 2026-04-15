@@ -180,6 +180,22 @@ jobs:
           git commit -m "feat: update muxtop to ${VERSION}"
           git push
 
+  update-apt:
+    name: Update APT Repository
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger APT repo update
+        run: |
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+          gh workflow run update-repo.yml \
+            --repo lanexadev/apt \
+            --field version="${VERSION}" \
+            --field source_repo="lanexadev/muxtop"
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
   publish:
     name: Publish to crates.io
     needs: release
