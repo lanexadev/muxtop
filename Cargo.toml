@@ -68,6 +68,17 @@ default-run = "muxtop"
 name = "muxtop"
 path = "src/main.rs"
 
+[package.metadata.deb]
+maintainer = "Lucas Schimmel"
+copyright = "2026 Lucas Schimmel"
+depends = "$auto"
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/muxtop", "usr/bin/", "755"],
+]
+extended-description = "A modern, multiplexed system monitor for the terminal. Features real-time CPU, memory, disk, and network monitoring with a TUI interface, process tree view, and fuzzy search."
+
 [dependencies]
 muxtop-core = { workspace = true }
 muxtop-tui = { workspace = true }
