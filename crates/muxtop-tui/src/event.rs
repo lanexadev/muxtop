@@ -85,6 +85,7 @@ mod tests {
         assert!(!format!("{resize:?}").is_empty());
 
         // Snapshot variant requires a SystemSnapshot
+        use muxtop_core::network::NetworkSnapshot;
         use muxtop_core::system::{CpuSnapshot, LoadSnapshot, MemorySnapshot};
         use std::time::Instant;
         let snap = SystemSnapshot {
@@ -106,6 +107,11 @@ mod tests {
                 uptime_secs: 0,
             },
             processes: vec![],
+            networks: NetworkSnapshot {
+                interfaces: vec![],
+                total_rx: 0,
+                total_tx: 0,
+            },
             timestamp: Instant::now(),
         };
         let snapshot_event = Event::Snapshot(snap);

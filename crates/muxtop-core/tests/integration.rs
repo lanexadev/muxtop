@@ -82,6 +82,41 @@ async fn test_full_pipeline_tree_build() {
 }
 
 #[tokio::test]
+async fn test_network_in_full_pipeline() {
+    let snapshot = collect_one_snapshot().await;
+
+    assert!(
+        !snapshot.networks.interfaces.is_empty(),
+        "snapshot should have network interfaces"
+    );
+    assert_eq!(
+        snapshot.networks.total_rx,
+        snapshot
+            .networks
+            .interfaces
+            .iter()
+            .map(|i| i.bytes_rx)
+            .sum::<u64>(),
+        "total_rx should be consistent"
+    );
+    assert_eq!(
+        snapshot.networks.total_tx,
+        snapshot
+            .networks
+            .interfaces
+            .iter()
+            .map(|i| i.bytes_tx)
+            .sum::<u64>(),
+        "total_tx should be consistent"
+    );
+
+    // Verify all interface names are non-empty
+    for iface in &snapshot.networks.interfaces {
+        assert!(!iface.name.is_empty(), "interface name should not be empty");
+    }
+}
+
+#[tokio::test]
 async fn test_full_pipeline_actions() {
     // Verify that kill_process rejects an out-of-range PID without panicking.
     let result = muxtop_core::actions::kill_process(u32::MAX, muxtop_core::actions::Signal::Term);

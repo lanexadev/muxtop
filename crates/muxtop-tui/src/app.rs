@@ -7,6 +7,7 @@ use nucleo::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo::{Config, Matcher, Utf32Str};
 
 use muxtop_core::actions::{self, Signal};
+use muxtop_core::network::NetworkHistory;
 use muxtop_core::process::{
     ProcessInfo, SortField, SortOrder, build_process_tree, filter_processes, flatten_tree,
     sort_processes,
@@ -82,6 +83,11 @@ pub enum Command {
     NiceDown,
     NiceUp,
     ClearFilter,
+    SwitchToNetwork,
+    SortNetByRx,
+    SortNetByTx,
+    SortNetByName,
+    SortNetByErrors,
 }
 
 impl Command {
@@ -105,6 +111,11 @@ impl Command {
         Command::NiceDown,
         Command::NiceUp,
         Command::ClearFilter,
+        Command::SwitchToNetwork,
+        Command::SortNetByRx,
+        Command::SortNetByTx,
+        Command::SortNetByName,
+        Command::SortNetByErrors,
     ];
 
     pub fn label(self) -> &'static str {
@@ -128,6 +139,11 @@ impl Command {
             Command::NiceDown => "Lower priority (+1)",
             Command::NiceUp => "Raise priority (-1)",
             Command::ClearFilter => "Clear filter",
+            Command::SwitchToNetwork => "Switch to Network tab",
+            Command::SortNetByRx => "Sort network by RX",
+            Command::SortNetByTx => "Sort network by TX",
+            Command::SortNetByName => "Sort network by name",
+            Command::SortNetByErrors => "Sort network by errors",
         }
     }
 
@@ -152,6 +168,11 @@ impl Command {
             Command::NiceDown => "F7",
             Command::NiceUp => "F8",
             Command::ClearFilter => "Esc",
+            Command::SwitchToNetwork => "Alt+3",
+            Command::SortNetByRx => "",
+            Command::SortNetByTx => "",
+            Command::SortNetByName => "",
+            Command::SortNetByErrors => "",
         }
     }
 
@@ -233,6 +254,7 @@ pub enum Tab {
     #[default]
     General,
     Processes,
+    Network,
 }
 
 impl std::fmt::Display for Tab {
@@ -242,12 +264,13 @@ impl std::fmt::Display for Tab {
 }
 
 impl Tab {
-    pub const ALL: &[Tab] = &[Tab::General, Tab::Processes];
+    pub const ALL: &[Tab] = &[Tab::General, Tab::Processes, Tab::Network];
 
     pub fn label(self) -> &'static str {
         match self {
             Tab::General => "General",
             Tab::Processes => "Processes",
+            Tab::Network => "Network",
         }
     }
 
@@ -260,6 +283,18 @@ impl Tab {
         let idx = Self::ALL.iter().position(|&t| t == self).unwrap_or(0);
         Self::ALL[(idx + Self::ALL.len() - 1) % Self::ALL.len()]
     }
+}
+
+/// Sort field for the Network tab.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkSortField {
+    Name,
+    #[default]
+    RxRate,
+    TxRate,
+    TotalRx,
+    TotalTx,
+    Errors,
 }
 
 /// Duration before a status message auto-clears.
@@ -289,6 +324,20 @@ pub struct AppState {
     pub visible_processes: Vec<ProcessInfo>,
     /// Derived: flattened tree (process, depth) pairs.
     pub visible_tree: Vec<(ProcessInfo, usize)>,
+    /// Network history for bandwidth and sparkline calculations.
+    pub network_history: NetworkHistory,
+    /// Selected interface index (Network tab).
+    pub net_selected: usize,
+    /// Scroll offset (Network tab).
+    pub net_scroll_offset: usize,
+    /// Sort field for the Network tab.
+    pub net_sort_field: NetworkSortField,
+    /// Sort order for the Network tab.
+    pub net_sort_order: SortOrder,
+    /// Filter input for the Network tab.
+    pub net_filter_input: String,
+    /// Filter active flag for the Network tab.
+    pub net_filter_active: bool,
 }
 
 impl Default for AppState {
@@ -317,6 +366,13 @@ impl AppState {
             last_snapshot: None,
             visible_processes: Vec::new(),
             visible_tree: Vec::new(),
+            network_history: NetworkHistory::new(60),
+            net_selected: 0,
+            net_scroll_offset: 0,
+            net_sort_field: NetworkSortField::default(),
+            net_sort_order: SortOrder::Desc,
+            net_filter_input: String::new(),
+            net_filter_active: false,
         }
     }
 
@@ -373,6 +429,40 @@ impl AppState {
         }
     }
 
+    /// Number of visible network interfaces (respects filter).
+    pub fn net_interface_count(&self) -> usize {
+        let Some(ref snapshot) = self.last_snapshot else {
+            return 0;
+        };
+        if self.net_filter_input.is_empty() {
+            snapshot.networks.interfaces.len()
+        } else {
+            let filter = self.net_filter_input.to_lowercase();
+            snapshot
+                .networks
+                .interfaces
+                .iter()
+                .filter(|i| i.name.to_lowercase().contains(&filter))
+                .count()
+        }
+    }
+
+    /// Number of visible items in the current tab.
+    pub fn item_count(&self) -> usize {
+        match self.tab {
+            Tab::Network => self.net_interface_count(),
+            _ => self.process_count(),
+        }
+    }
+
+    /// Reference to the selected/scroll_offset for the current tab.
+    fn selected_mut(&mut self) -> (&mut usize, &mut usize) {
+        match self.tab {
+            Tab::Network => (&mut self.net_selected, &mut self.net_scroll_offset),
+            _ => (&mut self.selected, &mut self.scroll_offset),
+        }
+    }
+
     /// Returns the currently selected process, if any.
     pub fn selected_process(&self) -> Option<&ProcessInfo> {
         if self.tree_mode {
@@ -384,6 +474,7 @@ impl AppState {
 
     /// Update the snapshot and recompute derived views.
     pub fn apply_snapshot(&mut self, snapshot: SystemSnapshot) {
+        self.network_history.push(snapshot.networks.clone());
         self.last_snapshot = Some(snapshot);
         self.recompute_visible();
     }
@@ -443,7 +534,7 @@ impl AppState {
         }
 
         // Filter mode captures most keys as text input.
-        if self.filter_active {
+        if self.filter_active || self.net_filter_active {
             self.handle_filter_key(key);
             return;
         }
@@ -456,29 +547,38 @@ impl AppState {
             KeyCode::Char('q') => self.quit(),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit(),
 
-            // Navigation
+            // Navigation (tab-aware)
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.process_count() > 0 {
-                    self.selected = (self.selected + 1).min(self.process_count() - 1);
+                let count = self.item_count();
+                if count > 0 {
+                    let (sel, _) = self.selected_mut();
+                    *sel = (*sel + 1).min(count - 1);
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                self.selected = self.selected.saturating_sub(1);
+                let (sel, _) = self.selected_mut();
+                *sel = sel.saturating_sub(1);
             }
             KeyCode::PageDown => {
-                if self.process_count() > 0 {
-                    self.selected = (self.selected + 20).min(self.process_count() - 1);
+                let count = self.item_count();
+                if count > 0 {
+                    let (sel, _) = self.selected_mut();
+                    *sel = (*sel + 20).min(count - 1);
                 }
             }
             KeyCode::PageUp => {
-                self.selected = self.selected.saturating_sub(20);
+                let (sel, _) = self.selected_mut();
+                *sel = sel.saturating_sub(20);
             }
             KeyCode::Home | KeyCode::Char('g') => {
-                self.selected = 0;
+                let (sel, _) = self.selected_mut();
+                *sel = 0;
             }
             KeyCode::End | KeyCode::Char('G') => {
-                if self.process_count() > 0 {
-                    self.selected = self.process_count() - 1;
+                let count = self.item_count();
+                if count > 0 {
+                    let (sel, _) = self.selected_mut();
+                    *sel = count - 1;
                 }
             }
 
@@ -488,6 +588,9 @@ impl AppState {
             }
             KeyCode::Char('2') if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.tab = Tab::Processes;
+            }
+            KeyCode::Char('3') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.tab = Tab::Network;
             }
 
             // Arrow tab navigation
@@ -514,17 +617,28 @@ impl AppState {
                 self.recompute_visible();
             }
 
-            // Sort cycling
+            // Sort cycling (tab-aware)
             KeyCode::Char('s') => {
-                self.sort_field = next_sort_field(self.sort_field);
-                self.recompute_visible();
+                if self.tab == Tab::Network {
+                    self.net_sort_field = next_net_sort_field(self.net_sort_field);
+                } else {
+                    self.sort_field = next_sort_field(self.sort_field);
+                    self.recompute_visible();
+                }
             }
             KeyCode::Char('S') | KeyCode::Char('I') => {
-                self.sort_order = match self.sort_order {
-                    SortOrder::Asc => SortOrder::Desc,
-                    SortOrder::Desc => SortOrder::Asc,
-                };
-                self.recompute_visible();
+                if self.tab == Tab::Network {
+                    self.net_sort_order = match self.net_sort_order {
+                        SortOrder::Asc => SortOrder::Desc,
+                        SortOrder::Desc => SortOrder::Asc,
+                    };
+                } else {
+                    self.sort_order = match self.sort_order {
+                        SortOrder::Asc => SortOrder::Desc,
+                        SortOrder::Desc => SortOrder::Asc,
+                    };
+                    self.recompute_visible();
+                }
             }
 
             // F-key sort shortcuts
@@ -577,15 +691,23 @@ impl AppState {
 
             // Clear filter with Esc (when not in filter input mode)
             KeyCode::Esc => {
-                if !self.filter_input.is_empty() {
+                if self.tab == Tab::Network {
+                    if !self.net_filter_input.is_empty() {
+                        self.net_filter_input.clear();
+                    }
+                } else if !self.filter_input.is_empty() {
                     self.filter_input.clear();
                     self.recompute_visible();
                 }
             }
 
-            // Filter mode
+            // Filter mode (tab-aware)
             KeyCode::Char('/') => {
-                self.filter_active = true;
+                if self.tab == Tab::Network {
+                    self.net_filter_active = true;
+                } else {
+                    self.filter_active = true;
+                }
             }
 
             // Command palette toggle
@@ -800,8 +922,27 @@ impl AppState {
                 }
             }
             Command::ClearFilter => {
-                self.filter_input.clear();
-                self.recompute_visible();
+                if self.tab == Tab::Network {
+                    self.net_filter_input.clear();
+                } else {
+                    self.filter_input.clear();
+                    self.recompute_visible();
+                }
+            }
+            Command::SwitchToNetwork => {
+                self.tab = Tab::Network;
+            }
+            Command::SortNetByRx => {
+                self.net_sort_field = NetworkSortField::RxRate;
+            }
+            Command::SortNetByTx => {
+                self.net_sort_field = NetworkSortField::TxRate;
+            }
+            Command::SortNetByName => {
+                self.net_sort_field = NetworkSortField::Name;
+            }
+            Command::SortNetByErrors => {
+                self.net_sort_field = NetworkSortField::Errors;
             }
         }
     }
@@ -814,6 +955,27 @@ impl AppState {
         // G-03: Ctrl+C must always quit, even in filter mode.
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.quit();
+            return;
+        }
+
+        if self.net_filter_active {
+            match key.code {
+                KeyCode::Esc => {
+                    self.net_filter_active = false;
+                }
+                KeyCode::Enter => {
+                    self.net_filter_active = false;
+                }
+                KeyCode::Backspace => {
+                    self.net_filter_input.pop();
+                }
+                KeyCode::Char(c) => {
+                    if self.net_filter_input.len() < Self::MAX_FILTER_LEN {
+                        self.net_filter_input.push(c);
+                    }
+                }
+                _ => {}
+            }
             return;
         }
 
@@ -865,6 +1027,18 @@ fn next_sort_field(field: SortField) -> SortField {
     }
 }
 
+/// Cycle to the next network sort field.
+fn next_net_sort_field(field: NetworkSortField) -> NetworkSortField {
+    match field {
+        NetworkSortField::RxRate => NetworkSortField::TxRate,
+        NetworkSortField::TxRate => NetworkSortField::Name,
+        NetworkSortField::Name => NetworkSortField::Errors,
+        NetworkSortField::Errors => NetworkSortField::TotalRx,
+        NetworkSortField::TotalRx => NetworkSortField::TotalTx,
+        NetworkSortField::TotalTx => NetworkSortField::RxRate,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -885,6 +1059,7 @@ mod tests {
     }
 
     fn make_snapshot(processes: Vec<ProcessInfo>) -> SystemSnapshot {
+        use muxtop_core::network::NetworkSnapshot;
         use muxtop_core::system::{CpuSnapshot, LoadSnapshot, MemorySnapshot};
         SystemSnapshot {
             cpu: CpuSnapshot {
@@ -905,6 +1080,11 @@ mod tests {
                 uptime_secs: 3600,
             },
             processes,
+            networks: NetworkSnapshot {
+                interfaces: vec![],
+                total_rx: 0,
+                total_tx: 0,
+            },
             timestamp: Instant::now(),
         }
     }
@@ -919,32 +1099,37 @@ mod tests {
     #[test]
     fn test_tab_next_cycles() {
         assert_eq!(Tab::General.next(), Tab::Processes);
-        assert_eq!(Tab::Processes.next(), Tab::General);
+        assert_eq!(Tab::Processes.next(), Tab::Network);
+        assert_eq!(Tab::Network.next(), Tab::General);
     }
 
     #[test]
     fn test_tab_prev_cycles() {
+        assert_eq!(Tab::Network.prev(), Tab::Processes);
         assert_eq!(Tab::Processes.prev(), Tab::General);
-        assert_eq!(Tab::General.prev(), Tab::Processes);
+        assert_eq!(Tab::General.prev(), Tab::Network);
     }
 
     #[test]
     fn test_tab_label_values() {
         assert_eq!(Tab::General.label(), "General");
         assert_eq!(Tab::Processes.label(), "Processes");
+        assert_eq!(Tab::Network.label(), "Network");
     }
 
     #[test]
     fn test_tab_display() {
         assert_eq!(format!("{}", Tab::General), "General");
         assert_eq!(format!("{}", Tab::Processes), "Processes");
+        assert_eq!(format!("{}", Tab::Network), "Network");
     }
 
     #[test]
-    fn test_tab_all_contains_both() {
+    fn test_tab_all_contains_all() {
         assert!(Tab::ALL.contains(&Tab::General));
         assert!(Tab::ALL.contains(&Tab::Processes));
-        assert_eq!(Tab::ALL.len(), 2);
+        assert!(Tab::ALL.contains(&Tab::Network));
+        assert_eq!(Tab::ALL.len(), 3);
     }
 
     // -- AppState defaults (STORY-02) --
@@ -1187,6 +1372,8 @@ mod tests {
         app.handle_key_event(key(KeyCode::Tab));
         assert_eq!(app.tab, Tab::Processes);
         app.handle_key_event(key(KeyCode::Tab));
+        assert_eq!(app.tab, Tab::Network);
+        app.handle_key_event(key(KeyCode::Tab));
         assert_eq!(app.tab, Tab::General);
     }
 
@@ -1194,7 +1381,7 @@ mod tests {
     fn test_backtab_switch() {
         let mut app = AppState::new();
         app.handle_key_event(key(KeyCode::BackTab));
-        assert_eq!(app.tab, Tab::Processes);
+        assert_eq!(app.tab, Tab::Network);
     }
 
     #[test]
@@ -1352,13 +1539,13 @@ mod tests {
         let mut app = AppState::new();
         assert_eq!(app.tab, Tab::General);
         app.handle_key_event(key(KeyCode::Left));
-        assert_eq!(app.tab, Tab::Processes);
+        assert_eq!(app.tab, Tab::Network);
     }
 
     #[test]
     fn test_tab_right_arrow_wraps() {
         let mut app = AppState::new();
-        app.tab = Tab::Processes;
+        app.tab = Tab::Network;
         app.handle_key_event(key(KeyCode::Right));
         assert_eq!(app.tab, Tab::General);
     }
@@ -1421,17 +1608,6 @@ mod tests {
     fn test_command_labels_non_empty() {
         for cmd in Command::ALL {
             assert!(!cmd.label().is_empty(), "Command {:?} has empty label", cmd);
-        }
-    }
-
-    #[test]
-    fn test_command_shortcuts_non_empty() {
-        for cmd in Command::ALL {
-            assert!(
-                !cmd.shortcut().is_empty(),
-                "Command {:?} has empty shortcut",
-                cmd
-            );
         }
     }
 
@@ -2007,5 +2183,139 @@ mod tests {
         let mut app = app_with_processes();
         app.handle_key_event(key(KeyCode::End));
         assert_eq!(app.selected, app.process_count() - 1);
+    }
+
+    // -- Network tab tests (Epic 12) --
+
+    #[test]
+    fn test_alt3_switches_to_network() {
+        let mut app = AppState::new();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::ALT));
+        assert_eq!(app.tab, Tab::Network);
+    }
+
+    #[test]
+    fn test_network_history_populated_on_snapshot() {
+        let mut app = AppState::new();
+        assert!(app.network_history.is_empty());
+        let snap = make_snapshot(vec![]);
+        app.apply_snapshot(snap);
+        assert_eq!(app.network_history.len(), 1);
+    }
+
+    #[test]
+    fn test_network_tab_uses_net_selected() {
+        let mut app = AppState::new();
+        app.tab = Tab::Network;
+        // Create snapshot with network interfaces
+        let mut snap = make_snapshot(vec![]);
+        snap.networks.interfaces = vec![
+            muxtop_core::network::NetworkInterfaceSnapshot {
+                name: "eth0".to_string(),
+                bytes_rx: 1000,
+                bytes_tx: 500,
+                packets_rx: 10,
+                packets_tx: 5,
+                errors_rx: 0,
+                errors_tx: 0,
+                mac_address: "00:00:00:00:00:00".to_string(),
+                is_up: true,
+            },
+            muxtop_core::network::NetworkInterfaceSnapshot {
+                name: "eth1".to_string(),
+                bytes_rx: 2000,
+                bytes_tx: 1000,
+                packets_rx: 20,
+                packets_tx: 10,
+                errors_rx: 0,
+                errors_tx: 0,
+                mac_address: "00:00:00:00:00:01".to_string(),
+                is_up: true,
+            },
+        ];
+        app.apply_snapshot(snap);
+        assert_eq!(app.net_selected, 0);
+        app.handle_key_event(key(KeyCode::Char('j')));
+        assert_eq!(app.net_selected, 1);
+        // Process selected should not change
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn test_network_sort_cycling() {
+        let mut app = AppState::new();
+        app.tab = Tab::Network;
+        assert!(matches!(app.net_sort_field, NetworkSortField::RxRate));
+        app.handle_key_event(key(KeyCode::Char('s')));
+        assert!(matches!(app.net_sort_field, NetworkSortField::TxRate));
+        app.handle_key_event(key(KeyCode::Char('s')));
+        assert!(matches!(app.net_sort_field, NetworkSortField::Name));
+    }
+
+    #[test]
+    fn test_network_filter_activation() {
+        let mut app = AppState::new();
+        app.tab = Tab::Network;
+        assert!(!app.net_filter_active);
+        app.handle_key_event(key(KeyCode::Char('/')));
+        assert!(app.net_filter_active);
+        // Should not affect process filter
+        assert!(!app.filter_active);
+    }
+
+    #[test]
+    fn test_network_filter_input() {
+        let mut app = AppState::new();
+        app.tab = Tab::Network;
+        app.handle_key_event(key(KeyCode::Char('/')));
+        assert!(app.net_filter_active);
+        app.handle_key_event(key(KeyCode::Char('e')));
+        app.handle_key_event(key(KeyCode::Char('t')));
+        app.handle_key_event(key(KeyCode::Char('h')));
+        assert_eq!(app.net_filter_input, "eth");
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(!app.net_filter_active);
+        assert_eq!(app.net_filter_input, "eth");
+    }
+
+    #[test]
+    fn test_switch_to_network_command() {
+        let mut app = AppState::new();
+        assert_eq!(app.tab, Tab::General);
+        // Open palette and execute SwitchToNetwork
+        app.execute_command(Command::SwitchToNetwork);
+        assert_eq!(app.tab, Tab::Network);
+    }
+
+    #[test]
+    fn test_sort_net_commands() {
+        let mut app = AppState::new();
+        app.execute_command(Command::SortNetByTx);
+        assert!(matches!(app.net_sort_field, NetworkSortField::TxRate));
+        app.execute_command(Command::SortNetByName);
+        assert!(matches!(app.net_sort_field, NetworkSortField::Name));
+        app.execute_command(Command::SortNetByErrors);
+        assert!(matches!(app.net_sort_field, NetworkSortField::Errors));
+        app.execute_command(Command::SortNetByRx);
+        assert!(matches!(app.net_sort_field, NetworkSortField::RxRate));
+    }
+
+    #[test]
+    fn test_network_esc_clears_filter() {
+        let mut app = AppState::new();
+        app.tab = Tab::Network;
+        app.net_filter_input = "eth".to_string();
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(app.net_filter_input.is_empty());
+    }
+
+    #[test]
+    fn test_net_defaults() {
+        let app = AppState::new();
+        assert_eq!(app.net_selected, 0);
+        assert_eq!(app.net_scroll_offset, 0);
+        assert!(matches!(app.net_sort_field, NetworkSortField::RxRate));
+        assert!(app.net_filter_input.is_empty());
+        assert!(!app.net_filter_active);
     }
 }

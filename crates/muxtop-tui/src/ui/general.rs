@@ -404,6 +404,11 @@ mod tests {
                 uptime_secs: 90061,
             },
             processes,
+            networks: muxtop_core::network::NetworkSnapshot {
+                interfaces: vec![],
+                total_rx: 0,
+                total_tx: 0,
+            },
             timestamp: Instant::now(),
         }
     }

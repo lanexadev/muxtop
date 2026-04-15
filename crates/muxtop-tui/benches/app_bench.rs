@@ -54,6 +54,11 @@ fn make_snapshot(n: usize) -> SystemSnapshot {
             uptime_secs: 86400,
         },
         processes: make_processes(n),
+        networks: muxtop_core::network::NetworkSnapshot {
+            interfaces: vec![],
+            total_rx: 0,
+            total_tx: 0,
+        },
         timestamp: Instant::now(),
     }
 }

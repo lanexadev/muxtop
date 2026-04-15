@@ -9,6 +9,7 @@ use crate::system::SystemSnapshot;
 
 pub struct Collector {
     sys: sysinfo::System,
+    networks: sysinfo::Networks,
     interval: Duration,
 }
 
@@ -16,6 +17,7 @@ impl Collector {
     pub fn new(interval: Duration) -> Self {
         Self {
             sys: sysinfo::System::new_all(),
+            networks: sysinfo::Networks::new_with_refreshed_list(),
             interval,
         }
     }
@@ -36,15 +38,20 @@ impl Collector {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         // First tick completes immediately — do an initial refresh to seed
-        // the sysinfo delta baseline (needed for accurate CPU percentages).
+        // the sysinfo delta baseline (needed for accurate CPU percentages
+        // and network counters).
         interval.tick().await;
         self.sys.refresh_all();
+        self.networks.refresh(true);
 
         loop {
             tokio::select! {
                 _ = interval.tick() => {
                     self.sys.refresh_all();
-                    let snapshot = SystemSnapshot::collect(&self.sys);
+                    // false = don't remove disappeared interfaces on every tick.
+                    // Interface list was fully scanned at startup.
+                    self.networks.refresh(false);
+                    let snapshot = SystemSnapshot::collect(&self.sys, &self.networks);
                     match tx.try_send(snapshot) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(_)) => {
