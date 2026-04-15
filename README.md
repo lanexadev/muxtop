@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/lanexadev/muxtop/actions/workflows/ci.yml/badge.svg)](https://github.com/lanexadev/muxtop/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/muxtop.svg)](https://crates.io/crates/muxtop)
-[![License](https://img.shields.io/crates/l/muxtop.svg)](LICENSE-MIT)
+[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](LICENSE-MIT)
 
 muxtop remplace le workflow `htop` + `iftop` + `ctop` par une interface à onglets unique.
 Pensez htop, mais avec une UX de multiplexeur (à la tmux/zellij) et une palette de commandes à la VS Code.
