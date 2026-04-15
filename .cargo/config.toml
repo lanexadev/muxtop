@@ -1,0 +1,7 @@
+# Default to native CPU for development builds
+[build]
+# Uncomment for static Linux builds:
+# target = "x86_64-unknown-linux-musl"
+
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+crt-static"]

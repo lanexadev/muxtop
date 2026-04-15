@@ -29,3 +29,4 @@
 
 # FORGE output (dev-only)
 .claude/
+CONTRACT-*.md

@@ -1,0 +1,26 @@
+[package]
+name = "muxtop-tui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Terminal UI for muxtop"
+rust-version.workspace = true
+
+[dependencies]
+muxtop-core = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+libc = { workspace = true }
+nucleo = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "app_bench"
+harness = false

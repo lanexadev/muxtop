@@ -1,0 +1,52 @@
+# muxtop — Justfile
+# Run `just --list` to see all available recipes.
+
+# Show all recipes
+default:
+    @just --list
+
+# Build the workspace (debug)
+build:
+    cargo build --workspace
+
+# Build release binary (static musl for Linux)
+build-release target="x86_64-unknown-linux-musl":
+    cross build --release --target {{target}}
+
+# Run muxtop in debug mode
+run *ARGS:
+    cargo run -- {{ARGS}}
+
+# Full CI check (fmt + clippy + deny + test)
+check:
+    cargo fmt --all -- --check
+    cargo clippy --workspace -- -D warnings
+    cargo test --workspace
+
+# Run tests
+test:
+    cargo test --workspace
+
+# Format code
+fmt:
+    cargo fmt --all
+
+# Run clippy lints
+clippy:
+    cargo clippy --workspace -- -D warnings
+
+# Dev mode with bacon (continuous check)
+dev:
+    bacon clippy
+
+# Run criterion micro-benchmarks
+bench:
+    cargo bench --workspace
+
+# Run the Thomas macro-benchmark
+bench-thomas:
+    ./scripts/bench-thomas.sh
+
+# Prepare a release (requires cargo-release)
+release version:
+    cargo release {{version}}

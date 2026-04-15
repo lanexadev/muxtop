@@ -1,0 +1,28 @@
+[package]
+name = "muxtop-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core data collection engine for muxtop"
+rust-version.workspace = true
+
+[dependencies]
+sysinfo = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "process_bench"
+harness = false
+
+[[bench]]
+name = "snapshot_bench"
+harness = false

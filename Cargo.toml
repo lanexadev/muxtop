@@ -1,0 +1,81 @@
+[workspace]
+members = ["crates/muxtop-core", "crates/muxtop-tui"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+authors = ["Lucas Schimmel"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lanexadev/muxtop"
+description = "A modern, multiplexed system monitor for the terminal"
+rust-version = "1.88"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
+
+# System information
+sysinfo = "0.34"
+
+# TUI
+ratatui = "0.30"
+crossterm = "0.29"
+
+# Fuzzy matching
+nucleo = "0.5"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tracing-appender = "0.2"
+
+# System
+libc = "0.2"
+
+# Async utilities
+tokio-util = { version = "0.7", features = ["rt"] }
+
+# Utilities
+dirs = "6"
+
+# Benchmarking
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# Internal crates
+muxtop-core = { path = "crates/muxtop-core", version = "0.1.0" }
+muxtop-tui = { path = "crates/muxtop-tui", version = "0.1.0" }
+
+[package]
+name = "muxtop"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+rust-version.workspace = true
+default-run = "muxtop"
+
+[[bin]]
+name = "muxtop"
+path = "src/main.rs"
+
+[dependencies]
+muxtop-core = { workspace = true }
+muxtop-tui = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+dirs = { workspace = true }
