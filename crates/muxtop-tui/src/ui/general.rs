@@ -3,7 +3,7 @@
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
 };
@@ -121,32 +121,20 @@ fn draw_memory_bars(
     let mem = &snapshot.memory;
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    let ram_pct = if mem.total > 0 {
-        mem.used as f64 / mem.total as f64 * 100.0
-    } else {
-        0.0
-    };
     lines.push(make_bar_line(
         "Mem",
         mem.used,
         mem.total,
-        theme.gauge_color(ram_pct),
         inner.width,
         unicode,
         theme,
     ));
 
     if mem.swap_total > 0 {
-        let swap_pct = if mem.swap_total > 0 {
-            mem.swap_used as f64 / mem.swap_total as f64 * 100.0
-        } else {
-            0.0
-        };
         lines.push(make_bar_line(
             "Swp",
             mem.swap_used,
             mem.swap_total,
-            theme.gauge_color(swap_pct),
             inner.width,
             unicode,
             theme,
@@ -157,20 +145,13 @@ fn draw_memory_bars(
     frame.render_widget(para, inner);
 }
 
-/// Bar characters — Unicode vs ASCII fallback.
-const BAR_FILLED_UNICODE: &str = "█";
-const BAR_EMPTY_UNICODE: &str = "░";
-const BAR_FILLED_ASCII: &str = "#";
-const BAR_EMPTY_ASCII: &str = "-";
-
 /// Build a single horizontal bar line (used for both RAM and Swap).
 fn make_bar_line(
     label: &str,
     used: u64,
     total: u64,
-    fill_color: Color,
     width: u16,
-    unicode: bool,
+    _unicode: bool,
     theme: &Theme,
 ) -> Line<'static> {
     let pct = if total > 0 {
@@ -180,38 +161,9 @@ fn make_bar_line(
     };
     let used_gb = format_bytes_gb(used);
     let total_gb = format_bytes_gb(total);
-    let info = format!("  {used_gb}/{total_gb} G  {pct:.1}%");
+    let info = format!("{pct:.0}%  {used_gb}/{total_gb}G");
 
-    let label_part = format!("{:<5}", label);
-    let overhead = label_part.len() as u16 + 2 + info.len() as u16; // label + "[]" + info
-    let bar_w = width.saturating_sub(overhead).max(1);
-
-    let filled = ((bar_w as f64) * (pct / 100.0)).round() as u16;
-    let empty = bar_w.saturating_sub(filled);
-
-    let (fill_char, empty_char) = if unicode {
-        (BAR_FILLED_UNICODE, BAR_EMPTY_UNICODE)
-    } else {
-        (BAR_FILLED_ASCII, BAR_EMPTY_ASCII)
-    };
-
-    Line::from(vec![
-        Span::styled(
-            label_part,
-            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("[", Style::default().fg(theme.text_dim)),
-        Span::styled(
-            fill_char.repeat(filled as usize),
-            Style::default().fg(fill_color),
-        ),
-        Span::styled(
-            empty_char.repeat(empty as usize),
-            Style::default().fg(theme.bar_empty),
-        ),
-        Span::styled("]", Style::default().fg(theme.text_dim)),
-        Span::styled(info, Style::default().fg(theme.text_dim)),
-    ])
+    build_htop_bar(label, 5, info, pct, width, theme)
 }
 
 /// Render per-core CPU usage bars inside a "CPU" bordered block.
@@ -266,43 +218,83 @@ fn draw_cpu_bars(
     }
 }
 
-/// Build a single CPU core bar line: "cpu0  [####----]  10.0%" (ASCII) or "cpu0  [████░░░░]  10.0%" (Unicode).
+/// Build a single CPU core bar line, htop-style: "cpu0  [|||||         45.2%]"
 fn make_cpu_bar_line(
     core: &CoreSnapshot,
     width: u16,
-    unicode: bool,
+    _unicode: bool,
     theme: &Theme,
 ) -> Line<'static> {
-    let pct = core.usage.clamp(0.0, 100.0);
-    let label = format!("{:<6}", core.name);
-    let info = format!("  {pct:.1}%");
+    let pct = core.usage.clamp(0.0, 100.0) as f64;
+    let info = format!("{pct:.1}%");
+    build_htop_bar(&core.name, 6, info, pct, width, theme)
+}
 
-    let overhead = label.len() as u16 + 2 + info.len() as u16; // label + "[]" + info
-    let bar_w = width.saturating_sub(overhead).max(1);
+/// Core htop-style bar builder.
+///
+/// Renders: `LABEL [|||||||||||       info]`
+///
+/// The fill is split into colour zones the same way htop does:
+///   - green  : chars covering the 0 – 50 % region of the bar
+///   - yellow : chars covering the 50 – 80 % region
+///   - red    : chars covering the 80 – 100 % region
+///
+/// Only the zones actually reached by `pct` are drawn, so a bar at 60 %
+/// shows green + a little yellow; a bar at 30 % shows only green.
+/// `info` is right-aligned inside the brackets; the fill never overwrites it.
+fn build_htop_bar(
+    label: &str,
+    label_w: usize,
+    info: String,
+    pct: f64,
+    width: u16,
+    theme: &Theme,
+) -> Line<'static> {
+    let label_str = format!("{:<width$}", label, width = label_w);
+    // bar_w = total chars available between "[" and "]"
+    let bar_w = (width as usize)
+        .saturating_sub(label_w + 2) // 2 = "[" + "]"
+        .max(1);
 
-    let filled = ((bar_w as f64) * (pct as f64 / 100.0)).round() as u16;
-    let empty = bar_w.saturating_sub(filled);
-
-    let (fill_char, empty_char) = if unicode {
-        (BAR_FILLED_UNICODE, BAR_EMPTY_UNICODE)
+    // Clip info to fit if the terminal is very narrow.
+    let info = if info.len() >= bar_w {
+        info.chars().take(bar_w).collect::<String>()
     } else {
-        (BAR_FILLED_ASCII, BAR_EMPTY_ASCII)
+        info
     };
+    let info_len = info.len();
 
-    Line::from(vec![
-        Span::styled(label, Style::default().fg(theme.fg)),
-        Span::styled("[", Style::default().fg(theme.text_dim)),
+    // Total fill chars: proportional to pct, never overlapping info.
+    let max_filled = bar_w.saturating_sub(info_len);
+    let filled = ((max_filled as f64) * (pct / 100.0)).round() as usize;
+    let filled = filled.min(max_filled);
+
+    // Zone boundaries expressed in characters (relative to max_filled).
+    // green: [0, g_end)  yellow: [g_end, y_end)  red: [y_end, filled)
+    let g_end = ((max_filled as f64) * 0.50).round() as usize;
+    let y_end = ((max_filled as f64) * 0.80).round() as usize;
+
+    let green_n  = filled.min(g_end);
+    let yellow_n = if filled > g_end  { (filled - g_end ).min(y_end - g_end) } else { 0 };
+    let red_n    = if filled > y_end  {  filled - y_end                       } else { 0 };
+
+    let empty = bar_w - filled - info_len;
+
+    let mut spans: Vec<Span<'static>> = vec![
         Span::styled(
-            fill_char.repeat(filled as usize),
-            Style::default().fg(theme.gauge_color(pct as f64)),
+            label_str,
+            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            empty_char.repeat(empty as usize),
-            Style::default().fg(theme.bar_empty),
-        ),
-        Span::styled("]", Style::default().fg(theme.text_dim)),
-        Span::styled(info, Style::default().fg(theme.text_dim)),
-    ])
+        Span::styled("[", Style::default().fg(theme.accent_primary)),
+    ];
+    if green_n  > 0 { spans.push(Span::styled("|".repeat(green_n),  Style::default().fg(theme.success))); }
+    if yellow_n > 0 { spans.push(Span::styled("|".repeat(yellow_n), Style::default().fg(theme.warning))); }
+    if red_n    > 0 { spans.push(Span::styled("|".repeat(red_n),    Style::default().fg(theme.danger)));  }
+    spans.push(Span::raw(" ".repeat(empty)));
+    spans.push(Span::styled(info, Style::default().fg(theme.text_dim)));
+    spans.push(Span::styled("]", Style::default().fg(theme.accent_primary)));
+
+    Line::from(spans)
 }
 
 #[cfg(test)]
