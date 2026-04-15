@@ -19,6 +19,27 @@ Pensez htop, mais avec une UX de multiplexeur (à la tmux/zellij) et une palette
 cargo install muxtop
 ```
 
+### Via Homebrew (macOS / Linux)
+
+```sh
+brew tap lanexadev/tap
+brew install muxtop
+```
+
+### Via .deb (Debian / Ubuntu)
+
+Téléchargez le `.deb` correspondant à votre architecture depuis la [dernière release](https://github.com/lanexadev/muxtop/releases/latest) :
+
+```sh
+# x86_64
+wget https://github.com/lanexadev/muxtop/releases/latest/download/muxtop-x86_64-unknown-linux-musl.deb
+sudo dpkg -i muxtop-x86_64-unknown-linux-musl.deb
+
+# aarch64
+wget https://github.com/lanexadev/muxtop/releases/latest/download/muxtop-aarch64-unknown-linux-musl.deb
+sudo dpkg -i muxtop-aarch64-unknown-linux-musl.deb
+```
+
 ### Binaire pré-compilé (Linux / macOS)
 
 ```sh
