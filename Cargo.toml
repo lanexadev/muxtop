@@ -50,8 +50,8 @@ dirs = "6"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 # Internal crates
-muxtop-core = { path = "crates/muxtop-core" }
-muxtop-tui = { path = "crates/muxtop-tui" }
+muxtop-core = { path = "crates/muxtop-core", version = "0.1.0" }
+muxtop-tui = { path = "crates/muxtop-tui", version = "0.1.0" }
 
 [package]
 name = "muxtop"
