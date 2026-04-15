@@ -7,8 +7,8 @@ pub const MSG_ERROR: u8 = 0x03;
 pub const MSG_HELLO: u8 = 0x04;
 pub const MSG_WELCOME: u8 = 0x05;
 
-/// Maximum frame payload size (16 MiB).
-pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
+/// Maximum frame payload size (4 MiB).
+pub const MAX_FRAME_SIZE: u32 = 4 * 1024 * 1024;
 
 /// A framed message on the wire.
 ///
@@ -24,8 +24,18 @@ pub struct Frame {
 const HEADER_SIZE: usize = 4;
 
 /// Encode a frame into bytes: `[4B BE length][1B type][payload]`.
+///
+/// # Panics
+///
+/// Panics if the payload exceeds [`MAX_FRAME_SIZE`] minus 1 (the type byte).
 pub fn encode_frame(frame: &Frame) -> Vec<u8> {
     let content_len = 1 + frame.payload.len(); // type byte + payload
+    assert!(
+        content_len <= MAX_FRAME_SIZE as usize,
+        "frame payload too large: {} bytes (max {})",
+        frame.payload.len(),
+        MAX_FRAME_SIZE - 1,
+    );
     let mut buf = Vec::with_capacity(HEADER_SIZE + content_len);
     buf.extend_from_slice(&(content_len as u32).to_be_bytes());
     buf.push(frame.msg_type);
@@ -114,12 +124,17 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             });
         }
 
-        // Read content (type byte + payload).
-        let mut content = vec![0u8; content_len as usize];
-        self.reader.read_exact(&mut content).await?;
+        // Read type byte.
+        let mut type_buf = [0u8; 1];
+        self.reader.read_exact(&mut type_buf).await?;
+        let msg_type = type_buf[0];
 
-        let msg_type = content[0];
-        let payload = content[1..].to_vec();
+        // Read payload directly into final Vec (no intermediate copy).
+        let payload_len = content_len as usize - 1;
+        let mut payload = vec![0u8; payload_len];
+        if payload_len > 0 {
+            self.reader.read_exact(&mut payload).await?;
+        }
 
         Ok(Some(Frame { msg_type, payload }))
     }
