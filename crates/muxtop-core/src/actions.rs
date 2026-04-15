@@ -217,7 +217,10 @@ mod tests {
     fn test_renice_self() {
         let pid = std::process::id();
         let result = renice_process(pid, 10);
-        assert!(result.is_ok(), "renice(self, 10) should succeed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "renice(self, 10) should succeed: {result:?}"
+        );
     }
 
     /// Renicing a very large PID should fail.
@@ -225,7 +228,10 @@ mod tests {
     fn test_renice_invalid_pid() {
         let bad_pid: u32 = i32::MAX as u32 - 1;
         let result = renice_process(bad_pid, 10);
-        assert!(result.is_err(), "renice(large_pid, 10) must return an error");
+        assert!(
+            result.is_err(),
+            "renice(large_pid, 10) must return an error"
+        );
     }
 
     /// Verify that each error path produces the expected discriminant.
@@ -257,9 +263,15 @@ mod tests {
     fn test_get_priority_self() {
         let pid = std::process::id();
         let result = get_process_priority(pid);
-        assert!(result.is_ok(), "get_process_priority(self) should succeed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "get_process_priority(self) should succeed: {result:?}"
+        );
         let nice = result.unwrap();
-        assert!((-20..=19).contains(&nice), "nice value {nice} out of POSIX range");
+        assert!(
+            (-20..=19).contains(&nice),
+            "nice value {nice} out of POSIX range"
+        );
     }
 
     /// get_process_priority with pid 0 must be rejected.

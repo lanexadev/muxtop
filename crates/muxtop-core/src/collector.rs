@@ -126,8 +126,14 @@ mod tests {
         token.cancel();
         handle.await.expect("collector task panicked");
 
-        assert!(!snapshot.processes.is_empty(), "snapshot should contain processes");
-        assert!(!snapshot.cpu.cores.is_empty(), "snapshot should contain CPU cores");
+        assert!(
+            !snapshot.processes.is_empty(),
+            "snapshot should contain processes"
+        );
+        assert!(
+            !snapshot.cpu.cores.is_empty(),
+            "snapshot should contain CPU cores"
+        );
     }
 
     /// Cancel the token after 500 ms; the JoinHandle must complete within 2 s.

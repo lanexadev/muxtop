@@ -67,7 +67,7 @@ jobs:
         if: contains(matrix.target, 'linux')
         run: |
           cargo install cargo-deb --locked
-          cargo deb --no-build --target ${{ matrix.target }}
+          cargo deb --no-build --no-strip --target ${{ matrix.target }}
           cp target/${{ matrix.target }}/debian/*.deb muxtop-${{ matrix.target }}.deb
           shasum -a 256 muxtop-${{ matrix.target }}.deb > muxtop-${{ matrix.target }}.deb.sha256
 

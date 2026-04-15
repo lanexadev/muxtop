@@ -24,7 +24,11 @@ use crate::terminal::TermCaps;
 #[derive(Debug, Clone)]
 pub enum ConfirmAction {
     /// Kill a process with the given signal.
-    Kill { pid: u32, name: String, signal: Signal },
+    Kill {
+        pid: u32,
+        name: String,
+        signal: Signal,
+    },
     /// Change the nice value of a process.
     Renice { pid: u32, name: String, delta: i32 },
 }
