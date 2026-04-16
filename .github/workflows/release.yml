@@ -200,15 +200,43 @@ jobs:
     name: Publish to crates.io
     needs: release
     runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo publish --package muxtop-core || true
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      - run: cargo publish --package muxtop-tui || true
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      - run: cargo publish || true
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: Publish muxtop-proto
+        run: |
+          if out=$(cargo publish --package muxtop-proto 2>&1); then
+            echo "$out"
+          else
+            echo "$out"
+            echo "$out" | grep -q "already exists" || exit 1
+          fi
+          sleep 30
+      - name: Publish muxtop-core
+        run: |
+          if out=$(cargo publish --package muxtop-core 2>&1); then
+            echo "$out"
+          else
+            echo "$out"
+            echo "$out" | grep -q "already exists" || exit 1
+          fi
+          sleep 30
+      - name: Publish muxtop-tui
+        run: |
+          if out=$(cargo publish --package muxtop-tui 2>&1); then
+            echo "$out"
+          else
+            echo "$out"
+            echo "$out" | grep -q "already exists" || exit 1
+          fi
+          sleep 30
+      - name: Publish muxtop
+        run: |
+          if out=$(cargo publish --package muxtop 2>&1); then
+            echo "$out"
+          else
+            echo "$out"
+            echo "$out" | grep -q "already exists" || exit 1
+          fi

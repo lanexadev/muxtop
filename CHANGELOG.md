@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-04-16
+
+### Fixed
+- Clippy lints: replaced `sort_by` with `sort_by_key` for cleaner sort expressions, and collapsed single-branch `if` blocks inside `match` arms into match guards.
+- CI: fixed `cargo publish` workflow to include `muxtop-proto` in the correct dependency order, and fixed a bash `errexit` bug that silently swallowed publish errors.
+
 ## [0.2.0] - 2026-04-16
 
 ### Added
