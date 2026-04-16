@@ -1,11 +1,15 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, broadcast, mpsc};
+use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
+
+/// Timeout for TLS handshake with connecting clients.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 use muxtop_core::system::SystemSnapshot;
 
@@ -15,13 +19,14 @@ use crate::client;
 pub struct ServerConfig {
     pub bind: SocketAddr,
     pub max_clients: usize,
-    pub auth_token: Option<String>,
+    pub auth_token: String,
     pub refresh_hz: u32,
+    pub tls_acceptor: TlsAcceptor,
 }
 
 /// Shared state accessible by all client tasks.
 pub struct SharedState {
-    pub auth_token: Option<String>,
+    pub auth_token: String,
     pub refresh_hz: u32,
     pub hostname: String,
     pub server_version: String,
@@ -29,14 +34,16 @@ pub struct SharedState {
     pub semaphore: Arc<Semaphore>,
 }
 
-/// Run the TCP server: relay collector snapshots to broadcast, accept clients.
+/// Run the TCP+TLS server: relay collector snapshots to broadcast, accept clients.
 pub async fn run(
     config: ServerConfig,
     mut collector_rx: mpsc::Receiver<SystemSnapshot>,
     token: CancellationToken,
 ) -> Result<()> {
     let listener = TcpListener::bind(config.bind).await?;
-    tracing::info!(addr = %config.bind, "listening");
+    tracing::info!(addr = %config.bind, "listening (TLS enabled)");
+
+    let tls_acceptor = config.tls_acceptor;
 
     // Create the broadcast channel for fan-out to clients.
     let (broadcast_tx, _) = broadcast::channel::<SystemSnapshot>(16);
@@ -84,15 +91,36 @@ pub async fn run(
     loop {
         tokio::select! {
             result = listener.accept() => {
-                let (stream, peer) = result?;
-                tracing::info!(peer = %peer, "client connected");
+                let (tcp_stream, peer) = result?;
+                tracing::info!(peer = %peer, "client connected, starting TLS handshake");
 
+                let tls_acceptor = tls_acceptor.clone();
                 let state = Arc::clone(&state);
                 let snapshot_rx = broadcast_tx.subscribe();
                 let client_token = token.clone();
 
                 tokio::spawn(async move {
-                    if let Err(e) = client::handle(stream, peer, state, snapshot_rx, client_token).await {
+                    // TLS handshake (with timeout to prevent slowloris).
+                    let tls_stream = match tokio::time::timeout(
+                        TLS_HANDSHAKE_TIMEOUT,
+                        tls_acceptor.accept(tcp_stream),
+                    )
+                    .await
+                    {
+                        Ok(Ok(s)) => s,
+                        Ok(Err(e)) => {
+                            tracing::warn!(peer = %peer, error = %e, "TLS handshake failed");
+                            return;
+                        }
+                        Err(_) => {
+                            tracing::warn!(peer = %peer, "TLS handshake timed out");
+                            return;
+                        }
+                    };
+                    tracing::debug!(peer = %peer, "TLS handshake complete");
+
+                    let (reader, writer) = tokio::io::split(tls_stream);
+                    if let Err(e) = client::handle(reader, writer, peer, state, snapshot_rx, client_token).await {
                         tracing::debug!(peer = %peer, error = %e, "client session ended");
                     }
                     tracing::info!(peer = %peer, "client disconnected");

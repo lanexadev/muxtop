@@ -1,6 +1,7 @@
 pub mod error;
 pub mod frame;
 pub mod remote;
+pub mod tls;
 pub mod wire;
 
 pub use error::ProtoError;

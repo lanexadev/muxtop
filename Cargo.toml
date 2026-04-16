@@ -53,6 +53,13 @@ criterion = { version = "0.5", features = ["html_reports"] }
 serde = { version = "1", features = ["derive"] }
 bincode = "2"
 
+# TLS
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+rcgen = "0.14"
+ring = "0.17"
+
 # Internal crates
 muxtop-core = { path = "crates/muxtop-core", version = "0.1.1" }
 muxtop-tui = { path = "crates/muxtop-tui", version = "0.1.1" }
@@ -96,3 +103,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 dirs = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rustls-pki-types = { workspace = true }

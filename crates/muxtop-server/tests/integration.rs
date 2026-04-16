@@ -2,13 +2,17 @@
 //!
 //! Each test spins up a real TCP server on a random port, connects clients,
 //! and exercises the wire protocol end-to-end.
+//! Tests cover both plain TCP (legacy helpers) and TLS connections.
 
+use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc};
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio_util::sync::CancellationToken;
 
 use muxtop_core::network::{NetworkInterfaceSnapshot, NetworkSnapshot};
@@ -537,4 +541,421 @@ async fn test_graceful_shutdown() {
         Ok(Err(_)) => {}      // I/O error from shutdown — fine.
         Err(_) => panic!("timeout: client did not observe shutdown"),
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// TLS Integration Tests
+// ═══════════════════════════════════════════════════════════════════
+
+/// Shared TLS test material: cert PEM, key PEM, TlsAcceptor, TlsConnector.
+struct TlsTestMaterial {
+    cert_pem: String,
+    _key_pem: String,
+    acceptor: TlsAcceptor,
+}
+
+fn make_tls_test_material() -> TlsTestMaterial {
+    let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let cert_pem = ck.cert.pem();
+    let key_pem = ck.signing_key.serialize_pem();
+
+    let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_pem.as_bytes()))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let key = rustls_pemfile::private_key(&mut BufReader::new(key_pem.as_bytes()))
+        .unwrap()
+        .unwrap();
+
+    let server_config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .unwrap();
+
+    TlsTestMaterial {
+        cert_pem,
+        _key_pem: key_pem,
+        acceptor: TlsAcceptor::from(Arc::new(server_config)),
+    }
+}
+
+/// Build a TLS connector that trusts the test cert.
+fn tls_connector_trusting(cert_pem: &str) -> tokio_rustls::TlsConnector {
+    let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_pem.as_bytes()))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    let mut root_store = RootCertStore::empty();
+    for cert in certs {
+        root_store.add(cert).unwrap();
+    }
+
+    let config = ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    tokio_rustls::TlsConnector::from(Arc::new(config))
+}
+
+/// Start a TLS test server.
+async fn start_tls_test_server(
+    tls: &TlsTestMaterial,
+    auth_token: Option<String>,
+    max_clients: usize,
+) -> (SocketAddr, mpsc::Sender<SystemSnapshot>, CancellationToken) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (collector_tx, collector_rx) = mpsc::channel::<SystemSnapshot>(16);
+    let token = CancellationToken::new();
+    let acceptor = tls.acceptor.clone();
+
+    let config = TestServerConfig {
+        auth_token,
+        max_clients,
+        refresh_hz: 1,
+    };
+
+    let server_token = token.clone();
+    tokio::spawn(async move {
+        run_tls_test_server(listener, acceptor, config, collector_rx, server_token).await;
+    });
+
+    (addr, collector_tx, token)
+}
+
+/// TLS server loop for testing.
+async fn run_tls_test_server(
+    listener: tokio::net::TcpListener,
+    acceptor: TlsAcceptor,
+    config: TestServerConfig,
+    mut collector_rx: mpsc::Receiver<SystemSnapshot>,
+    token: CancellationToken,
+) {
+    use std::time::Instant;
+    use tokio::sync::Semaphore;
+
+    let (broadcast_tx, _) = broadcast::channel::<SystemSnapshot>(16);
+    let semaphore = Arc::new(Semaphore::new(config.max_clients));
+    let auth_token = config.auth_token.clone();
+    let refresh_hz = config.refresh_hz;
+    let start_time = Instant::now();
+
+    let relay_tx = broadcast_tx.clone();
+    let relay_token = token.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                snapshot = collector_rx.recv() => {
+                    match snapshot {
+                        Some(snap) => { let _ = relay_tx.send(snap); }
+                        None => break,
+                    }
+                }
+                _ = relay_token.cancelled() => break,
+            }
+        }
+    });
+
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                let (tcp_stream, peer) = match result {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+
+                let acceptor = acceptor.clone();
+                let semaphore = Arc::clone(&semaphore);
+                let auth_token = auth_token.clone();
+                let snapshot_rx = broadcast_tx.subscribe();
+                let client_token = token.clone();
+
+                tokio::spawn(async move {
+                    let tls_stream = match acceptor.accept(tcp_stream).await {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    };
+                    let (reader, writer) = tokio::io::split(tls_stream);
+                    let _ = handle_tls_test_client(
+                        reader, writer, peer, semaphore, auth_token, refresh_hz,
+                        start_time, snapshot_rx, client_token,
+                    ).await;
+                });
+            }
+            _ = token.cancelled() => break,
+        }
+    }
+}
+
+async fn handle_tls_test_client<R, W>(
+    reader: R,
+    writer: W,
+    _peer: SocketAddr,
+    semaphore: Arc<tokio::sync::Semaphore>,
+    auth_token: Option<String>,
+    refresh_hz: u32,
+    start_time: std::time::Instant,
+    mut snapshot_rx: broadcast::Receiver<SystemSnapshot>,
+    token: CancellationToken,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let _permit = match semaphore.try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            let mut fw = FrameWriter::new(writer);
+            let mut fr = FrameReader::new(reader);
+            let _ = tokio::time::timeout(Duration::from_secs(5), fr.read_frame()).await;
+            let err = WireMessage::Error {
+                code: 503,
+                message: "max clients reached".into(),
+            };
+            let _ = fw.write_frame(&err.to_frame()?).await;
+            return Ok(());
+        }
+    };
+
+    let mut fr = FrameReader::new(reader);
+    let mut fw = FrameWriter::new(writer);
+
+    let frame = tokio::time::timeout(Duration::from_secs(5), fr.read_frame())
+        .await??
+        .ok_or("no Hello received")?;
+    let hello = WireMessage::from_frame(&frame)?;
+
+    if let WireMessage::Hello {
+        auth_token: client_token,
+        ..
+    } = &hello
+    {
+        if let Some(expected) = &auth_token {
+            let provided = client_token.as_deref().unwrap_or("");
+            if provided != expected.as_str() {
+                let err = WireMessage::Error {
+                    code: 401,
+                    message: "unauthorized".into(),
+                };
+                let _ = fw.write_frame(&err.to_frame()?).await;
+                return Ok(());
+            }
+        }
+    }
+
+    let welcome = WireMessage::Welcome {
+        server_version: env!("CARGO_PKG_VERSION").to_string(),
+        hostname: "test-host".into(),
+        refresh_hz,
+    };
+    fw.write_frame(&welcome.to_frame()?).await?;
+
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+    heartbeat.tick().await;
+
+    loop {
+        tokio::select! {
+            result = snapshot_rx.recv() => {
+                match result {
+                    Ok(snap) => {
+                        let msg = WireMessage::Snapshot(snap);
+                        fw.write_frame(&msg.to_frame()?).await?;
+                        heartbeat.reset();
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            _ = heartbeat.tick() => {
+                let msg = WireMessage::Heartbeat {
+                    server_version: env!("CARGO_PKG_VERSION").to_string(),
+                    uptime_secs: start_time.elapsed().as_secs(),
+                };
+                fw.write_frame(&msg.to_frame()?).await?;
+            }
+            _ = token.cancelled() => break,
+        }
+    }
+
+    Ok(())
+}
+
+/// Helper: TLS connect to server and perform handshake.
+async fn tls_connect_and_handshake(
+    addr: SocketAddr,
+    connector: &tokio_rustls::TlsConnector,
+    auth_token: Option<&str>,
+) -> Result<
+    (
+        FrameReader<tokio::io::ReadHalf<tokio_rustls::client::TlsStream<TcpStream>>>,
+        FrameWriter<tokio::io::WriteHalf<tokio_rustls::client::TlsStream<TcpStream>>>,
+        WireMessage,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let tcp = TcpStream::connect(addr).await?;
+    let server_name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
+    let tls_stream = connector.connect(server_name, tcp).await?;
+    let (reader, writer) = tokio::io::split(tls_stream);
+    let mut fr = FrameReader::new(reader);
+    let mut fw = FrameWriter::new(writer);
+
+    let hello = WireMessage::Hello {
+        client_version: "test".into(),
+        auth_token: auth_token.map(String::from),
+    };
+    fw.write_frame(&hello.to_frame()?).await?;
+
+    let frame = fr.read_frame().await?.unwrap();
+    let response = WireMessage::from_frame(&frame)?;
+
+    Ok((fr, fw, response))
+}
+
+// ── TLS AC-01: Server accepts TLS connections ──
+
+#[tokio::test]
+async fn test_tls_handshake() {
+    let tls = make_tls_test_material();
+    let (addr, _tx, token) = start_tls_test_server(&tls, Some("test-token".into()), 8).await;
+
+    let connector = tls_connector_trusting(&tls.cert_pem);
+    let (_fr, _fw, response) =
+        tls_connect_and_handshake(addr, &connector, Some("test-token"))
+            .await
+            .unwrap();
+
+    match response {
+        WireMessage::Welcome { hostname, .. } => {
+            assert_eq!(hostname, "test-host");
+        }
+        other => panic!("expected Welcome, got {other:?}"),
+    }
+
+    token.cancel();
+}
+
+// ── TLS AC-02: Client receives snapshots over TLS ──
+
+#[tokio::test]
+async fn test_tls_client_receives_snapshot() {
+    let tls = make_tls_test_material();
+    let (addr, snap_tx, token) = start_tls_test_server(&tls, None, 8).await;
+
+    let connector = tls_connector_trusting(&tls.cert_pem);
+    let (mut fr, _fw, _welcome) =
+        tls_connect_and_handshake(addr, &connector, None)
+            .await
+            .unwrap();
+
+    snap_tx.send(make_snapshot()).await.unwrap();
+
+    let frame = tokio::time::timeout(Duration::from_secs(3), fr.read_frame())
+        .await
+        .expect("timeout")
+        .unwrap()
+        .unwrap();
+
+    let msg = WireMessage::from_frame(&frame).unwrap();
+    assert!(matches!(msg, WireMessage::Snapshot(_)));
+
+    token.cancel();
+}
+
+// ── TLS AC-06: Rejects unknown certs ──
+
+#[tokio::test]
+async fn test_tls_rejects_unknown_cert() {
+    let tls = make_tls_test_material();
+    let (addr, _tx, token) = start_tls_test_server(&tls, None, 8).await;
+
+    // Use a connector with empty root store (doesn't trust the self-signed cert).
+    let config = ClientConfig::builder()
+        .with_root_certificates(RootCertStore::empty())
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+
+    let result = tls_connect_and_handshake(addr, &connector, None).await;
+    assert!(result.is_err(), "should fail with untrusted cert");
+
+    token.cancel();
+}
+
+// ── TLS AC-07: --tls-skip-verify bypasses cert check ──
+
+#[tokio::test]
+async fn test_tls_skip_verify_connects() {
+    let tls = make_tls_test_material();
+    let (addr, _tx, token) = start_tls_test_server(&tls, None, 8).await;
+
+    // Use insecure connector (skip verify).
+    let connector = muxtop_proto::tls::connector_insecure();
+
+    let (_fr, _fw, response) =
+        tls_connect_and_handshake(addr, &connector, None)
+            .await
+            .unwrap();
+
+    assert!(matches!(response, WireMessage::Welcome { .. }));
+
+    token.cancel();
+}
+
+// ── TLS AC-08: Full streaming over TLS ──
+
+#[tokio::test]
+async fn test_tls_full_streaming() {
+    let tls = make_tls_test_material();
+    let (addr, snap_tx, token) =
+        start_tls_test_server(&tls, Some("auth-token".into()), 8).await;
+
+    let connector = tls_connector_trusting(&tls.cert_pem);
+    let (mut fr, _fw, response) =
+        tls_connect_and_handshake(addr, &connector, Some("auth-token"))
+            .await
+            .unwrap();
+    assert!(matches!(response, WireMessage::Welcome { .. }));
+
+    // Send 3 snapshots.
+    for _ in 0..3 {
+        snap_tx.send(make_snapshot()).await.unwrap();
+    }
+
+    // Receive all 3.
+    let mut received = 0;
+    for _ in 0..3 {
+        let frame = tokio::time::timeout(Duration::from_secs(3), fr.read_frame())
+            .await
+            .expect("timeout")
+            .unwrap()
+            .unwrap();
+        let msg = WireMessage::from_frame(&frame).unwrap();
+        assert!(matches!(msg, WireMessage::Snapshot(_)));
+        received += 1;
+    }
+    assert_eq!(received, 3);
+
+    token.cancel();
+}
+
+// ── TLS AC-08b: Auth rejection over TLS ──
+
+#[tokio::test]
+async fn test_tls_auth_rejection() {
+    let tls = make_tls_test_material();
+    let (addr, _tx, token) =
+        start_tls_test_server(&tls, Some("correct-token".into()), 8).await;
+
+    let connector = tls_connector_trusting(&tls.cert_pem);
+    let (_fr, _fw, response) =
+        tls_connect_and_handshake(addr, &connector, Some("wrong-token"))
+            .await
+            .unwrap();
+
+    match response {
+        WireMessage::Error { code, .. } => assert_eq!(code, 401),
+        other => panic!("expected Error 401, got {other:?}"),
+    }
+
+    token.cancel();
 }

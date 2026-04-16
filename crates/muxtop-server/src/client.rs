@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::broadcast;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
@@ -20,22 +20,27 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Handle a single client connection: handshake, then stream snapshots + heartbeats.
-pub async fn handle(
-    stream: TcpStream,
+///
+/// Accepts any async reader/writer pair (works with both plain TCP and TLS streams).
+pub async fn handle<R, W>(
+    reader: R,
+    writer: W,
     peer: SocketAddr,
     state: Arc<SharedState>,
     mut snapshot_rx: broadcast::Receiver<SystemSnapshot>,
     token: CancellationToken,
-) -> Result<(), ServerError> {
+) -> Result<(), ServerError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     // G-21: Acquire semaphore permit — auto-released when this function returns.
     let _permit = match state.semaphore.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
             tracing::warn!(peer = %peer, "max clients reached, rejecting");
-            // Send error and close.
-            let (reader, writer) = stream.into_split();
-            let mut frame_writer = FrameWriter::new(writer);
             let mut frame_reader = FrameReader::new(reader);
+            let mut frame_writer = FrameWriter::new(writer);
 
             // Wait for Hello first (so the client gets a proper rejection).
             let _ = time::timeout(HANDSHAKE_TIMEOUT, frame_reader.read_frame()).await;
@@ -49,7 +54,6 @@ pub async fn handle(
         }
     };
 
-    let (reader, writer) = stream.into_split();
     let mut frame_reader = FrameReader::new(reader);
     let mut frame_writer = FrameWriter::new(writer);
 
@@ -69,18 +73,16 @@ pub async fn handle(
         } => {
             tracing::info!(peer = %peer, client_version = %client_version, "received Hello");
 
-            // G-22: Validate auth token if server requires one.
-            if let Some(expected) = &state.auth_token {
-                let provided = auth_token.as_deref().unwrap_or("");
-                if !constant_time_eq(expected.as_bytes(), provided.as_bytes()) {
-                    tracing::warn!(peer = %peer, "authentication failed");
-                    let error_msg = WireMessage::Error {
-                        code: 401,
-                        message: "unauthorized".into(),
-                    };
-                    let _ = frame_writer.write_frame(&error_msg.to_frame()?).await;
-                    return Err(ServerError::Unauthorized);
-                }
+            // G-22: Always validate auth token (mandatory).
+            let provided = auth_token.as_deref().unwrap_or("");
+            if !constant_time_eq(state.auth_token.as_bytes(), provided.as_bytes()) {
+                tracing::warn!(peer = %peer, "authentication failed");
+                let error_msg = WireMessage::Error {
+                    code: 401,
+                    message: "unauthorized".into(),
+                };
+                let _ = frame_writer.write_frame(&error_msg.to_frame()?).await;
+                return Err(ServerError::Unauthorized);
             }
         }
         other => {

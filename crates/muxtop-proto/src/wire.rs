@@ -7,7 +7,10 @@ use crate::ProtoError;
 use crate::frame::{Frame, MSG_ERROR, MSG_HEARTBEAT, MSG_HELLO, MSG_SNAPSHOT, MSG_WELCOME};
 
 /// Wire protocol messages exchanged between muxtop client and server.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Uses a custom `Debug` impl to redact `auth_token` in `Hello` messages,
+/// preventing accidental token leakage in logs or panic messages.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub enum WireMessage {
     /// Full system snapshot (server → client).
     Snapshot(SystemSnapshot),
@@ -33,6 +36,48 @@ pub enum WireMessage {
         hostname: String,
         refresh_hz: u32,
     },
+}
+
+impl std::fmt::Debug for WireMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WireMessage::Snapshot(s) => f.debug_tuple("Snapshot").field(s).finish(),
+            WireMessage::Heartbeat {
+                server_version,
+                uptime_secs,
+            } => f
+                .debug_struct("Heartbeat")
+                .field("server_version", server_version)
+                .field("uptime_secs", uptime_secs)
+                .finish(),
+            WireMessage::Error { code, message } => f
+                .debug_struct("Error")
+                .field("code", code)
+                .field("message", message)
+                .finish(),
+            WireMessage::Hello {
+                client_version,
+                auth_token,
+            } => f
+                .debug_struct("Hello")
+                .field("client_version", client_version)
+                .field(
+                    "auth_token",
+                    &auth_token.as_ref().map(|_| "[REDACTED]"),
+                )
+                .finish(),
+            WireMessage::Welcome {
+                server_version,
+                hostname,
+                refresh_hz,
+            } => f
+                .debug_struct("Welcome")
+                .field("server_version", server_version)
+                .field("hostname", hostname)
+                .field("refresh_hz", refresh_hz)
+                .finish(),
+        }
+    }
 }
 
 fn bincode_config() -> impl bincode::config::Config {

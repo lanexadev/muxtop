@@ -1,7 +1,8 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -44,9 +45,17 @@ struct Cli {
     #[arg(long)]
     remote: Option<String>,
 
-    /// Authentication token for remote server
+    /// Authentication token for remote server (required for --remote)
     #[arg(long, env = "MUXTOP_TOKEN")]
     token: Option<String>,
+
+    /// Path to CA certificate for TLS verification (PEM format)
+    #[arg(long)]
+    tls_ca: Option<PathBuf>,
+
+    /// Skip TLS certificate verification (INSECURE — for development only)
+    #[arg(long, conflicts_with = "tls_ca")]
+    tls_skip_verify: bool,
 }
 
 fn init_tracing() -> Result<()> {
@@ -110,7 +119,33 @@ async fn main() -> Result<()> {
             .parse()
             .context("invalid --remote address (expected host:port, e.g. 127.0.0.1:4242)")?;
 
-        let remote = RemoteCollector::new(addr, cli.token.clone());
+        // Token is mandatory for remote connections.
+        let token = match &cli.token {
+            Some(t) if !t.is_empty() => t.clone(),
+            _ => bail!(
+                "Authentication token is required for remote connections. \
+                 Set --token <secret> or MUXTOP_TOKEN env var."
+            ),
+        };
+
+        // Build TLS connector.
+        let tls_connector = if let Some(ref ca_path) = cli.tls_ca {
+            muxtop_proto::tls::connector_from_ca(ca_path)
+                .context("failed to load TLS CA certificate")?
+        } else if cli.tls_skip_verify {
+            eprintln!("WARNING: TLS certificate verification is disabled (--tls-skip-verify)");
+            muxtop_proto::tls::connector_insecure()
+        } else {
+            bail!(
+                "TLS CA certificate is required. Use --tls-ca <path> to specify the server's \
+                 certificate, or --tls-skip-verify for development (INSECURE)."
+            );
+        };
+
+        // Derive server name for TLS SNI (IP addresses use IpAddress variant directly).
+        let server_name = rustls_pki_types::ServerName::IpAddress(addr.ip().into());
+
+        let remote = RemoteCollector::new(addr, Some(token), tls_connector, server_name);
         remote.spawn(tx, None, cancel.clone())
     } else {
         let collector = Collector::new(Duration::from_secs(cli.refresh));

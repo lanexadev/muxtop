@@ -1,4 +1,4 @@
-// Remote collector: TCP client that receives snapshots from muxtop-server.
+// Remote collector: TCP client that receives snapshots from muxtop-server via TLS.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -6,6 +6,7 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
+use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
 
 use crate::{FrameReader, FrameWriter, WireMessage};
@@ -32,16 +33,28 @@ pub enum ConnectionEvent {
     ServerError { code: u16, message: String },
 }
 
-/// A TCP client that connects to a muxtop-server and receives snapshots.
+/// A TLS client that connects to a muxtop-server and receives snapshots.
 pub struct RemoteCollector {
     addr: SocketAddr,
     token: Option<String>,
+    tls_connector: TlsConnector,
+    server_name: rustls_pki_types::ServerName<'static>,
 }
 
 impl RemoteCollector {
     /// Create a new remote collector targeting the given server address.
-    pub fn new(addr: SocketAddr, token: Option<String>) -> Self {
-        Self { addr, token }
+    pub fn new(
+        addr: SocketAddr,
+        token: Option<String>,
+        tls_connector: TlsConnector,
+        server_name: rustls_pki_types::ServerName<'static>,
+    ) -> Self {
+        Self {
+            addr,
+            token,
+            tls_connector,
+            server_name,
+        }
     }
 
     /// Spawn the remote collector as a background tokio task.
@@ -114,12 +127,22 @@ impl RemoteCollector {
         cancel: &CancellationToken,
     ) -> Result<(), RemoteError> {
         // Connect with cancellation support.
-        let stream = tokio::select! {
+        let tcp_stream = tokio::select! {
             result = TcpStream::connect(self.addr) => result?,
             () = cancel.cancelled() => return Ok(()),
         };
 
-        let (reader, writer) = stream.into_split();
+        // TLS handshake (with timeout and cancellation).
+        let tls_stream = tokio::select! {
+            result = timeout(HANDSHAKE_TIMEOUT, self.tls_connector.connect(self.server_name.clone(), tcp_stream)) => {
+                result
+                    .map_err(|_| RemoteError::Protocol("TLS handshake timed out".into()))?
+                    .map_err(|e| RemoteError::Protocol(format!("TLS handshake failed: {e}")))?
+            }
+            () = cancel.cancelled() => return Ok(()),
+        };
+
+        let (reader, writer) = tokio::io::split(tls_stream);
         let mut frame_reader = FrameReader::new(reader);
         let mut frame_writer = FrameWriter::new(writer);
 
@@ -256,17 +279,53 @@ pub enum RemoteError {
 mod tests {
     use super::*;
     use crate::{FrameReader, FrameWriter, WireMessage};
+    use crate::tls::connector_insecure;
+    use std::io::BufReader;
+    use std::sync::Arc;
     use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
+    use tokio_rustls::rustls::ServerConfig;
 
-    /// Helper: start a mock server that sends Welcome then streams one snapshot.
+    /// Generate self-signed cert and build a TLS acceptor for testing.
+    fn test_tls_acceptor() -> TlsAcceptor {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_pem = ck.cert.pem();
+        let key_pem = ck.signing_key.serialize_pem();
+
+        let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_pem.as_bytes()))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let key = rustls_pemfile::private_key(&mut BufReader::new(key_pem.as_bytes()))
+            .unwrap()
+            .unwrap();
+
+        let config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap();
+
+        TlsAcceptor::from(Arc::new(config))
+    }
+
+    /// Build a test RemoteCollector with insecure TLS (skip verify).
+    fn test_collector(addr: SocketAddr, token: Option<String>) -> RemoteCollector {
+        let tls_connector = connector_insecure();
+        let server_name =
+            rustls_pki_types::ServerName::IpAddress(addr.ip().into());
+        RemoteCollector::new(addr, token, tls_connector, server_name)
+    }
+
+    /// Helper: start a TLS mock server that sends Welcome then streams one snapshot.
     async fn mock_server(auth_token: Option<&str>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let tls_acceptor = test_tls_acceptor();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let expected_token = auth_token.map(String::from);
 
         let handle = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (reader, writer) = stream.into_split();
+            let (tcp_stream, _) = listener.accept().await.unwrap();
+            let tls_stream = tls_acceptor.accept(tcp_stream).await.unwrap();
+            let (reader, writer) = tokio::io::split(tls_stream);
             let mut frame_reader = FrameReader::new(reader);
             let mut frame_writer = FrameWriter::new(writer);
 
@@ -377,7 +436,7 @@ mod tests {
         let (conn_tx, mut conn_rx) = mpsc::channel(4);
         let token = CancellationToken::new();
 
-        let collector = RemoteCollector::new(addr, None);
+        let collector = test_collector(addr, None);
         let handle = collector.spawn(tx, Some(conn_tx), token.clone());
 
         // Should receive Connected event.
@@ -411,7 +470,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         let token = CancellationToken::new();
 
-        let collector = RemoteCollector::new(addr, None);
+        let collector = test_collector(addr, None);
         let handle = collector.spawn(tx, None, token.clone());
 
         let snap = tokio::time::timeout(Duration::from_secs(3), rx.recv())
@@ -435,7 +494,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(4);
         let token = CancellationToken::new();
 
-        let collector = RemoteCollector::new(addr, None);
+        let collector = test_collector(addr, None);
         let handle = collector.spawn(tx, None, token.clone());
 
         // Wait briefly for connection, then cancel.
@@ -459,7 +518,7 @@ mod tests {
         let (conn_tx, mut conn_rx) = mpsc::channel(4);
         let token = CancellationToken::new();
 
-        let collector = RemoteCollector::new(addr, Some("wrong-token".to_string()));
+        let collector = test_collector(addr, Some("wrong-token".to_string()));
         let handle = collector.spawn(tx, Some(conn_tx), token.clone());
 
         // Should receive ServerError event (401).
@@ -486,7 +545,7 @@ mod tests {
         let (conn_tx, mut conn_rx) = mpsc::channel(16);
         let token = CancellationToken::new();
 
-        let collector = RemoteCollector::new(addr, None);
+        let collector = test_collector(addr, None);
         let handle = collector.spawn(tx, Some(conn_tx), token.clone());
 
         // Should get Disconnected events as connection attempts fail.
