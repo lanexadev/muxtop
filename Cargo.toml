@@ -87,6 +87,7 @@ extended-description = "A modern, multiplexed system monitor for the terminal. F
 [dependencies]
 muxtop-core = { workspace = true }
 muxtop-tui = { workspace = true }
+muxtop-proto = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
