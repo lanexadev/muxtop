@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/muxtop-core", "crates/muxtop-tui", "crates/muxtop-proto"]
+members = ["crates/muxtop-core", "crates/muxtop-tui", "crates/muxtop-proto", "crates/muxtop-server"]
 resolver = "3"
 
 [workspace.package]
@@ -13,7 +13,7 @@ rust-version = "1.88"
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time", "net", "io-util"] }
 
 # System information
 sysinfo = "0.34"
@@ -26,7 +26,7 @@ crossterm = "0.29"
 nucleo = "0.5"
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 
 # Error handling
 thiserror = "2"

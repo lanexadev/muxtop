@@ -1,0 +1,26 @@
+[package]
+name = "muxtop-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "TCP server daemon for muxtop remote system monitoring"
+rust-version.workspace = true
+
+[[bin]]
+name = "muxtop-server"
+path = "src/main.rs"
+
+[dependencies]
+muxtop-core = { workspace = true }
+muxtop-proto = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util"] }
+tokio-util = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+dirs = { workspace = true }

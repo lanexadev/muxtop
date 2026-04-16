@@ -1054,6 +1054,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "muxtop-server"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dirs",
+ "muxtop-core",
+ "muxtop-proto",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "muxtop-tui"
 version = "0.1.1"
 dependencies = [
