@@ -437,6 +437,87 @@ async fn test_broadcast_to_multiple_clients() {
     token.cancel();
 }
 
+// ── AC-05b: Client receives multiple snapshots ──
+
+#[tokio::test]
+async fn test_client_receives_multiple_snapshots() {
+    let (addr, snap_tx, token) = start_test_server(None, 8).await;
+
+    let (mut fr, _fw, _welcome) = connect_and_handshake(addr, None).await;
+
+    // Send 3 snapshots through the collector channel.
+    for _ in 0..3 {
+        snap_tx.send(make_snapshot()).await.unwrap();
+    }
+
+    // Client should receive all 3.
+    let mut received = 0;
+    for _ in 0..3 {
+        let frame = tokio::time::timeout(Duration::from_secs(3), fr.read_frame())
+            .await
+            .expect("timeout waiting for snapshot")
+            .unwrap()
+            .unwrap();
+
+        let msg = WireMessage::from_frame(&frame).unwrap();
+        assert!(matches!(msg, WireMessage::Snapshot(_)));
+        received += 1;
+    }
+
+    assert_eq!(received, 3, "should have received 3 snapshots");
+
+    token.cancel();
+}
+
+// ── AC-06: Snapshot content verification ──
+
+#[tokio::test]
+async fn test_snapshot_content_complete() {
+    let (addr, snap_tx, token) = start_test_server(None, 8).await;
+
+    let (mut fr, _fw, _welcome) = connect_and_handshake(addr, None).await;
+
+    snap_tx.send(make_snapshot()).await.unwrap();
+
+    let frame = tokio::time::timeout(Duration::from_secs(3), fr.read_frame())
+        .await
+        .expect("timeout")
+        .unwrap()
+        .unwrap();
+
+    let msg = WireMessage::from_frame(&frame).unwrap();
+    match msg {
+        WireMessage::Snapshot(snap) => {
+            // CPU
+            assert!(snap.cpu.global_usage >= 0.0);
+            assert!(!snap.cpu.cores.is_empty(), "should have CPU cores");
+
+            // Memory
+            assert!(snap.memory.total > 0, "should have total memory");
+
+            // Processes
+            assert!(!snap.processes.is_empty(), "should have processes");
+            let proc = &snap.processes[0];
+            assert!(proc.pid > 0);
+            assert!(!proc.name.is_empty());
+
+            // Networks
+            assert!(
+                !snap.networks.interfaces.is_empty(),
+                "should have network interfaces"
+            );
+            let iface = &snap.networks.interfaces[0];
+            assert!(!iface.name.is_empty());
+
+            // Timestamp
+            assert!(snap.timestamp_ms > 0, "should have timestamp");
+        }
+        other => panic!("expected Snapshot, got {other:?}"),
+    }
+
+    token.cancel();
+}
+
 // ── AC-10: Graceful shutdown ──
 
 #[tokio::test]
