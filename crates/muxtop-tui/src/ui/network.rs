@@ -430,10 +430,10 @@ fn sorted_filtered_interfaces(app: &AppState) -> Vec<NetworkInterfaceSnapshot> {
             });
         }
         NetworkSortField::TotalRx => {
-            interfaces.sort_by(|a, b| b.bytes_rx.cmp(&a.bytes_rx));
+            interfaces.sort_by_key(|b| std::cmp::Reverse(b.bytes_rx));
         }
         NetworkSortField::TotalTx => {
-            interfaces.sort_by(|a, b| b.bytes_tx.cmp(&a.bytes_tx));
+            interfaces.sort_by_key(|b| std::cmp::Reverse(b.bytes_tx));
         }
         NetworkSortField::Errors => {
             interfaces.sort_by(|a, b| {

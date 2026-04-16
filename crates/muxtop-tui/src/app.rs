@@ -242,7 +242,7 @@ impl PaletteState {
                 })
                 .collect();
 
-            scored.sort_by(|a, b| b.1.cmp(&a.1));
+            scored.sort_by_key(|b| std::cmp::Reverse(b.1));
             self.filtered = scored.into_iter().map(|(cmd, s)| (cmd, Some(s))).collect();
         }
 
@@ -685,44 +685,36 @@ impl AppState {
             }
 
             // Kill process — F9 (Processes tab only, local mode only)
-            KeyCode::F(9) => {
-                if self.tab == Tab::Processes {
-                    if self.is_remote() {
-                        self.set_status("Actions disabled in remote mode".to_string());
-                    } else {
-                        self.request_kill(Signal::Term);
-                    }
+            KeyCode::F(9) if self.tab == Tab::Processes => {
+                if self.is_remote() {
+                    self.set_status("Actions disabled in remote mode".to_string());
+                } else {
+                    self.request_kill(Signal::Term);
                 }
             }
 
             // Force kill — F10 (Processes tab only, local mode only)
-            KeyCode::F(10) => {
-                if self.tab == Tab::Processes {
-                    if self.is_remote() {
-                        self.set_status("Actions disabled in remote mode".to_string());
-                    } else {
-                        self.request_kill(Signal::Kill);
-                    }
+            KeyCode::F(10) if self.tab == Tab::Processes => {
+                if self.is_remote() {
+                    self.set_status("Actions disabled in remote mode".to_string());
+                } else {
+                    self.request_kill(Signal::Kill);
                 }
             }
 
             // Renice — F7 lower priority (+1), F8 higher priority (-1)
-            KeyCode::F(7) => {
-                if self.tab == Tab::Processes {
-                    if self.is_remote() {
-                        self.set_status("Actions disabled in remote mode".to_string());
-                    } else {
-                        self.request_renice(1);
-                    }
+            KeyCode::F(7) if self.tab == Tab::Processes => {
+                if self.is_remote() {
+                    self.set_status("Actions disabled in remote mode".to_string());
+                } else {
+                    self.request_renice(1);
                 }
             }
-            KeyCode::F(8) => {
-                if self.tab == Tab::Processes {
-                    if self.is_remote() {
-                        self.set_status("Actions disabled in remote mode".to_string());
-                    } else {
-                        self.request_renice(-1);
-                    }
+            KeyCode::F(8) if self.tab == Tab::Processes => {
+                if self.is_remote() {
+                    self.set_status("Actions disabled in remote mode".to_string());
+                } else {
+                    self.request_renice(-1);
                 }
             }
 
@@ -872,11 +864,9 @@ impl AppState {
                     self.execute_command(cmd);
                 }
             }
-            KeyCode::Down => {
-                if !self.palette.filtered.is_empty() {
-                    self.palette.selected =
-                        (self.palette.selected + 1).min(self.palette.filtered.len() - 1);
-                }
+            KeyCode::Down if !self.palette.filtered.is_empty() => {
+                self.palette.selected =
+                    (self.palette.selected + 1).min(self.palette.filtered.len() - 1);
             }
             KeyCode::Up => {
                 self.palette.selected = self.palette.selected.saturating_sub(1);
@@ -1033,10 +1023,8 @@ impl AppState {
                 KeyCode::Backspace => {
                     self.net_filter_input.pop();
                 }
-                KeyCode::Char(c) => {
-                    if self.net_filter_input.len() < Self::MAX_FILTER_LEN {
-                        self.net_filter_input.push(c);
-                    }
+                KeyCode::Char(c) if self.net_filter_input.len() < Self::MAX_FILTER_LEN => {
+                    self.net_filter_input.push(c);
                 }
                 _ => {}
             }
@@ -1055,11 +1043,9 @@ impl AppState {
                 self.filter_input.pop();
                 self.recompute_visible();
             }
-            KeyCode::Char(c) => {
-                if self.filter_input.len() < Self::MAX_FILTER_LEN {
-                    self.filter_input.push(c);
-                    self.recompute_visible();
-                }
+            KeyCode::Char(c) if self.filter_input.len() < Self::MAX_FILTER_LEN => {
+                self.filter_input.push(c);
+                self.recompute_visible();
             }
             _ => {}
         }
