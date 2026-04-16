@@ -5,6 +5,61 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+#### Network (`muxtop-core` — Epic 11)
+- `NetworkInterfaceSnapshot`, `NetworkSnapshot`, and `NetworkHistory` types in a new `network` module tracking per-interface bytes, packets, and errors.
+- `NetworkHistory` circular buffer (60-entry `VecDeque`) computing bandwidth (bytes/s with timestamp-based division) and sparkline data.
+- `SystemSnapshot` extended with a `networks` field collected from `sysinfo::Networks` on each tick.
+- Guard hardening: saturating arithmetic for totals, capacity min 2, counter-reset handling, `refresh(false)` in hot path.
+
+#### Network tab (`muxtop-tui` — Epic 12)
+- New `Tab::Network` with `Alt+3` keybinding and full navigation.
+- Interface table with columns: Interface, State, RX/s, TX/s, Total RX/TX, Errors; color-coded rates (green RX, yellow TX, red errors).
+- Summary bar showing total bandwidth and active/total interface count.
+- RX/TX sparklines for the selected interface using `NetworkHistory`.
+- Per-tab selection, scroll, sort (6 fields: name, rx rate, tx rate, total rx, total tx, errors), and filter state.
+- 5 new command palette commands: `SwitchToNetwork`, `SortNetByRx/Tx/Name/Errors`.
+
+#### Wire protocol (`muxtop-proto` — Epic 13)
+- New `muxtop-proto` crate implementing the muxtop wire protocol.
+- Length-prefixed framing: 4B big-endian length + 1B message type + bincode payload.
+- Async `FrameReader` / `FrameWriter` over `tokio::AsyncRead` / `AsyncWrite`.
+- `WireMessage` enum: `Snapshot`, `Heartbeat`, `Error`, `Hello`, `Welcome`.
+- `MAX_FRAME_SIZE` capped at 4 MiB to limit DoS surface.
+- `Serialize`, `Deserialize`, `Encode`, `Decode`, and `PartialEq` derives on all public core types.
+- `SystemSnapshot.timestamp` migrated from `Instant` to `timestamp_ms: u64` (milliseconds since Unix epoch) to enable wire serialization.
+
+#### Server daemon (`muxtop-server` — Epic 14)
+- New `muxtop-server` crate: TCP daemon that broadcasts system snapshots to connected clients over the muxtop wire protocol.
+- Hello/Welcome handshake, token authentication (`--token` / `MUXTOP_TOKEN`), and constant-time comparison.
+- `--max-clients` semaphore limiting concurrent connections.
+- Heartbeat frame emitted every 5 seconds per client.
+- Snapshot broadcast relay from the local collector.
+- Graceful shutdown via `CancellationToken`.
+
+#### Remote monitoring (`muxtop-proto` + `muxtop-tui` + CLI — Epic 15)
+- `RemoteCollector` TCP client in `muxtop-proto`: connects to a `muxtop-server`, performs Hello/Welcome handshake, and streams `SystemSnapshot` frames through the same `mpsc` channel interface as the local `Collector`.
+- Exponential backoff reconnection (1 s → 30 s cap, resets on successful connection).
+- `ConnectionEvent` channel for real-time TUI status notifications.
+- `--remote host:port` CLI flag: spawns `RemoteCollector` instead of local `Collector`.
+- `--token` flag and `MUXTOP_TOKEN` env var for server authentication.
+- `ConnectionMode` enum (`Local` | `Remote { hostname, addr }`) in `CliConfig` and `AppState`.
+- Remote mode TUI: header displays `→ remote:hostname:port`; kill/renice actions and palette commands disabled with a clear notice; footer hides Kill/Nice hints; warning emitted when `--refresh` is combined with `--remote`.
+
+#### Tests & Benchmarks (Epic 16)
+- 7 new `muxtop-core` network edge-case unit tests: multi-interface, empty snapshots, sparkline TX, bandwidth, and `is_up` heuristic.
+- 2 new `muxtop-server` E2E tests: multi-snapshot streaming (3 snapshots) and snapshot content verification (CPU, memory, processes, networks, timestamp fields).
+- Network benchmarks: `NetworkSnapshot::collect`, `NetworkHistory::push_60`, bandwidth calculation with sparklines.
+- Proto benchmarks: snapshot serialize/deserialize with 3 000 processes, frame encode/decode round-trip.
+
+#### Documentation
+- `CONTRIBUTING.md`: contributor guide covering prerequisites, dev setup, crate architecture, branch model, commit conventions, code standards, and PR process.
+
+---
+
 ## [0.1.1] - 2026-04-15
 
 ### Added
