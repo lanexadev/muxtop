@@ -278,9 +278,10 @@ pub enum RemoteError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FrameReader, FrameWriter, WireMessage};
     use crate::tls::connector_insecure;
-    use std::io::BufReader;
+    use crate::{FrameReader, FrameWriter, WireMessage};
+    use rustls_pki_types::pem::PemObject;
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
     use std::sync::Arc;
     use tokio::net::TcpListener;
     use tokio_rustls::TlsAcceptor;
@@ -292,12 +293,11 @@ mod tests {
         let cert_pem = ck.cert.pem();
         let key_pem = ck.signing_key.serialize_pem();
 
-        let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_pem.as_bytes()))
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        let key = rustls_pemfile::private_key(&mut BufReader::new(key_pem.as_bytes()))
-            .unwrap()
-            .unwrap();
+        let certs: Vec<CertificateDer<'static>> =
+            CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+        let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).unwrap();
 
         let config = ServerConfig::builder()
             .with_no_client_auth()
@@ -310,8 +310,7 @@ mod tests {
     /// Build a test RemoteCollector with insecure TLS (skip verify).
     fn test_collector(addr: SocketAddr, token: Option<String>) -> RemoteCollector {
         let tls_connector = connector_insecure();
-        let server_name =
-            rustls_pki_types::ServerName::IpAddress(addr.ip().into());
+        let server_name = rustls_pki_types::ServerName::IpAddress(addr.ip().into());
         RemoteCollector::new(addr, token, tls_connector, server_name)
     }
 
@@ -334,16 +333,16 @@ mod tests {
             let msg = WireMessage::from_frame(&frame).unwrap();
             match msg {
                 WireMessage::Hello { auth_token, .. } => {
-                    if let Some(ref expected) = expected_token {
-                        if auth_token.as_deref() != Some(expected.as_str()) {
-                            let err = WireMessage::Error {
-                                code: 401,
-                                message: "unauthorized".to_string(),
-                            };
-                            let f = err.to_frame().unwrap();
-                            frame_writer.write_frame(&f).await.unwrap();
-                            return;
-                        }
+                    if let Some(ref expected) = expected_token
+                        && auth_token.as_deref() != Some(expected.as_str())
+                    {
+                        let err = WireMessage::Error {
+                            code: 401,
+                            message: "unauthorized".to_string(),
+                        };
+                        let f = err.to_frame().unwrap();
+                        frame_writer.write_frame(&f).await.unwrap();
+                        return;
                     }
                 }
                 _ => panic!("expected Hello"),

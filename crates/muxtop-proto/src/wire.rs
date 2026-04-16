@@ -61,10 +61,7 @@ impl std::fmt::Debug for WireMessage {
             } => f
                 .debug_struct("Hello")
                 .field("client_version", client_version)
-                .field(
-                    "auth_token",
-                    &auth_token.as_ref().map(|_| "[REDACTED]"),
-                )
+                .field("auth_token", &auth_token.as_ref().map(|_| "[REDACTED]"))
                 .finish(),
             WireMessage::Welcome {
                 server_version,

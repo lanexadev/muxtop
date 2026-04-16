@@ -1,10 +1,10 @@
 // TLS client configuration for muxtop.
 
-use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 
 use rustls_pki_types::CertificateDer;
+use rustls_pki_types::pem::PemObject;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
@@ -23,10 +23,10 @@ pub enum TlsClientError {
 
 /// Build a `TlsConnector` that trusts certificates from a PEM-encoded CA file.
 pub fn connector_from_ca(ca_path: &Path) -> Result<TlsConnector, TlsClientError> {
-    let ca_file = std::fs::File::open(ca_path)?;
-    let certs: Vec<CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut BufReader::new(ca_file))
-            .collect::<Result<Vec<_>, _>>()?;
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(ca_path)
+        .map_err(|_| TlsClientError::NoCertificates)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| TlsClientError::NoCertificates)?;
 
     if certs.is_empty() {
         return Err(TlsClientError::NoCertificates);
@@ -34,9 +34,7 @@ pub fn connector_from_ca(ca_path: &Path) -> Result<TlsConnector, TlsClientError>
 
     let mut root_store = RootCertStore::empty();
     for cert in certs {
-        root_store
-            .add(cert)
-            .map_err(TlsClientError::Rustls)?;
+        root_store.add(cert).map_err(TlsClientError::Rustls)?;
     }
 
     let config = ClientConfig::builder()
@@ -78,8 +76,10 @@ impl tokio_rustls::rustls::client::danger::ServerCertVerifier for NoVerifier {
         _message: &[u8],
         _cert: &CertificateDer<'_>,
         _dss: &tokio_rustls::rustls::DigitallySignedStruct,
-    ) -> Result<tokio_rustls::rustls::client::danger::HandshakeSignatureValid, tokio_rustls::rustls::Error>
-    {
+    ) -> Result<
+        tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
+        tokio_rustls::rustls::Error,
+    > {
         Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
     }
 
@@ -88,8 +88,10 @@ impl tokio_rustls::rustls::client::danger::ServerCertVerifier for NoVerifier {
         _message: &[u8],
         _cert: &CertificateDer<'_>,
         _dss: &tokio_rustls::rustls::DigitallySignedStruct,
-    ) -> Result<tokio_rustls::rustls::client::danger::HandshakeSignatureValid, tokio_rustls::rustls::Error>
-    {
+    ) -> Result<
+        tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
+        tokio_rustls::rustls::Error,
+    > {
         Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
     }
 

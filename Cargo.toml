@@ -55,7 +55,6 @@ bincode = "2"
 
 # TLS
 tokio-rustls = "0.26"
-rustls-pemfile = "2"
 rustls-pki-types = "1"
 rcgen = "0.14"
 ring = "0.17"
@@ -104,5 +103,4 @@ tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 dirs = { workspace = true }
 tokio-rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 rustls-pki-types = { workspace = true }

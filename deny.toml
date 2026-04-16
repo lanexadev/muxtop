@@ -1,5 +1,8 @@
 [advisories]
-ignore = []
+# bincode v2 is marked unmaintained (RUSTSEC-2025-0141) but the team considers
+# it a complete version. We use it for our wire protocol and will evaluate
+# alternatives (bitcode, postcard) in a future release.
+ignore = ["RUSTSEC-2025-0141"]
 
 [licenses]
 allow = [
