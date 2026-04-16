@@ -112,16 +112,16 @@ async fn main() -> Result<()> {
 
     // Build TLS acceptor.
     let tls_acceptor = if let (Some(cert_path), Some(key_path)) = (&cli.tls_cert, &cli.tls_key) {
-        tls::acceptor_from_pem(cert_path, key_path)
-            .context("failed to load TLS certificate/key")?
+        tls::acceptor_from_pem(cert_path, key_path).context("failed to load TLS certificate/key")?
     } else if cli.tls_generate {
         let hostname = cli.bind.ip().to_string();
         let (cert_pem, key_pem) =
             tls::generate_self_signed(&hostname).context("failed to generate self-signed cert")?;
 
         // Parse cert DER for fingerprint.
-        let certs: Vec<_> =
-            rustls_pemfile::certs(&mut std::io::BufReader::new(cert_pem.as_bytes()))
+        use rustls_pki_types::pem::PemObject;
+        let certs: Vec<rustls_pki_types::CertificateDer<'static>> =
+            rustls_pki_types::CertificateDer::pem_slice_iter(cert_pem.as_bytes())
                 .collect::<Result<Vec<_>, _>>()
                 .context("failed to parse generated certificate")?;
         let fingerprint = tls::cert_fingerprint(certs[0].as_ref());
@@ -267,11 +267,7 @@ mod tests {
 
     #[test]
     fn test_cli_tls_cert_requires_key() {
-        let result = Cli::try_parse_from([
-            "muxtop-server",
-            "--tls-cert",
-            "cert.pem",
-        ]);
+        let result = Cli::try_parse_from(["muxtop-server", "--tls-cert", "cert.pem"]);
         assert!(result.is_err(), "--tls-cert requires --tls-key");
     }
 
@@ -285,6 +281,9 @@ mod tests {
             "--tls-key",
             "key.pem",
         ]);
-        assert!(result.is_err(), "--tls-generate conflicts with --tls-cert/--tls-key");
+        assert!(
+            result.is_err(),
+            "--tls-generate conflicts with --tls-cert/--tls-key"
+        );
     }
 }

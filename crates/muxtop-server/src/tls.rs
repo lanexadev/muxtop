@@ -1,11 +1,11 @@
 // TLS configuration for muxtop-server.
 
-use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 
 use rcgen::generate_simple_self_signed;
-use rustls_pki_types::CertificateDer;
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
 
@@ -29,22 +29,17 @@ pub enum TlsError {
 }
 
 /// Build a `TlsAcceptor` from PEM-encoded certificate and key files.
-pub fn acceptor_from_pem(
-    cert_path: &Path,
-    key_path: &Path,
-) -> Result<TlsAcceptor, TlsError> {
-    let cert_file = std::fs::File::open(cert_path)?;
-    let key_file = std::fs::File::open(key_path)?;
-
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
-        .collect::<Result<Vec<_>, _>>()?;
+pub fn acceptor_from_pem(cert_path: &Path, key_path: &Path) -> Result<TlsAcceptor, TlsError> {
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_path)
+        .map_err(|_| TlsError::NoCertificates)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| TlsError::NoCertificates)?;
 
     if certs.is_empty() {
         return Err(TlsError::NoCertificates);
     }
 
-    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))?
-        .ok_or(TlsError::NoPrivateKey)?;
+    let key = PrivateKeyDer::from_pem_file(key_path).map_err(|_| TlsError::NoPrivateKey)?;
 
     let config = ServerConfig::builder()
         .with_no_client_auth()
@@ -70,7 +65,6 @@ pub fn generate_self_signed(hostname: &str) -> Result<(String, String), TlsError
 pub fn cert_fingerprint(cert_der: &[u8]) -> String {
     use std::fmt::Write;
 
-    // Simple SHA-256 using ring (pulled in by rustls).
     let digest = ring::digest::digest(&ring::digest::SHA256, cert_der);
     let bytes = digest.as_ref();
 
@@ -100,14 +94,12 @@ mod tests {
     #[test]
     fn test_cert_fingerprint_is_hex() {
         let (cert_pem, _) = generate_self_signed("localhost").unwrap();
-        // Parse cert PEM to get DER
-        let mut reader = std::io::BufReader::new(cert_pem.as_bytes());
-        let certs = rustls_pemfile::certs(&mut reader)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        let certs: Vec<CertificateDer<'static>> =
+            CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
         assert!(!certs.is_empty());
         let fp = cert_fingerprint(certs[0].as_ref());
-        // SHA-256 fingerprint = 64 hex chars + 31 colons = 95 chars
         assert!(fp.contains(':'));
         assert_eq!(fp.len(), 95);
     }

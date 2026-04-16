@@ -4,11 +4,12 @@
 //! and exercises the wire protocol end-to-end.
 //! Tests cover both plain TCP (legacy helpers) and TLS connections.
 
-use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc};
 use tokio_rustls::TlsAcceptor;
@@ -169,6 +170,7 @@ async fn run_test_server(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_test_client(
     stream: TcpStream,
     _peer: SocketAddr,
@@ -210,17 +212,16 @@ async fn handle_test_client(
         auth_token: client_token,
         ..
     } = &hello
+        && let Some(expected) = &auth_token
     {
-        if let Some(expected) = &auth_token {
-            let provided = client_token.as_deref().unwrap_or("");
-            if provided != expected.as_str() {
-                let err = WireMessage::Error {
-                    code: 401,
-                    message: "unauthorized".into(),
-                };
-                let _ = fw.write_frame(&err.to_frame()?).await;
-                return Ok(());
-            }
+        let provided = client_token.as_deref().unwrap_or("");
+        if provided != expected.as_str() {
+            let err = WireMessage::Error {
+                code: 401,
+                message: "unauthorized".into(),
+            };
+            let _ = fw.write_frame(&err.to_frame()?).await;
+            return Ok(());
         }
     }
 
@@ -559,12 +560,10 @@ fn make_tls_test_material() -> TlsTestMaterial {
     let cert_pem = ck.cert.pem();
     let key_pem = ck.signing_key.serialize_pem();
 
-    let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_pem.as_bytes()))
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    let key = rustls_pemfile::private_key(&mut BufReader::new(key_pem.as_bytes()))
-        .unwrap()
-        .unwrap();
+    let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).unwrap();
 
     let server_config = ServerConfig::builder()
         .with_no_client_auth()
@@ -580,7 +579,7 @@ fn make_tls_test_material() -> TlsTestMaterial {
 
 /// Build a TLS connector that trusts the test cert.
 fn tls_connector_trusting(cert_pem: &str) -> tokio_rustls::TlsConnector {
-    let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_pem.as_bytes()))
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
 
@@ -687,6 +686,7 @@ async fn run_tls_test_server(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_tls_test_client<R, W>(
     reader: R,
     writer: W,
@@ -729,17 +729,16 @@ where
         auth_token: client_token,
         ..
     } = &hello
+        && let Some(expected) = &auth_token
     {
-        if let Some(expected) = &auth_token {
-            let provided = client_token.as_deref().unwrap_or("");
-            if provided != expected.as_str() {
-                let err = WireMessage::Error {
-                    code: 401,
-                    message: "unauthorized".into(),
-                };
-                let _ = fw.write_frame(&err.to_frame()?).await;
-                return Ok(());
-            }
+        let provided = client_token.as_deref().unwrap_or("");
+        if provided != expected.as_str() {
+            let err = WireMessage::Error {
+                code: 401,
+                message: "unauthorized".into(),
+            };
+            let _ = fw.write_frame(&err.to_frame()?).await;
+            return Ok(());
         }
     }
 
@@ -820,10 +819,9 @@ async fn test_tls_handshake() {
     let (addr, _tx, token) = start_tls_test_server(&tls, Some("test-token".into()), 8).await;
 
     let connector = tls_connector_trusting(&tls.cert_pem);
-    let (_fr, _fw, response) =
-        tls_connect_and_handshake(addr, &connector, Some("test-token"))
-            .await
-            .unwrap();
+    let (_fr, _fw, response) = tls_connect_and_handshake(addr, &connector, Some("test-token"))
+        .await
+        .unwrap();
 
     match response {
         WireMessage::Welcome { hostname, .. } => {
@@ -843,10 +841,9 @@ async fn test_tls_client_receives_snapshot() {
     let (addr, snap_tx, token) = start_tls_test_server(&tls, None, 8).await;
 
     let connector = tls_connector_trusting(&tls.cert_pem);
-    let (mut fr, _fw, _welcome) =
-        tls_connect_and_handshake(addr, &connector, None)
-            .await
-            .unwrap();
+    let (mut fr, _fw, _welcome) = tls_connect_and_handshake(addr, &connector, None)
+        .await
+        .unwrap();
 
     snap_tx.send(make_snapshot()).await.unwrap();
 
@@ -891,10 +888,9 @@ async fn test_tls_skip_verify_connects() {
     // Use insecure connector (skip verify).
     let connector = muxtop_proto::tls::connector_insecure();
 
-    let (_fr, _fw, response) =
-        tls_connect_and_handshake(addr, &connector, None)
-            .await
-            .unwrap();
+    let (_fr, _fw, response) = tls_connect_and_handshake(addr, &connector, None)
+        .await
+        .unwrap();
 
     assert!(matches!(response, WireMessage::Welcome { .. }));
 
@@ -906,14 +902,12 @@ async fn test_tls_skip_verify_connects() {
 #[tokio::test]
 async fn test_tls_full_streaming() {
     let tls = make_tls_test_material();
-    let (addr, snap_tx, token) =
-        start_tls_test_server(&tls, Some("auth-token".into()), 8).await;
+    let (addr, snap_tx, token) = start_tls_test_server(&tls, Some("auth-token".into()), 8).await;
 
     let connector = tls_connector_trusting(&tls.cert_pem);
-    let (mut fr, _fw, response) =
-        tls_connect_and_handshake(addr, &connector, Some("auth-token"))
-            .await
-            .unwrap();
+    let (mut fr, _fw, response) = tls_connect_and_handshake(addr, &connector, Some("auth-token"))
+        .await
+        .unwrap();
     assert!(matches!(response, WireMessage::Welcome { .. }));
 
     // Send 3 snapshots.
@@ -943,14 +937,12 @@ async fn test_tls_full_streaming() {
 #[tokio::test]
 async fn test_tls_auth_rejection() {
     let tls = make_tls_test_material();
-    let (addr, _tx, token) =
-        start_tls_test_server(&tls, Some("correct-token".into()), 8).await;
+    let (addr, _tx, token) = start_tls_test_server(&tls, Some("correct-token".into()), 8).await;
 
     let connector = tls_connector_trusting(&tls.cert_pem);
-    let (_fr, _fw, response) =
-        tls_connect_and_handshake(addr, &connector, Some("wrong-token"))
-            .await
-            .unwrap();
+    let (_fr, _fw, response) = tls_connect_and_handshake(addr, &connector, Some("wrong-token"))
+        .await
+        .unwrap();
 
     match response {
         WireMessage::Error { code, .. } => assert_eq!(code, 401),
