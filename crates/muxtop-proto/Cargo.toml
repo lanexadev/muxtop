@@ -20,3 +20,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util"] }
+
+[[bench]]
+name = "proto_bench"
+harness = false
