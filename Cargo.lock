@@ -1018,6 +1018,7 @@ dependencies = [
  "clap",
  "dirs",
  "muxtop-core",
+ "muxtop-proto",
  "muxtop-tui",
  "tokio",
  "tokio-util",
@@ -1051,6 +1052,8 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

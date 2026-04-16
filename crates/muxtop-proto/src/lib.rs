@@ -1,5 +1,6 @@
 pub mod error;
 pub mod frame;
+pub mod remote;
 pub mod wire;
 
 pub use error::ProtoError;
@@ -7,6 +8,7 @@ pub use frame::{
     Frame, FrameReader, FrameWriter, MAX_FRAME_SIZE, MSG_ERROR, MSG_HEARTBEAT, MSG_HELLO,
     MSG_SNAPSHOT, MSG_WELCOME, decode_frame, encode_frame,
 };
+pub use remote::{ConnectionEvent, RemoteCollector};
 pub use wire::WireMessage;
 
 #[cfg(test)]
