@@ -68,7 +68,8 @@ cargo build --release
 | **Recherche fuzzy** | Propulsé par [nucleo](https://github.com/helix-editor/nucleo) (issu de l'éditeur Helix) |
 | **Vue arborescente** | `F5` bascule l'affichage hiérarchique parent/enfant |
 | **Renice** | `+` / `-` pour ajuster la priorité d'un processus |
-| **Monitoring distant** | `--remote host:port` + `--token` pour surveiller un serveur distant via TCP |
+| **Monitoring distant** | `--remote host:port` + `--token` pour surveiller un serveur distant via TLS chiffré |
+| **TLS natif** | Chiffrement rustls (TLS 1.2/1.3), génération auto de certificats self-signed (`--tls-generate`), auth par token obligatoire |
 | **Collecte asynchrone** | Basé sur tokio — le UI n'est jamais bloqué, même à 3000+ processus |
 | **Thème Tokyo Night** | TrueColor natif, repli automatique sur les terminaux ANSI/16 couleurs |
 | **Binaire statique** | Un seul binaire musl, aucune dépendance système |
@@ -86,14 +87,15 @@ muxtop --sort mem                   # tri par mémoire au démarrage
 muxtop --tree                       # démarre en vue arborescente
 muxtop --about                      # version, licence, déclaration de confidentialité
 
-# Monitoring distant
-muxtop --remote host:port           # se connecte à un muxtop-server distant
-muxtop --remote host:port --token s # avec authentification par token
-MUXTOP_TOKEN=s muxtop --remote host:port
+# Démarrer le serveur (TLS + auth obligatoire)
+muxtop-server --token "mon-secret-16chars" --tls-generate
+muxtop-server --token "mon-secret-16chars" --tls-cert cert.pem --tls-key key.pem
+muxtop-server --token "mon-secret-16chars" --tls-generate --bind 0.0.0.0:4242 --max-clients 10
 
-# Démarrer le serveur
-muxtop-server                       # daemon sur 0.0.0.0:7700
-muxtop-server --port 9000 --token s --max-clients 10
+# Monitoring distant (TLS)
+muxtop --remote host:port --token "mon-secret-16chars" --tls-skip-verify  # dev
+muxtop --remote host:port --token "mon-secret-16chars" --tls-ca cert.pem  # production
+MUXTOP_TOKEN="mon-secret-16chars" muxtop --remote host:port --tls-ca cert.pem
 ```
 
 ### Raccourcis clavier
