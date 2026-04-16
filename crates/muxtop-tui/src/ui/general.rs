@@ -356,7 +356,6 @@ mod tests {
     ) -> muxtop_core::system::SystemSnapshot {
         use muxtop_core::process::ProcessInfo;
         use muxtop_core::system::*;
-        use std::time::Instant;
 
         let cores = (0..core_count)
             .map(|i| CoreSnapshot {
@@ -404,7 +403,12 @@ mod tests {
                 uptime_secs: 90061,
             },
             processes,
-            timestamp: Instant::now(),
+            networks: muxtop_core::network::NetworkSnapshot {
+                interfaces: vec![],
+                total_rx: 0,
+                total_tx: 0,
+            },
+            timestamp_ms: 0,
         }
     }
 

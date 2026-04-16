@@ -1,5 +1,4 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use std::time::Instant;
 
 use muxtop_core::process::ProcessInfo;
 use muxtop_core::system::{
@@ -54,7 +53,12 @@ fn make_snapshot(n: usize) -> SystemSnapshot {
             uptime_secs: 86400,
         },
         processes: make_processes(n),
-        timestamp: Instant::now(),
+        networks: muxtop_core::network::NetworkSnapshot {
+            interfaces: vec![],
+            total_rx: 0,
+            total_tx: 0,
+        },
+        timestamp_ms: 0,
     }
 }
 

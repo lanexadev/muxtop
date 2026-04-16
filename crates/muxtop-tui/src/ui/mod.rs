@@ -2,6 +2,7 @@
 
 mod confirm;
 mod general;
+mod network;
 mod palette;
 mod processes;
 pub mod theme;
@@ -14,11 +15,12 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Tabs},
 };
 
+use crate::ConnectionMode;
 use crate::app::{AppState, Tab};
 use theme::Theme;
 
 /// Labels for future tabs (not yet implemented).
-const FUTURE_TABS: &[&str] = &["Network [soon]", "Containers [soon]", "GPU [soon]"];
+const FUTURE_TABS: &[&str] = &["Containers [soon]", "GPU [soon]"];
 
 /// Render the full application layout: Header, TabBar, Content, Footer.
 pub fn draw_root(frame: &mut Frame, app: &AppState) {
@@ -32,7 +34,7 @@ pub fn draw_root(frame: &mut Frame, app: &AppState) {
     ])
     .areas(frame.area());
 
-    draw_header(frame, header_area, &theme);
+    draw_header(frame, header_area, app, &theme);
     draw_tabbar(frame, tabbar_area, app, &theme);
     draw_content(frame, content_area, app, &theme);
     draw_footer(frame, footer_area, app, &theme);
@@ -48,10 +50,10 @@ pub fn draw_root(frame: &mut Frame, app: &AppState) {
     }
 }
 
-/// Render the header line: app name and version.
-fn draw_header(frame: &mut Frame, area: Rect, theme: &Theme) {
+/// Render the header line: app name, version, and optional remote indicator.
+fn draw_header(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
     let version = env!("CARGO_PKG_VERSION");
-    let header = Paragraph::new(Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             " muxtop ",
             Style::default()
@@ -63,7 +65,22 @@ fn draw_header(frame: &mut Frame, area: Rect, theme: &Theme) {
             format!(" v{version} "),
             Style::default().bg(theme.header_bg).fg(theme.fg),
         ),
-    ]));
+    ];
+
+    if let ConnectionMode::Remote {
+        ref hostname,
+        ref addr,
+    } = app.connection_mode
+    {
+        spans.push(Span::styled(
+            format!(" → remote:{hostname}:{} ", addr.port()),
+            Style::default()
+                .bg(theme.header_bg)
+                .fg(theme.accent_secondary),
+        ));
+    }
+
+    let header = Paragraph::new(Line::from(spans));
     frame.render_widget(header, area);
 }
 
@@ -100,6 +117,7 @@ fn draw_content(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
     match app.tab {
         Tab::General => general::draw_general_tab(frame, area, app, theme),
         Tab::Processes => processes::draw_processes_tab(frame, area, app, theme),
+        Tab::Network => network::draw_network_tab(frame, area, app, theme),
     }
 }
 
@@ -129,18 +147,35 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
             Span::raw(" "),
             key_hint("^P", "Palette", theme),
         ],
-        Tab::Processes => vec![
+        Tab::Processes => {
+            let mut hints = vec![
+                key_hint("q", "Quit", theme),
+                Span::raw(" "),
+                key_hint("/", "Filter", theme),
+                Span::raw(" "),
+                key_hint("s", "Sort", theme),
+                Span::raw(" "),
+                key_hint("t", "Tree", theme),
+            ];
+            // Hide kill/renice hints in remote mode.
+            if !app.is_remote() {
+                hints.push(Span::raw(" "));
+                hints.push(key_hint("F9", "Kill", theme));
+                hints.push(Span::raw(" "));
+                hints.push(key_hint("F7/F8", "Nice", theme));
+            }
+            hints.push(Span::raw(" "));
+            hints.push(key_hint("^P", "Palette", theme));
+            hints
+        }
+        Tab::Network => vec![
             key_hint("q", "Quit", theme),
+            Span::raw(" "),
+            key_hint("j/k", "Select", theme),
             Span::raw(" "),
             key_hint("/", "Filter", theme),
             Span::raw(" "),
             key_hint("s", "Sort", theme),
-            Span::raw(" "),
-            key_hint("t", "Tree", theme),
-            Span::raw(" "),
-            key_hint("F9", "Kill", theme),
-            Span::raw(" "),
-            key_hint("F7/F8", "Nice", theme),
             Span::raw(" "),
             key_hint("^P", "Palette", theme),
         ],
@@ -324,7 +359,6 @@ mod tests {
     fn test_content_dispatches_by_tab() {
         use muxtop_core::process::ProcessInfo;
         use muxtop_core::system::*;
-        use std::time::Instant;
 
         // Provide a snapshot so tabs render distinct content (not both "Waiting for data...")
         let snap = SystemSnapshot {
@@ -360,7 +394,12 @@ mod tests {
                 memory_percent: 1.0,
                 status: "Running".to_string(),
             }],
-            timestamp: Instant::now(),
+            networks: muxtop_core::network::NetworkSnapshot {
+                interfaces: vec![],
+                total_rx: 0,
+                total_tx: 0,
+            },
+            timestamp_ms: 0,
         };
 
         let mut app = AppState::new();
@@ -409,5 +448,242 @@ mod tests {
             footer.contains("Tree"),
             "Processes footer should contain Tree hint"
         );
+    }
+
+    // -- Network tab tests (Epic 12) --
+
+    #[test]
+    fn test_tabbar_shows_network() {
+        let app = AppState::new();
+        let buf = render_with(&app, 120, 24);
+        let tabbar_text = format!(
+            "{} {}",
+            buffer_line_text(&buf, 1),
+            buffer_line_text(&buf, 2)
+        );
+        assert!(
+            tabbar_text.contains("Network"),
+            "TabBar should show Network"
+        );
+    }
+
+    #[test]
+    fn test_network_tab_waiting_for_data() {
+        let mut app = AppState::new();
+        app.tab = Tab::Network;
+        let buf = render_with(&app, 80, 24);
+        assert!(
+            buffer_contains(&buf, "Waiting for data"),
+            "Network tab should show waiting message when no snapshot"
+        );
+    }
+
+    #[test]
+    fn test_network_tab_renders_no_panic() {
+        let mut app = AppState::new();
+        app.tab = Tab::Network;
+        // No snapshot — should not panic
+        let _buf = render_with(&app, 80, 24);
+        let _buf = render_with(&app, 1, 1);
+        let _buf = render_with(&app, 10, 5);
+    }
+
+    #[test]
+    fn test_network_tab_with_interfaces() {
+        use muxtop_core::network::{NetworkInterfaceSnapshot, NetworkSnapshot};
+        use muxtop_core::system::*;
+
+        let snap = SystemSnapshot {
+            cpu: CpuSnapshot {
+                global_usage: 25.0,
+                cores: vec![],
+            },
+            memory: MemorySnapshot {
+                total: 16_000_000_000,
+                used: 8_000_000_000,
+                available: 8_000_000_000,
+                swap_total: 0,
+                swap_used: 0,
+            },
+            load: LoadSnapshot {
+                one: 1.0,
+                five: 0.8,
+                fifteen: 0.5,
+                uptime_secs: 3600,
+            },
+            processes: vec![],
+            networks: NetworkSnapshot {
+                interfaces: vec![
+                    NetworkInterfaceSnapshot {
+                        name: "eth0".to_string(),
+                        bytes_rx: 1_000_000,
+                        bytes_tx: 500_000,
+                        packets_rx: 1000,
+                        packets_tx: 500,
+                        errors_rx: 0,
+                        errors_tx: 0,
+                        mac_address: "00:11:22:33:44:55".to_string(),
+                        is_up: true,
+                    },
+                    NetworkInterfaceSnapshot {
+                        name: "lo".to_string(),
+                        bytes_rx: 100,
+                        bytes_tx: 100,
+                        packets_rx: 10,
+                        packets_tx: 10,
+                        errors_rx: 0,
+                        errors_tx: 0,
+                        mac_address: "00:00:00:00:00:00".to_string(),
+                        is_up: true,
+                    },
+                ],
+                total_rx: 1_000_100,
+                total_tx: 500_100,
+            },
+            timestamp_ms: 0,
+        };
+
+        let mut app = AppState::new();
+        app.tab = Tab::Network;
+        app.apply_snapshot(snap);
+        let buf = render_with(&app, 100, 24);
+        assert!(
+            buffer_contains(&buf, "eth0"),
+            "Network tab should show eth0 interface"
+        );
+        assert!(
+            buffer_contains(&buf, "lo"),
+            "Network tab should show lo interface"
+        );
+    }
+
+    #[test]
+    fn test_network_footer_shows_hints() {
+        let mut app = AppState::new();
+        app.tab = Tab::Network;
+        let buf = render_with(&app, 80, 24);
+        let footer = buffer_line_text(&buf, 23);
+        assert!(
+            footer.contains("Quit"),
+            "Network footer should contain Quit"
+        );
+        assert!(
+            footer.contains("Sort"),
+            "Network footer should contain Sort"
+        );
+        assert!(
+            footer.contains("Filter"),
+            "Network footer should contain Filter"
+        );
+    }
+
+    #[test]
+    fn test_network_tab_summary_bar() {
+        use muxtop_core::network::{NetworkInterfaceSnapshot, NetworkSnapshot};
+        use muxtop_core::system::*;
+
+        let snap = SystemSnapshot {
+            cpu: CpuSnapshot {
+                global_usage: 0.0,
+                cores: vec![],
+            },
+            memory: MemorySnapshot {
+                total: 0,
+                used: 0,
+                available: 0,
+                swap_total: 0,
+                swap_used: 0,
+            },
+            load: LoadSnapshot {
+                one: 0.0,
+                five: 0.0,
+                fifteen: 0.0,
+                uptime_secs: 0,
+            },
+            processes: vec![],
+            networks: NetworkSnapshot {
+                interfaces: vec![NetworkInterfaceSnapshot {
+                    name: "eth0".to_string(),
+                    bytes_rx: 1000,
+                    bytes_tx: 500,
+                    packets_rx: 10,
+                    packets_tx: 5,
+                    errors_rx: 0,
+                    errors_tx: 0,
+                    mac_address: "00:00:00:00:00:00".to_string(),
+                    is_up: true,
+                }],
+                total_rx: 1000,
+                total_tx: 500,
+            },
+            timestamp_ms: 0,
+        };
+
+        let mut app = AppState::new();
+        app.tab = Tab::Network;
+        app.apply_snapshot(snap);
+        let buf = render_with(&app, 100, 24);
+        assert!(
+            buffer_contains(&buf, "Total"),
+            "Network tab should show summary bar with Total"
+        );
+        assert!(
+            buffer_contains(&buf, "Interfaces"),
+            "Network tab should show interface count"
+        );
+    }
+
+    #[test]
+    fn test_network_tab_shows_header_columns() {
+        use muxtop_core::network::{NetworkInterfaceSnapshot, NetworkSnapshot};
+        use muxtop_core::system::*;
+
+        let snap = SystemSnapshot {
+            cpu: CpuSnapshot {
+                global_usage: 0.0,
+                cores: vec![],
+            },
+            memory: MemorySnapshot {
+                total: 0,
+                used: 0,
+                available: 0,
+                swap_total: 0,
+                swap_used: 0,
+            },
+            load: LoadSnapshot {
+                one: 0.0,
+                five: 0.0,
+                fifteen: 0.0,
+                uptime_secs: 0,
+            },
+            processes: vec![],
+            networks: NetworkSnapshot {
+                interfaces: vec![NetworkInterfaceSnapshot {
+                    name: "eth0".to_string(),
+                    bytes_rx: 0,
+                    bytes_tx: 0,
+                    packets_rx: 0,
+                    packets_tx: 0,
+                    errors_rx: 0,
+                    errors_tx: 0,
+                    mac_address: "00:00:00:00:00:00".to_string(),
+                    is_up: true,
+                }],
+                total_rx: 0,
+                total_tx: 0,
+            },
+            timestamp_ms: 0,
+        };
+
+        let mut app = AppState::new();
+        app.tab = Tab::Network;
+        app.apply_snapshot(snap);
+        let buf = render_with(&app, 100, 24);
+        assert!(
+            buffer_contains(&buf, "INTERFACE"),
+            "Should show INTERFACE header"
+        );
+        assert!(buffer_contains(&buf, "RX/s"), "Should show RX/s header");
+        assert!(buffer_contains(&buf, "TX/s"), "Should show TX/s header");
     }
 }

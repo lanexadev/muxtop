@@ -330,7 +330,6 @@ mod tests {
     use crate::app::{AppState, Tab};
     use muxtop_core::system::*;
     use ratatui::{Terminal, backend::TestBackend};
-    use std::time::Instant;
 
     fn render_with(app: &AppState, width: u16, height: u16) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(width, height);
@@ -403,7 +402,12 @@ mod tests {
                 uptime_secs: 3600,
             },
             processes: procs,
-            timestamp: Instant::now(),
+            networks: muxtop_core::network::NetworkSnapshot {
+                interfaces: vec![],
+                total_rx: 0,
+                total_tx: 0,
+            },
+            timestamp_ms: 0,
         }
     }
 

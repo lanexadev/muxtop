@@ -1,0 +1,122 @@
+use criterion::{Criterion, criterion_group, criterion_main};
+
+use muxtop_core::network::{NetworkInterfaceSnapshot, NetworkSnapshot};
+use muxtop_core::process::ProcessInfo;
+use muxtop_core::system::{
+    CoreSnapshot, CpuSnapshot, LoadSnapshot, MemorySnapshot, SystemSnapshot,
+};
+use muxtop_proto::frame::decode_frame;
+use muxtop_proto::{WireMessage, encode_frame};
+
+fn make_snapshot_3000() -> SystemSnapshot {
+    let cores: Vec<CoreSnapshot> = (0..8)
+        .map(|i| CoreSnapshot {
+            name: format!("cpu{i}"),
+            usage: (i as f32 * 12.5) % 100.0,
+            frequency: 3600,
+        })
+        .collect();
+
+    let processes: Vec<ProcessInfo> = (0..3000)
+        .map(|i| ProcessInfo {
+            pid: i as u32 + 1,
+            parent_pid: if i == 0 {
+                None
+            } else {
+                Some((i / 3) as u32 + 1)
+            },
+            name: format!("proc-{i}"),
+            command: format!("/usr/bin/proc-{i} --flag --option=value"),
+            user: format!("user{}", i % 10),
+            cpu_percent: (i as f32 * 7.3) % 100.0,
+            memory_bytes: (i as u64 * 1_048_576) % 16_000_000_000,
+            memory_percent: ((i as f64 * 0.03) % 100.0) as f32,
+            status: if i % 50 == 0 { "Running" } else { "Sleeping" }.to_string(),
+        })
+        .collect();
+
+    let interfaces: Vec<NetworkInterfaceSnapshot> = (0..4)
+        .map(|i| NetworkInterfaceSnapshot {
+            name: format!("eth{i}"),
+            bytes_rx: (i as u64 + 1) * 1_000_000,
+            bytes_tx: (i as u64 + 1) * 500_000,
+            packets_rx: (i as u64 + 1) * 1000,
+            packets_tx: (i as u64 + 1) * 500,
+            errors_rx: 0,
+            errors_tx: 0,
+            mac_address: format!("00:11:22:33:44:{i:02x}"),
+            is_up: true,
+        })
+        .collect();
+
+    let total_rx: u64 = interfaces.iter().map(|i| i.bytes_rx).sum();
+    let total_tx: u64 = interfaces.iter().map(|i| i.bytes_tx).sum();
+
+    SystemSnapshot {
+        cpu: CpuSnapshot {
+            global_usage: 45.2,
+            cores,
+        },
+        memory: MemorySnapshot {
+            total: 32_000_000_000,
+            used: 16_000_000_000,
+            available: 16_000_000_000,
+            swap_total: 8_000_000_000,
+            swap_used: 2_000_000_000,
+        },
+        load: LoadSnapshot {
+            one: 2.5,
+            five: 1.8,
+            fifteen: 1.2,
+            uptime_secs: 86400,
+        },
+        processes,
+        networks: NetworkSnapshot {
+            interfaces,
+            total_rx,
+            total_tx,
+        },
+        timestamp_ms: 1_713_200_000_000,
+    }
+}
+
+fn bench_snapshot_serialize(c: &mut Criterion) {
+    let snap = make_snapshot_3000();
+    let msg = WireMessage::Snapshot(snap);
+
+    c.bench_function("snapshot_serialize_3000", |b| {
+        b.iter(|| msg.to_frame().unwrap());
+    });
+}
+
+fn bench_snapshot_deserialize(c: &mut Criterion) {
+    let snap = make_snapshot_3000();
+    let msg = WireMessage::Snapshot(snap);
+    let frame = msg.to_frame().unwrap();
+
+    c.bench_function("snapshot_deserialize_3000", |b| {
+        b.iter(|| WireMessage::from_frame(&frame).unwrap());
+    });
+}
+
+fn bench_frame_roundtrip(c: &mut Criterion) {
+    let snap = make_snapshot_3000();
+    let msg = WireMessage::Snapshot(snap);
+    let frame = msg.to_frame().unwrap();
+    let encoded = encode_frame(&frame).unwrap();
+
+    c.bench_function("frame_roundtrip_3000", |b| {
+        b.iter(|| {
+            let (decoded_frame, _) = decode_frame(&encoded).unwrap();
+            WireMessage::from_frame(&decoded_frame).unwrap()
+        });
+    });
+}
+
+criterion_group!(
+    benches,
+    bench_snapshot_serialize,
+    bench_snapshot_deserialize,
+    bench_frame_roundtrip
+);
+criterion_main!(benches);

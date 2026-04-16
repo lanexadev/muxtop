@@ -1,0 +1,31 @@
+[package]
+name = "muxtop-proto"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Wire protocol and serialization for muxtop"
+rust-version.workspace = true
+
+[dependencies]
+muxtop-core = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+rustls-pemfile = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util"] }
+rcgen = { workspace = true }
+tempfile = "3"
+
+[[bench]]
+name = "proto_bench"
+harness = false

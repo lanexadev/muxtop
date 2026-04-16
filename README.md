@@ -61,28 +61,41 @@ cargo build --release
 
 | Fonctionnalité | Détail |
 |---|---|
-| **Onglets** | General (CPU, mémoire, charge) et Processes — `Alt+1` / `Alt+2` |
-| **Palette de commandes** | `Ctrl+P` — `kill firefox`, `sort memory`, etc. |
+| **Onglets** | General (CPU, mémoire, charge), Processes et Network — `Alt+1` / `Alt+2` / `Alt+3` |
+| **Onglet Réseau** | Tableau d'interfaces avec RX/s, TX/s, totaux, erreurs + sparklines en temps réel |
+| **Palette de commandes** | `Ctrl+P` — `kill firefox`, `sort memory`, `sort net rx`, etc. |
 | **Raccourcis htop** | `F3` recherche, `F4` filtre, `F5` arbre, `F6` tri, `F9` kill, `F10` quitter |
 | **Recherche fuzzy** | Propulsé par [nucleo](https://github.com/helix-editor/nucleo) (issu de l'éditeur Helix) |
 | **Vue arborescente** | `F5` bascule l'affichage hiérarchique parent/enfant |
 | **Renice** | `+` / `-` pour ajuster la priorité d'un processus |
+| **Monitoring distant** | `--remote host:port` + `--token` pour surveiller un serveur distant via TLS chiffré |
+| **TLS natif** | Chiffrement rustls (TLS 1.2/1.3), génération auto de certificats self-signed (`--tls-generate`), auth par token obligatoire |
 | **Collecte asynchrone** | Basé sur tokio — le UI n'est jamais bloqué, même à 3000+ processus |
 | **Thème Tokyo Night** | TrueColor natif, repli automatique sur les terminaux ANSI/16 couleurs |
 | **Binaire statique** | Un seul binaire musl, aucune dépendance système |
-| **Zéro télémétrie** | Aucun appel réseau, jamais (voir [Vie privée](#vie-privée--télémétrie)) |
+| **Zéro télémétrie** | Aucun appel réseau côté client, jamais (voir [Vie privée](#vie-privée--télémétrie)) |
 
 ---
 
 ## Utilisation
 
 ```sh
-muxtop                          # lancement normal
-muxtop --refresh 2              # rafraîchissement toutes les 2 secondes
-muxtop --filter firefox         # démarre avec un filtre de processus
-muxtop --sort mem               # tri par mémoire au démarrage
-muxtop --tree                   # démarre en vue arborescente
-muxtop --about                  # version, licence, déclaration de confidentialité
+muxtop                              # lancement normal
+muxtop --refresh 2                  # rafraîchissement toutes les 2 secondes
+muxtop --filter firefox             # démarre avec un filtre de processus
+muxtop --sort mem                   # tri par mémoire au démarrage
+muxtop --tree                       # démarre en vue arborescente
+muxtop --about                      # version, licence, déclaration de confidentialité
+
+# Démarrer le serveur (TLS + auth obligatoire)
+muxtop-server --token "mon-secret-16chars" --tls-generate
+muxtop-server --token "mon-secret-16chars" --tls-cert cert.pem --tls-key key.pem
+muxtop-server --token "mon-secret-16chars" --tls-generate --bind 0.0.0.0:4242 --max-clients 10
+
+# Monitoring distant (TLS)
+muxtop --remote host:port --token "mon-secret-16chars" --tls-skip-verify  # dev
+muxtop --remote host:port --token "mon-secret-16chars" --tls-ca cert.pem  # production
+MUXTOP_TOKEN="mon-secret-16chars" muxtop --remote host:port --tls-ca cert.pem
 ```
 
 ### Raccourcis clavier
@@ -90,7 +103,7 @@ muxtop --about                  # version, licence, déclaration de confidential
 | Touche | Action |
 |--------|--------|
 | `Ctrl+P` | Palette de commandes |
-| `Alt+1` / `Alt+2` | Changer d'onglet |
+| `Alt+1` / `Alt+2` / `Alt+3` | Changer d'onglet (General / Processes / Network) |
 | `F1` | Aide |
 | `F3` / `/` | Recherche |
 | `F4` | Filtre de processus |
@@ -128,15 +141,17 @@ just bench-thomas
 
 ```
 muxtop/
-├── src/                    # Point d'entrée (CLI clap + bootstrap tokio)
+├── src/                      # Point d'entrée (CLI clap + bootstrap tokio)
 └── crates/
-    ├── muxtop-core/        # Collecte système, modèles de données, actions
+    ├── muxtop-core/          # Collecte système, modèles de données, actions
     │   ├── src/collector.rs  # Boucle async sysinfo
     │   ├── src/process.rs    # Tri, filtrage, arbre de processus
     │   └── src/system.rs     # Snapshots CPU / mémoire / charge
-    └── muxtop-tui/         # Interface ratatui
-        ├── src/app.rs        # Machine à états, gestion des événements
-        └── src/ui/           # Onglets General, Processes, palette, thème
+    ├── muxtop-tui/           # Interface ratatui
+    │   ├── src/app.rs        # Machine à états, gestion des événements
+    │   └── src/ui/           # Onglets General, Processes, palette, thème
+    ├── muxtop-proto/         # Protocole filaire et sérialisation binaire
+    └── muxtop-server/        # Daemon TCP pour le monitoring à distance
 ```
 
 ---
@@ -155,8 +170,8 @@ just dev      # vérification continue avec bacon
 
 | Version | Objectif |
 |---------|----------|
-| **v0.1** | Remplacement htop — onglets, palette de commandes, vue arborescente |
-| v0.2 | Onglet Réseau (remplace iftop) + architecture client-serveur |
+| **v0.1** ✓ | Remplacement htop — onglets, palette de commandes, vue arborescente |
+| **v0.2** ✓ | Onglet Réseau (remplace iftop) + architecture client-serveur (`muxtop-server`, `--remote`) |
 | v0.3 | Onglet Conteneurs (Docker / Podman / K8s) + monitoring GPU |
 | v1.0 | Système de plugins WASM + thèmes + fichier de configuration |
 
@@ -173,7 +188,7 @@ Si vous observez une activité réseau sortante depuis muxtop, c'est un bug — 
 
 ## Contribuer
 
-Les contributions sont les bienvenues. Merci d'ouvrir d'abord une issue pour discuter des changements envisagés.
+Les contributions sont les bienvenues ! Consultez [CONTRIBUTING.md](CONTRIBUTING.md) pour les prérequis, les conventions de code, le workflow de branches et les instructions pour soumettre une PR.
 
 ---
 

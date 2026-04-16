@@ -12,9 +12,21 @@ pub use terminal::{
     install_panic_hook, restore_terminal,
 };
 
+use std::net::SocketAddr;
+
 use muxtop_core::process::SortField;
 use muxtop_core::system::SystemSnapshot;
 use tokio::sync::mpsc;
+
+/// Whether the TUI is monitoring the local machine or a remote server.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub enum ConnectionMode {
+    /// Collecting system data locally via sysinfo.
+    #[default]
+    Local,
+    /// Receiving snapshots from a remote muxtop-server.
+    Remote { hostname: String, addr: SocketAddr },
+}
 
 /// Configuration passed from CLI arguments to the TUI.
 #[derive(Debug, Clone)]
@@ -25,6 +37,8 @@ pub struct CliConfig {
     pub sort_field: SortField,
     /// Start in tree view mode (from `--tree`).
     pub tree_mode: bool,
+    /// Local or remote connection mode.
+    pub connection_mode: ConnectionMode,
 }
 
 impl Default for CliConfig {
@@ -33,6 +47,7 @@ impl Default for CliConfig {
             filter: None,
             sort_field: SortField::Cpu,
             tree_mode: false,
+            connection_mode: ConnectionMode::default(),
         }
     }
 }
@@ -73,6 +88,7 @@ mod tests {
         assert!(config.filter.is_none());
         assert!(matches!(config.sort_field, SortField::Cpu));
         assert!(!config.tree_mode);
+        assert_eq!(config.connection_mode, ConnectionMode::Local);
     }
 
     #[test]
@@ -108,6 +124,7 @@ mod tests {
             filter: Some("test".to_string()),
             sort_field: SortField::Pid,
             tree_mode: true,
+            ..Default::default()
         };
         let cloned = config.clone();
         assert_eq!(cloned.filter, config.filter);
@@ -119,5 +136,55 @@ mod tests {
     fn test_cli_config_debug() {
         let config = CliConfig::default();
         assert!(!format!("{config:?}").is_empty());
+    }
+
+    #[test]
+    fn test_connection_mode_default_is_local() {
+        assert_eq!(ConnectionMode::default(), ConnectionMode::Local);
+    }
+
+    #[test]
+    fn test_connection_mode_remote_variant() {
+        let addr: std::net::SocketAddr = "127.0.0.1:4242".parse().unwrap();
+        let mode = ConnectionMode::Remote {
+            hostname: "prod-01".to_string(),
+            addr,
+        };
+        assert!(matches!(mode, ConnectionMode::Remote { .. }));
+        if let ConnectionMode::Remote { hostname, addr } = &mode {
+            assert_eq!(hostname, "prod-01");
+            assert_eq!(addr.port(), 4242);
+        }
+    }
+
+    #[test]
+    fn test_connection_mode_equality() {
+        let addr: std::net::SocketAddr = "10.0.0.1:4242".parse().unwrap();
+        let a = ConnectionMode::Remote {
+            hostname: "host".to_string(),
+            addr,
+        };
+        let b = ConnectionMode::Remote {
+            hostname: "host".to_string(),
+            addr,
+        };
+        assert_eq!(a, b);
+        assert_ne!(ConnectionMode::Local, a);
+    }
+
+    #[test]
+    fn test_cli_config_with_remote_mode() {
+        let addr: std::net::SocketAddr = "192.168.1.1:4242".parse().unwrap();
+        let config = CliConfig {
+            connection_mode: ConnectionMode::Remote {
+                hostname: "server".to_string(),
+                addr,
+            },
+            ..Default::default()
+        };
+        assert!(matches!(
+            config.connection_mode,
+            ConnectionMode::Remote { .. }
+        ));
     }
 }
