@@ -25,22 +25,20 @@ const HEADER_SIZE: usize = 4;
 
 /// Encode a frame into bytes: `[4B BE length][1B type][payload]`.
 ///
-/// # Panics
-///
-/// Panics if the payload exceeds [`MAX_FRAME_SIZE`] minus 1 (the type byte).
-pub fn encode_frame(frame: &Frame) -> Vec<u8> {
+/// Returns an error if the payload exceeds [`MAX_FRAME_SIZE`] minus 1 (the type byte).
+pub fn encode_frame(frame: &Frame) -> Result<Vec<u8>, ProtoError> {
     let content_len = 1 + frame.payload.len(); // type byte + payload
-    assert!(
-        content_len <= MAX_FRAME_SIZE as usize,
-        "frame payload too large: {} bytes (max {})",
-        frame.payload.len(),
-        MAX_FRAME_SIZE - 1,
-    );
+    if content_len > MAX_FRAME_SIZE as usize {
+        return Err(ProtoError::FrameTooLarge {
+            size: content_len as u32,
+            max: MAX_FRAME_SIZE,
+        });
+    }
     let mut buf = Vec::with_capacity(HEADER_SIZE + content_len);
     buf.extend_from_slice(&(content_len as u32).to_be_bytes());
     buf.push(frame.msg_type);
     buf.extend_from_slice(&frame.payload);
-    buf
+    Ok(buf)
 }
 
 /// Decode a frame from a byte slice.
@@ -152,7 +150,7 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
 
     /// Write one frame to the stream and flush.
     pub async fn write_frame(&mut self, frame: &Frame) -> Result<(), ProtoError> {
-        let bytes = encode_frame(frame);
+        let bytes = encode_frame(frame)?;
         self.writer.write_all(&bytes).await?;
         self.writer.flush().await?;
         Ok(())
@@ -169,7 +167,7 @@ mod tests {
             msg_type: MSG_SNAPSHOT,
             payload: vec![0xDE, 0xAD],
         };
-        let bytes = encode_frame(&frame);
+        let bytes = encode_frame(&frame).unwrap();
         // length = 3 (1 type + 2 payload), big-endian
         assert_eq!(&bytes[0..4], &[0, 0, 0, 3]);
         assert_eq!(bytes[4], MSG_SNAPSHOT);
@@ -191,7 +189,7 @@ mod tests {
             msg_type: MSG_ERROR,
             payload: vec![1, 2, 3, 4, 5],
         };
-        let bytes = encode_frame(&original);
+        let bytes = encode_frame(&original).unwrap();
         let (decoded, consumed) = decode_frame(&bytes).unwrap();
         assert_eq!(original, decoded);
         assert_eq!(consumed, bytes.len());
@@ -203,7 +201,7 @@ mod tests {
             msg_type: MSG_HELLO,
             payload: vec![],
         };
-        let bytes = encode_frame(&frame);
+        let bytes = encode_frame(&frame).unwrap();
         // length = 1 (just the type byte)
         assert_eq!(&bytes[0..4], &[0, 0, 0, 1]);
         let (decoded, _) = decode_frame(&bytes).unwrap();
@@ -262,7 +260,7 @@ mod tests {
                 msg_type,
                 payload: vec![42],
             };
-            let bytes = encode_frame(&frame);
+            let bytes = encode_frame(&frame).unwrap();
             let (decoded, _) = decode_frame(&bytes).unwrap();
             assert_eq!(frame, decoded);
         }
@@ -274,7 +272,7 @@ mod tests {
             msg_type: MSG_SNAPSHOT,
             payload: vec![1, 2, 3],
         };
-        let bytes = encode_frame(&frame);
+        let bytes = encode_frame(&frame).unwrap();
         let cursor = std::io::Cursor::new(bytes);
         let mut reader = FrameReader::new(cursor);
 

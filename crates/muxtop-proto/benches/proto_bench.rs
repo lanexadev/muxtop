@@ -103,7 +103,7 @@ fn bench_frame_roundtrip(c: &mut Criterion) {
     let snap = make_snapshot_3000();
     let msg = WireMessage::Snapshot(snap);
     let frame = msg.to_frame().unwrap();
-    let encoded = encode_frame(&frame);
+    let encoded = encode_frame(&frame).unwrap();
 
     c.bench_function("frame_roundtrip_3000", |b| {
         b.iter(|| {

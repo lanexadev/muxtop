@@ -154,15 +154,19 @@ pub async fn handle(
 }
 
 /// Constant-time byte comparison to prevent timing attacks on token validation.
+///
+/// Both length and content are compared without early returns to avoid
+/// leaking the expected token length via timing side-channel.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
+    let len_matches = a.len() == b.len();
+    let max_len = std::cmp::max(a.len(), b.len());
     let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
+    for i in 0..max_len {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
         diff |= x ^ y;
     }
-    diff == 0
+    diff == 0 && len_matches
 }
 
 #[cfg(test)]

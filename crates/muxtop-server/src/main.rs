@@ -21,8 +21,8 @@ use muxtop_core::system::SystemSnapshot;
     author
 )]
 struct Cli {
-    /// Bind address (e.g., 0.0.0.0:4242)
-    #[arg(long, default_value = "0.0.0.0:4242")]
+    /// Bind address (e.g., 127.0.0.1:4242)
+    #[arg(long, default_value = "127.0.0.1:4242")]
     bind: SocketAddr,
 
     /// Refresh interval in seconds (1–3600)
@@ -78,6 +78,13 @@ async fn main() -> Result<()> {
 
     init_tracing()?;
 
+    if cli.token.is_none() {
+        eprintln!(
+            "WARNING: No --token set. Any client can connect and view system data. \
+             Set --token <secret> or MUXTOP_TOKEN to require authentication."
+        );
+    }
+
     tracing::info!(
         bind = %cli.bind,
         refresh = cli.refresh,
@@ -131,7 +138,7 @@ mod tests {
     #[test]
     fn test_cli_defaults() {
         let cli = Cli::parse_from(["muxtop-server"]);
-        assert_eq!(cli.bind, "0.0.0.0:4242".parse().unwrap());
+        assert_eq!(cli.bind, "127.0.0.1:4242".parse().unwrap());
         assert_eq!(cli.refresh, 1);
         assert_eq!(cli.max_clients, 8);
         assert!(cli.token.is_none());
