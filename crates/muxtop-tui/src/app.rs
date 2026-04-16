@@ -14,8 +14,8 @@ use muxtop_core::process::{
 };
 use muxtop_core::system::SystemSnapshot;
 
-use crate::CliConfig;
 use crate::terminal::TermCaps;
+use crate::{CliConfig, ConnectionMode};
 
 // ---------------------------------------------------------------------------
 // Confirm dialog
@@ -211,9 +211,16 @@ impl PaletteState {
     }
 
     /// Recompute filtered results using nucleo fuzzy matching.
-    pub fn refilter(&mut self) {
+    /// `excluded` contains commands to hide (e.g. kill/renice in remote mode).
+    pub fn refilter_excluding(&mut self, excluded: &[Command]) {
+        let available: Vec<Command> = Command::ALL
+            .iter()
+            .copied()
+            .filter(|cmd| !excluded.contains(cmd))
+            .collect();
+
         if self.input.is_empty() {
-            self.filtered = Command::ALL.iter().map(|&cmd| (cmd, None)).collect();
+            self.filtered = available.iter().map(|&cmd| (cmd, None)).collect();
         } else {
             let mut matcher = Matcher::new(Config::DEFAULT);
             let atom = Atom::new(
@@ -224,7 +231,7 @@ impl PaletteState {
                 false,
             );
 
-            let mut scored: Vec<(Command, u16)> = Command::ALL
+            let mut scored: Vec<(Command, u16)> = available
                 .iter()
                 .filter_map(|&cmd| {
                     let haystack = cmd.search_text();
@@ -245,6 +252,11 @@ impl PaletteState {
         } else {
             self.selected = self.selected.min(self.filtered.len() - 1);
         }
+    }
+
+    /// Recompute filtered results (no exclusions).
+    pub fn refilter(&mut self) {
+        self.refilter_excluding(&[]);
     }
 }
 
@@ -338,6 +350,8 @@ pub struct AppState {
     pub net_filter_input: String,
     /// Filter active flag for the Network tab.
     pub net_filter_active: bool,
+    /// Whether monitoring local machine or remote server.
+    pub connection_mode: ConnectionMode,
 }
 
 impl Default for AppState {
@@ -373,6 +387,7 @@ impl AppState {
             net_sort_order: SortOrder::Desc,
             net_filter_input: String::new(),
             net_filter_active: false,
+            connection_mode: ConnectionMode::default(),
         }
     }
 
@@ -383,8 +398,14 @@ impl AppState {
             tree_mode: config.tree_mode,
             filter_input: config.filter.unwrap_or_default(),
             term_caps,
+            connection_mode: config.connection_mode,
             ..Self::new()
         }
+    }
+
+    /// Returns true if currently in remote monitoring mode.
+    pub fn is_remote(&self) -> bool {
+        matches!(self.connection_mode, ConnectionMode::Remote { .. })
     }
 
     /// Returns the current status message if it hasn't expired.
@@ -663,29 +684,45 @@ impl AppState {
                 self.recompute_visible();
             }
 
-            // Kill process — F9 (Processes tab only)
+            // Kill process — F9 (Processes tab only, local mode only)
             KeyCode::F(9) => {
                 if self.tab == Tab::Processes {
-                    self.request_kill(Signal::Term);
+                    if self.is_remote() {
+                        self.set_status("Actions disabled in remote mode".to_string());
+                    } else {
+                        self.request_kill(Signal::Term);
+                    }
                 }
             }
 
-            // Force kill — F10 (Processes tab only)
+            // Force kill — F10 (Processes tab only, local mode only)
             KeyCode::F(10) => {
                 if self.tab == Tab::Processes {
-                    self.request_kill(Signal::Kill);
+                    if self.is_remote() {
+                        self.set_status("Actions disabled in remote mode".to_string());
+                    } else {
+                        self.request_kill(Signal::Kill);
+                    }
                 }
             }
 
             // Renice — F7 lower priority (+1), F8 higher priority (-1)
             KeyCode::F(7) => {
                 if self.tab == Tab::Processes {
-                    self.request_renice(1);
+                    if self.is_remote() {
+                        self.set_status("Actions disabled in remote mode".to_string());
+                    } else {
+                        self.request_renice(1);
+                    }
                 }
             }
             KeyCode::F(8) => {
                 if self.tab == Tab::Processes {
-                    self.request_renice(-1);
+                    if self.is_remote() {
+                        self.set_status("Actions disabled in remote mode".to_string());
+                    } else {
+                        self.request_renice(-1);
+                    }
                 }
             }
 
@@ -789,10 +826,21 @@ impl AppState {
         }
     }
 
+    /// Returns the list of commands to exclude from the palette (empty in local mode).
+    fn excluded_commands(&self) -> &[Command] {
+        if self.is_remote() {
+            Self::REMOTE_BLOCKED_COMMANDS
+        } else {
+            &[]
+        }
+    }
+
     /// Open the command palette with a fresh state.
     fn open_palette(&mut self) {
         self.show_palette = true;
         self.palette = PaletteState::new();
+        let excluded = self.excluded_commands().to_vec();
+        self.palette.refilter_excluding(&excluded);
     }
 
     /// Close the command palette and clear state.
@@ -835,18 +883,34 @@ impl AppState {
             }
             KeyCode::Backspace => {
                 self.palette.input.pop();
-                self.palette.refilter();
+                let excluded = self.excluded_commands().to_vec();
+                self.palette.refilter_excluding(&excluded);
             }
             KeyCode::Char(c) => {
                 self.palette.input.push(c);
-                self.palette.refilter();
+                let excluded = self.excluded_commands().to_vec();
+                self.palette.refilter_excluding(&excluded);
             }
             _ => {}
         }
     }
 
+    /// Commands that are blocked in remote mode (cannot kill/renice on a remote host).
+    const REMOTE_BLOCKED_COMMANDS: &[Command] = &[
+        Command::KillProcess,
+        Command::ForceKillProcess,
+        Command::NiceDown,
+        Command::NiceUp,
+    ];
+
     /// Execute a command from the palette.
     fn execute_command(&mut self, cmd: Command) {
+        // Block kill/renice actions in remote mode.
+        if self.is_remote() && Self::REMOTE_BLOCKED_COMMANDS.contains(&cmd) {
+            self.set_status("Actions disabled in remote mode".to_string());
+            return;
+        }
+
         match cmd {
             Command::Quit => self.quit(),
             Command::ToggleTreeView => {
@@ -2316,5 +2380,109 @@ mod tests {
         assert!(matches!(app.net_sort_field, NetworkSortField::RxRate));
         assert!(app.net_filter_input.is_empty());
         assert!(!app.net_filter_active);
+    }
+
+    // -- Epic 15: Remote mode tests --
+
+    fn make_remote_app() -> AppState {
+        let addr: std::net::SocketAddr = "10.0.0.1:4242".parse().unwrap();
+        let config = crate::CliConfig {
+            connection_mode: crate::ConnectionMode::Remote {
+                hostname: "prod-01".to_string(),
+                addr,
+            },
+            ..Default::default()
+        };
+        AppState::with_config(config, TermCaps::default())
+    }
+
+    #[test]
+    fn test_connection_mode_remote() {
+        let app = make_remote_app();
+        assert!(app.is_remote());
+        assert!(matches!(
+            app.connection_mode,
+            crate::ConnectionMode::Remote { .. }
+        ));
+    }
+
+    #[test]
+    fn test_connection_mode_local_default() {
+        let app = AppState::new();
+        assert!(!app.is_remote());
+        assert!(matches!(app.connection_mode, crate::ConnectionMode::Local));
+    }
+
+    #[test]
+    fn test_actions_disabled_remote_kill() {
+        let mut app = make_remote_app();
+        app.tab = Tab::Processes;
+        // Simulate F9 (Kill) key
+        app.handle_key_event(KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE));
+        assert!(
+            app.active_status()
+                .is_some_and(|s| s.contains("disabled in remote")),
+            "expected 'disabled in remote' status, got {:?}",
+            app.active_status()
+        );
+    }
+
+    #[test]
+    fn test_actions_disabled_remote_force_kill() {
+        let mut app = make_remote_app();
+        app.tab = Tab::Processes;
+        app.handle_key_event(KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE));
+        assert!(
+            app.active_status()
+                .is_some_and(|s| s.contains("disabled in remote")),
+        );
+    }
+
+    #[test]
+    fn test_actions_disabled_remote_nice() {
+        let mut app = make_remote_app();
+        app.tab = Tab::Processes;
+        app.handle_key_event(KeyEvent::new(KeyCode::F(7), KeyModifiers::NONE));
+        assert!(
+            app.active_status()
+                .is_some_and(|s| s.contains("disabled in remote")),
+        );
+    }
+
+    #[test]
+    fn test_palette_filters_remote() {
+        let mut app = make_remote_app();
+        app.open_palette();
+        let cmds: Vec<Command> = app.palette.filtered.iter().map(|(c, _)| *c).collect();
+        assert!(
+            !cmds.contains(&Command::KillProcess),
+            "KillProcess should be hidden"
+        );
+        assert!(
+            !cmds.contains(&Command::ForceKillProcess),
+            "ForceKillProcess should be hidden"
+        );
+        assert!(
+            !cmds.contains(&Command::NiceDown),
+            "NiceDown should be hidden"
+        );
+        assert!(!cmds.contains(&Command::NiceUp), "NiceUp should be hidden");
+        // But Quit and other commands should still be present.
+        assert!(cmds.contains(&Command::Quit));
+    }
+
+    #[test]
+    fn test_palette_includes_all_local() {
+        let mut app = AppState::new();
+        app.open_palette();
+        let cmds: Vec<Command> = app.palette.filtered.iter().map(|(c, _)| *c).collect();
+        assert!(
+            cmds.contains(&Command::KillProcess),
+            "KillProcess should be in local palette"
+        );
+        assert!(
+            cmds.contains(&Command::NiceDown),
+            "NiceDown should be in local palette"
+        );
     }
 }

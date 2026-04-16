@@ -15,6 +15,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Tabs},
 };
 
+use crate::ConnectionMode;
 use crate::app::{AppState, Tab};
 use theme::Theme;
 
@@ -33,7 +34,7 @@ pub fn draw_root(frame: &mut Frame, app: &AppState) {
     ])
     .areas(frame.area());
 
-    draw_header(frame, header_area, &theme);
+    draw_header(frame, header_area, app, &theme);
     draw_tabbar(frame, tabbar_area, app, &theme);
     draw_content(frame, content_area, app, &theme);
     draw_footer(frame, footer_area, app, &theme);
@@ -49,10 +50,10 @@ pub fn draw_root(frame: &mut Frame, app: &AppState) {
     }
 }
 
-/// Render the header line: app name and version.
-fn draw_header(frame: &mut Frame, area: Rect, theme: &Theme) {
+/// Render the header line: app name, version, and optional remote indicator.
+fn draw_header(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
     let version = env!("CARGO_PKG_VERSION");
-    let header = Paragraph::new(Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             " muxtop ",
             Style::default()
@@ -64,7 +65,22 @@ fn draw_header(frame: &mut Frame, area: Rect, theme: &Theme) {
             format!(" v{version} "),
             Style::default().bg(theme.header_bg).fg(theme.fg),
         ),
-    ]));
+    ];
+
+    if let ConnectionMode::Remote {
+        ref hostname,
+        ref addr,
+    } = app.connection_mode
+    {
+        spans.push(Span::styled(
+            format!(" → remote:{hostname}:{} ", addr.port()),
+            Style::default()
+                .bg(theme.header_bg)
+                .fg(theme.accent_secondary),
+        ));
+    }
+
+    let header = Paragraph::new(Line::from(spans));
     frame.render_widget(header, area);
 }
 
@@ -131,21 +147,27 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
             Span::raw(" "),
             key_hint("^P", "Palette", theme),
         ],
-        Tab::Processes => vec![
-            key_hint("q", "Quit", theme),
-            Span::raw(" "),
-            key_hint("/", "Filter", theme),
-            Span::raw(" "),
-            key_hint("s", "Sort", theme),
-            Span::raw(" "),
-            key_hint("t", "Tree", theme),
-            Span::raw(" "),
-            key_hint("F9", "Kill", theme),
-            Span::raw(" "),
-            key_hint("F7/F8", "Nice", theme),
-            Span::raw(" "),
-            key_hint("^P", "Palette", theme),
-        ],
+        Tab::Processes => {
+            let mut hints = vec![
+                key_hint("q", "Quit", theme),
+                Span::raw(" "),
+                key_hint("/", "Filter", theme),
+                Span::raw(" "),
+                key_hint("s", "Sort", theme),
+                Span::raw(" "),
+                key_hint("t", "Tree", theme),
+            ];
+            // Hide kill/renice hints in remote mode.
+            if !app.is_remote() {
+                hints.push(Span::raw(" "));
+                hints.push(key_hint("F9", "Kill", theme));
+                hints.push(Span::raw(" "));
+                hints.push(key_hint("F7/F8", "Nice", theme));
+            }
+            hints.push(Span::raw(" "));
+            hints.push(key_hint("^P", "Palette", theme));
+            hints
+        }
         Tab::Network => vec![
             key_hint("q", "Quit", theme),
             Span::raw(" "),
