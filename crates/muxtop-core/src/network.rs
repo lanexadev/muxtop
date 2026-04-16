@@ -380,6 +380,177 @@ mod tests {
     }
 
     #[test]
+    fn test_network_snapshot_empty_interfaces() {
+        let snapshot = NetworkSnapshot {
+            interfaces: vec![],
+            total_rx: 0,
+            total_tx: 0,
+        };
+        assert!(snapshot.interfaces.is_empty());
+        assert_eq!(snapshot.total_rx, 0);
+        assert_eq!(snapshot.total_tx, 0);
+    }
+
+    #[test]
+    fn test_multi_interface_snapshot() {
+        let snap = NetworkSnapshot {
+            interfaces: vec![
+                NetworkInterfaceSnapshot {
+                    name: "eth0".into(),
+                    bytes_rx: 1000,
+                    bytes_tx: 500,
+                    packets_rx: 10,
+                    packets_tx: 5,
+                    errors_rx: 0,
+                    errors_tx: 0,
+                    mac_address: "aa:bb:cc:dd:ee:f0".into(),
+                    is_up: true,
+                },
+                NetworkInterfaceSnapshot {
+                    name: "wlan0".into(),
+                    bytes_rx: 2000,
+                    bytes_tx: 1000,
+                    packets_rx: 20,
+                    packets_tx: 10,
+                    errors_rx: 1,
+                    errors_tx: 0,
+                    mac_address: "aa:bb:cc:dd:ee:f1".into(),
+                    is_up: true,
+                },
+                NetworkInterfaceSnapshot {
+                    name: "lo".into(),
+                    bytes_rx: 500,
+                    bytes_tx: 500,
+                    packets_rx: 5,
+                    packets_tx: 5,
+                    errors_rx: 0,
+                    errors_tx: 0,
+                    mac_address: "00:00:00:00:00:00".into(),
+                    is_up: true,
+                },
+            ],
+            total_rx: 3500,
+            total_tx: 2000,
+        };
+        assert_eq!(snap.interfaces.len(), 3);
+        let sum_rx: u64 = snap.interfaces.iter().map(|i| i.bytes_rx).sum();
+        let sum_tx: u64 = snap.interfaces.iter().map(|i| i.bytes_tx).sum();
+        assert_eq!(sum_rx, snap.total_rx);
+        assert_eq!(sum_tx, snap.total_tx);
+    }
+
+    fn make_multi_iface_snapshot(
+        eth0_rx: u64,
+        eth0_tx: u64,
+        wlan0_rx: u64,
+        wlan0_tx: u64,
+    ) -> NetworkSnapshot {
+        NetworkSnapshot {
+            interfaces: vec![
+                NetworkInterfaceSnapshot {
+                    name: "eth0".into(),
+                    bytes_rx: eth0_rx,
+                    bytes_tx: eth0_tx,
+                    packets_rx: 0,
+                    packets_tx: 0,
+                    errors_rx: 0,
+                    errors_tx: 0,
+                    mac_address: "00:00:00:00:00:00".into(),
+                    is_up: eth0_rx > 0 || eth0_tx > 0,
+                },
+                NetworkInterfaceSnapshot {
+                    name: "wlan0".into(),
+                    bytes_rx: wlan0_rx,
+                    bytes_tx: wlan0_tx,
+                    packets_rx: 0,
+                    packets_tx: 0,
+                    errors_rx: 0,
+                    errors_tx: 0,
+                    mac_address: "00:00:00:00:00:01".into(),
+                    is_up: wlan0_rx > 0 || wlan0_tx > 0,
+                },
+            ],
+            total_rx: eth0_rx + wlan0_rx,
+            total_tx: eth0_tx + wlan0_tx,
+        }
+    }
+
+    #[test]
+    fn test_history_multi_interface_bandwidth() {
+        let mut history = NetworkHistory::new(60);
+        history.push(make_multi_iface_snapshot(1000, 500, 2000, 1000));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        history.push(make_multi_iface_snapshot(2000, 800, 2500, 1200));
+
+        let eth0_bw = history.bandwidth_rx("eth0");
+        let wlan0_bw = history.bandwidth_rx("wlan0");
+
+        // eth0 delta = 1000, wlan0 delta = 500 in same time interval
+        // So eth0 should have higher bandwidth
+        assert!(eth0_bw > 0.0, "eth0 rx bandwidth should be positive");
+        assert!(wlan0_bw > 0.0, "wlan0 rx bandwidth should be positive");
+        assert!(
+            eth0_bw > wlan0_bw,
+            "eth0 (delta 1000) should have higher bandwidth than wlan0 (delta 500)"
+        );
+    }
+
+    #[test]
+    fn test_sparkline_tx_data() {
+        let mut history = NetworkHistory::new(60);
+        for &tx in &[0u64, 100, 300, 700, 1500] {
+            history.push(make_snapshot("eth0", 0, tx));
+        }
+        let spark = history.sparkline_tx("eth0", 10);
+        // 4 TX deltas: 100, 200, 400, 800
+        assert_eq!(spark, vec![100, 200, 400, 800]);
+    }
+
+    #[test]
+    fn test_history_multi_interface_sparkline() {
+        let mut history = NetworkHistory::new(60);
+        // Push 3 multi-iface snapshots
+        history.push(make_multi_iface_snapshot(0, 0, 0, 0));
+        history.push(make_multi_iface_snapshot(100, 50, 200, 100));
+        history.push(make_multi_iface_snapshot(300, 150, 500, 250));
+
+        let eth0_spark = history.sparkline_rx("eth0", 10);
+        let wlan0_spark = history.sparkline_rx("wlan0", 10);
+
+        assert_eq!(eth0_spark, vec![100, 200]); // deltas: 100, 200
+        assert_eq!(wlan0_spark, vec![200, 300]); // deltas: 200, 300
+    }
+
+    #[test]
+    fn test_interface_is_up_heuristic() {
+        let down = NetworkInterfaceSnapshot {
+            name: "eth1".into(),
+            bytes_rx: 0,
+            bytes_tx: 0,
+            packets_rx: 0,
+            packets_tx: 0,
+            errors_rx: 0,
+            errors_tx: 0,
+            mac_address: "00:00:00:00:00:00".into(),
+            is_up: false,
+        };
+        assert!(!down.is_up, "interface with zero traffic should be down");
+
+        let up = NetworkInterfaceSnapshot {
+            name: "eth0".into(),
+            bytes_rx: 100,
+            bytes_tx: 0,
+            packets_rx: 1,
+            packets_tx: 0,
+            errors_rx: 0,
+            errors_tx: 0,
+            mac_address: "00:00:00:00:00:00".into(),
+            is_up: true,
+        };
+        assert!(up.is_up, "interface with rx traffic should be up");
+    }
+
+    #[test]
     fn test_all_structs_are_debug() {
         let iface = NetworkInterfaceSnapshot {
             name: "eth0".into(),
