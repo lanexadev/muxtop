@@ -1,0 +1,40 @@
+name: Publish to crates.io (manual)
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish muxtop-proto
+        run: |
+          out=$(cargo publish --package muxtop-proto 2>&1); rc=$?
+          echo "$out"
+          if [ $rc -ne 0 ] && ! echo "$out" | grep -q "already exists"; then exit $rc; fi
+          sleep 30
+      - name: Publish muxtop-core
+        run: |
+          out=$(cargo publish --package muxtop-core 2>&1); rc=$?
+          echo "$out"
+          if [ $rc -ne 0 ] && ! echo "$out" | grep -q "already exists"; then exit $rc; fi
+          sleep 30
+      - name: Publish muxtop-tui
+        run: |
+          out=$(cargo publish --package muxtop-tui 2>&1); rc=$?
+          echo "$out"
+          if [ $rc -ne 0 ] && ! echo "$out" | grep -q "already exists"; then exit $rc; fi
+          sleep 30
+      - name: Publish muxtop
+        run: |
+          out=$(cargo publish --package muxtop 2>&1); rc=$?
+          echo "$out"
+          if [ $rc -ne 0 ] && ! echo "$out" | grep -q "already exists"; then exit $rc; fi
