@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-04-20
+
+### Performance
+- `PaletteState::refilter_excluding` no longer allocates a throwaway `Vec<Command>` on every call; the empty-input hot path is **−84 %** faster (178 ns → 28 ns). Other palette variants improve 3–11 %.
+- `sort_processes` uses `sort_by_cached_key` for `Name` / `User` fields so `to_lowercase()` runs O(n) instead of O(n log n) times. `name_asc/5000` drops from 4.69 ms to **765 µs (−84 %)**; `cpu_desc/5000` from 966 µs to **436 µs (−55 %)**.
+- `muxtop --about` no longer builds a Tokio multi-threaded runtime before printing. `main()` is now synchronous and constructs the runtime only when entering the TUI path. Cuts `--about` startup from an effective cold-start cost to ~18 ms on warm runs.
+
+### Fixed
+- `scripts/bench-thomas.sh` now warms up the binary with `--version` before timing `--about`, so measurements don't capture the one-time macOS Gatekeeper scan cost of a freshly-rebuilt binary.
+
 ## [0.2.1] - 2026-04-16
 
 ### Fixed

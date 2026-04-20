@@ -213,14 +213,17 @@ impl PaletteState {
     /// Recompute filtered results using nucleo fuzzy matching.
     /// `excluded` contains commands to hide (e.g. kill/renice in remote mode).
     pub fn refilter_excluding(&mut self, excluded: &[Command]) {
-        let available: Vec<Command> = Command::ALL
-            .iter()
-            .copied()
-            .filter(|cmd| !excluded.contains(cmd))
-            .collect();
+        let is_available = |cmd: &Command| !excluded.contains(cmd);
 
         if self.input.is_empty() {
-            self.filtered = available.iter().map(|&cmd| (cmd, None)).collect();
+            self.filtered.clear();
+            self.filtered.extend(
+                Command::ALL
+                    .iter()
+                    .copied()
+                    .filter(is_available)
+                    .map(|cmd| (cmd, None)),
+            );
         } else {
             let mut matcher = Matcher::new(Config::DEFAULT);
             let atom = Atom::new(
@@ -231,9 +234,11 @@ impl PaletteState {
                 false,
             );
 
-            let mut scored: Vec<(Command, u16)> = available
+            let mut scored: Vec<(Command, u16)> = Command::ALL
                 .iter()
-                .filter_map(|&cmd| {
+                .copied()
+                .filter(is_available)
+                .filter_map(|cmd| {
                     let haystack = cmd.search_text();
                     let mut buf = Vec::new();
                     let haystack_utf32 = Utf32Str::new(&haystack, &mut buf);
@@ -243,7 +248,9 @@ impl PaletteState {
                 .collect();
 
             scored.sort_by_key(|b| std::cmp::Reverse(b.1));
-            self.filtered = scored.into_iter().map(|(cmd, s)| (cmd, Some(s))).collect();
+            self.filtered.clear();
+            self.filtered
+                .extend(scored.into_iter().map(|(cmd, s)| (cmd, Some(s))));
         }
 
         // Clamp selection

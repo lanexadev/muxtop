@@ -64,22 +64,24 @@ pub enum SortOrder {
 /// Sorts `procs` in-place by `field` in the given `order`.
 /// Name and User comparisons are case-insensitive.
 pub fn sort_processes(procs: &mut [ProcessInfo], field: SortField, order: SortOrder) {
-    procs.sort_unstable_by(|a, b| {
-        let cmp = match field {
-            SortField::Cpu => a
-                .cpu_percent
+    // Name/User use `sort_by_cached_key` so `to_lowercase()` runs O(n) instead
+    // of O(n log n) times — a comparator-based sort reallocates the lowercased
+    // key on every comparison.
+    match field {
+        SortField::Name => procs.sort_by_cached_key(|p| p.name.to_lowercase()),
+        SortField::User => procs.sort_by_cached_key(|p| p.user.to_lowercase()),
+        SortField::Cpu => procs.sort_unstable_by(|a, b| {
+            a.cpu_percent
                 .partial_cmp(&b.cpu_percent)
-                .unwrap_or(std::cmp::Ordering::Equal),
-            SortField::Mem => a.memory_bytes.cmp(&b.memory_bytes),
-            SortField::Pid => a.pid.cmp(&b.pid),
-            SortField::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-            SortField::User => a.user.to_lowercase().cmp(&b.user.to_lowercase()),
-        };
-        match order {
-            SortOrder::Asc => cmp,
-            SortOrder::Desc => cmp.reverse(),
-        }
-    });
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
+        SortField::Mem => procs.sort_unstable_by_key(|p| p.memory_bytes),
+        SortField::Pid => procs.sort_unstable_by_key(|p| p.pid),
+    }
+
+    if matches!(order, SortOrder::Desc) {
+        procs.reverse();
+    }
 }
 
 /// Returns a new `Vec` containing every process whose `name` or `command`
