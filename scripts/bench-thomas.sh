@@ -50,6 +50,11 @@ fi
 # 3. Startup + run + exit
 printf "\n${BOLD}[2/4] Measuring startup + ${RUN_SECS}s run...${RESET}\n"
 
+# Warm-up: the first execution of a freshly-built binary on macOS pays a
+# Gatekeeper / XProtect scan (~500 ms) that has nothing to do with our code.
+# Discard the first run so subsequent measurements reflect actual startup.
+"$BIN" --version > /dev/null 2>&1
+
 # We can't run the TUI interactively, so we measure --about (instant exit).
 start=$(date +%s%N 2>/dev/null || python3 -c 'import time; print(int(time.time()*1e9))')
 "$BIN" --about > /dev/null 2>&1

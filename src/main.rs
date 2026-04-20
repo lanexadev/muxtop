@@ -91,15 +91,26 @@ fn init_tracing() -> Result<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Fast path: `--about` must not pay the cost of building the tokio runtime
+    // (clap short-circuits `--version`/`--help` inside `parse()`, but `--about`
+    // is a custom flag and reaches main). Spinning up `rt-multi-thread` for
+    // a trivial print adds ~500 ms of cold-start latency.
     if cli.about {
         print_about();
         return Ok(());
     }
 
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime")?;
+    runtime.block_on(run_app(cli))
+}
+
+async fn run_app(cli: Cli) -> Result<()> {
     init_tracing()?;
 
     tracing::info!("muxtop starting");
