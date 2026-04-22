@@ -26,6 +26,7 @@
 
 # Benchmarks (local)
 /criterion/
+/dhat-heap.json
 
 # FORGE output (dev-only)
 .claude/

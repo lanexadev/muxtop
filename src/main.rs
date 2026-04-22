@@ -56,6 +56,12 @@ struct Cli {
     /// Skip TLS certificate verification (INSECURE — for development only)
     #[arg(long, conflicts_with = "tls_ca")]
     tls_skip_verify: bool,
+
+    /// [benchmark] Run the collector + apply snapshots through AppState for N
+    /// seconds without rendering, then exit cleanly. Used by the macro
+    /// benchmark to measure steady-state RSS without a TTY.
+    #[arg(long, hide = true, value_name = "SECS")]
+    bench_run: Option<u64>,
 }
 
 fn init_tracing() -> Result<()> {
@@ -181,6 +187,19 @@ async fn run_app(cli: Cli) -> Result<()> {
         connection_mode,
     };
 
+    // Benchmark mode: drain snapshots into an AppState for N seconds with no
+    // rendering, then exit. Lets external tools measure steady-state RSS
+    // without a TTY.
+    if let Some(secs) = cli.bench_run {
+        bench_run_loop(rx, config, Duration::from_secs(secs)).await;
+        cancel.cancel();
+        if let Err(e) = collector_handle.await {
+            tracing::error!("collector task panicked: {e:?}");
+        }
+        tracing::info!("muxtop bench-run shutting down");
+        return Ok(());
+    }
+
     // G-05: Run the TUI on a dedicated blocking thread so it doesn't
     // block the tokio runtime (crossterm::event::poll is a blocking syscall).
     let tui_result = tokio::task::spawn_blocking(move || muxtop_tui::run(rx, config))
@@ -199,6 +218,31 @@ async fn run_app(cli: Cli) -> Result<()> {
     tui_result.context("TUI error")?;
 
     Ok(())
+}
+
+/// Headless benchmark loop: drains snapshots into an `AppState` and exercises
+/// `apply_snapshot` + `recompute_visible` for `duration` seconds, then exits.
+/// Used to measure steady-state RSS without a TTY.
+async fn bench_run_loop(
+    mut rx: mpsc::Receiver<SystemSnapshot>,
+    config: CliConfig,
+    duration: Duration,
+) {
+    let mut app =
+        muxtop_tui::AppState::with_config(config, muxtop_tui::terminal::TermCaps::default());
+    let deadline = tokio::time::Instant::now() + duration;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break,
+            maybe_snap = rx.recv() => match maybe_snap {
+                Some(snap) => {
+                    app.apply_snapshot(snap);
+                    app.recompute_visible();
+                }
+                None => break,
+            }
+        }
+    }
 }
 
 fn print_about() {
