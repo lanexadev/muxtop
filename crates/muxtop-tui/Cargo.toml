@@ -19,7 +19,12 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+dhat = "0.3"
 
 [[bench]]
 name = "app_bench"
 harness = false
+
+[[example]]
+name = "alloc_profile"
+path = "examples/alloc_profile.rs"

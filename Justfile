@@ -43,9 +43,13 @@ dev:
 bench:
     cargo bench --workspace
 
-# Run the Thomas macro-benchmark
+# Run the Thomas macro-benchmark (build, startup, RSS)
 bench-thomas:
     ./scripts/bench-thomas.sh
+
+# Run the dhat heap allocation profile on hot paths
+bench-alloc:
+    cargo run --release --example alloc_profile -p muxtop-tui
 
 # Prepare a release (requires cargo-release)
 release version:
