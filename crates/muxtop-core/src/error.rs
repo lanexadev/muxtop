@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::container_engine::EngineError;
+
 #[derive(Debug, Error)]
 pub enum CoreError {
     #[error("collection failed: {0}")]
@@ -16,6 +18,9 @@ pub enum CoreError {
 
     #[error("channel closed")]
     ChannelClosed,
+
+    #[error("container engine: {0}")]
+    Engine(#[from] EngineError),
 }
 
 #[cfg(test)]
@@ -30,11 +35,22 @@ mod tests {
             CoreError::Permission("denied".into()),
             CoreError::Io(std::io::Error::other("io err")),
             CoreError::ChannelClosed,
+            CoreError::Engine(EngineError::ConnectFailed("refused".into())),
         ];
         for err in &variants {
             let msg = format!("{err}");
             assert!(!msg.is_empty(), "Display for {err:?} was empty");
         }
+    }
+
+    #[test]
+    fn core_error_from_engine_error() {
+        let eng = EngineError::ConnectFailed("refused".into());
+        let core: CoreError = eng.into();
+        assert!(matches!(
+            core,
+            CoreError::Engine(EngineError::ConnectFailed(_))
+        ));
     }
 
     #[test]
