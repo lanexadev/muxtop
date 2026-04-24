@@ -7,10 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-04-24
+
 ### Added
 - `scripts/bench-thomas.sh` now measures peak RSS over a 30 s headless collector run (uses `/usr/bin/time -l` on macOS, `/usr/bin/time -v` on Linux). Gives a publishable memory footprint number for comparison with other monitors.
 - Hidden `--bench-run <secs>` flag on the `muxtop` binary: runs the collector + `AppState::apply_snapshot` / `recompute_visible` loop without a TUI, then exits. Lets external tools measure steady-state RSS without a TTY.
 - `cargo run --example alloc_profile -p muxtop-tui` (also `just bench-alloc`) — runs the hot paths (`PaletteState::refilter`, `sort_processes`, `AppState::apply_snapshot`) under the `dhat` global allocator and reports per-iteration allocation counts and bytes. Complements the criterion time benches for catching allocation regressions.
+
+### Security
+- Bump `rustls-webpki` to 0.103.13 to remediate **RUSTSEC-2026-0104**.
 
 ## [0.2.2] - 2026-04-20
 
