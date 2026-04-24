@@ -6,6 +6,7 @@
 //!
 //! CPU percentage is computed client-side by caching the previous `cpu_usage`
 //! + `system_cpu_usage` per container and taking a delta at the next tick.
+//!
 //! The Collector calls this at 0.5 Hz (see ADR-05 of forge/23-epic-containers),
 //! so the first tick after startup yields 0 % for every container — an
 //! acceptable 2 s warm-up.
@@ -501,17 +502,18 @@ mod tests {
     // ─── compute_cpu_pct ───────────────────────────────────────────────────
 
     fn stats_with_cpu(total: u64, system: u64, online: u32) -> ContainerStatsResponse {
-        let mut out = ContainerStatsResponse::default();
-        out.cpu_stats = Some(ContainerCpuStats {
-            cpu_usage: Some(ContainerCpuUsage {
-                total_usage: Some(total),
+        ContainerStatsResponse {
+            cpu_stats: Some(ContainerCpuStats {
+                cpu_usage: Some(ContainerCpuUsage {
+                    total_usage: Some(total),
+                    ..Default::default()
+                }),
+                system_cpu_usage: Some(system),
+                online_cpus: Some(online),
                 ..Default::default()
             }),
-            system_cpu_usage: Some(system),
-            online_cpus: Some(online),
             ..Default::default()
-        });
-        out
+        }
     }
 
     #[test]
@@ -619,27 +621,29 @@ mod tests {
 
     #[test]
     fn sum_blkio_reads_and_writes() {
-        let mut stats = ContainerStatsResponse::default();
-        stats.blkio_stats = Some(ContainerBlkioStats {
-            io_service_bytes_recursive: Some(vec![
-                ContainerBlkioStatEntry {
-                    op: Some("Read".into()),
-                    value: Some(1_000),
-                    ..Default::default()
-                },
-                ContainerBlkioStatEntry {
-                    op: Some("write".into()),
-                    value: Some(500),
-                    ..Default::default()
-                },
-                ContainerBlkioStatEntry {
-                    op: Some("read".into()),
-                    value: Some(250),
-                    ..Default::default()
-                },
-            ]),
+        let stats = ContainerStatsResponse {
+            blkio_stats: Some(ContainerBlkioStats {
+                io_service_bytes_recursive: Some(vec![
+                    ContainerBlkioStatEntry {
+                        op: Some("Read".into()),
+                        value: Some(1_000),
+                        ..Default::default()
+                    },
+                    ContainerBlkioStatEntry {
+                        op: Some("write".into()),
+                        value: Some(500),
+                        ..Default::default()
+                    },
+                    ContainerBlkioStatEntry {
+                        op: Some("read".into()),
+                        value: Some(250),
+                        ..Default::default()
+                    },
+                ]),
+                ..Default::default()
+            }),
             ..Default::default()
-        });
+        };
         assert_eq!(sum_blkio(&stats, "read"), 1_250);
         assert_eq!(sum_blkio(&stats, "write"), 500);
     }
@@ -652,7 +656,6 @@ mod tests {
 
     #[test]
     fn sum_networks_aggregates_all_interfaces() {
-        let mut stats = ContainerStatsResponse::default();
         let mut nets = HashMap::new();
         nets.insert(
             "eth0".into(),
@@ -670,7 +673,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        stats.networks = Some(nets);
+        let stats = ContainerStatsResponse {
+            networks: Some(nets),
+            ..Default::default()
+        };
         assert_eq!(sum_networks(&stats), (300, 125));
     }
 
@@ -694,21 +700,6 @@ mod tests {
             ..Default::default()
         };
 
-        let mut stats = ContainerStatsResponse::default();
-        stats.memory_stats = Some(ContainerMemoryStats {
-            usage: Some(128 * 1024 * 1024),
-            limit: Some(512 * 1024 * 1024),
-            ..Default::default()
-        });
-        stats.cpu_stats = Some(ContainerCpuStats {
-            cpu_usage: Some(ContainerCpuUsage {
-                total_usage: Some(2_000),
-                ..Default::default()
-            }),
-            system_cpu_usage: Some(10_000),
-            online_cpus: Some(2),
-            ..Default::default()
-        });
         let mut nets = HashMap::new();
         nets.insert(
             "eth0".into(),
@@ -718,15 +709,32 @@ mod tests {
                 ..Default::default()
             },
         );
-        stats.networks = Some(nets);
-        stats.blkio_stats = Some(ContainerBlkioStats {
-            io_service_bytes_recursive: Some(vec![ContainerBlkioStatEntry {
-                op: Some("read".into()),
-                value: Some(1024),
+        let stats = ContainerStatsResponse {
+            memory_stats: Some(ContainerMemoryStats {
+                usage: Some(128 * 1024 * 1024),
+                limit: Some(512 * 1024 * 1024),
                 ..Default::default()
-            }]),
+            }),
+            cpu_stats: Some(ContainerCpuStats {
+                cpu_usage: Some(ContainerCpuUsage {
+                    total_usage: Some(2_000),
+                    ..Default::default()
+                }),
+                system_cpu_usage: Some(10_000),
+                online_cpus: Some(2),
+                ..Default::default()
+            }),
+            networks: Some(nets),
+            blkio_stats: Some(ContainerBlkioStats {
+                io_service_bytes_recursive: Some(vec![ContainerBlkioStatEntry {
+                    op: Some("read".into()),
+                    value: Some(1024),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
             ..Default::default()
-        });
+        };
 
         let prev = CachedCpu {
             cpu_usage: 0,

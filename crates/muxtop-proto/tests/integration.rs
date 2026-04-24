@@ -1,11 +1,13 @@
+use bincode::config;
 use tokio::net::{TcpListener, TcpStream};
 
+use muxtop_core::containers::{ContainerSnapshot, ContainerState, ContainersSnapshot, EngineKind};
 use muxtop_core::network::{NetworkInterfaceSnapshot, NetworkSnapshot};
 use muxtop_core::process::ProcessInfo;
 use muxtop_core::system::{
     CoreSnapshot, CpuSnapshot, LoadSnapshot, MemorySnapshot, SystemSnapshot,
 };
-use muxtop_proto::{FrameReader, FrameWriter, WireMessage};
+use muxtop_proto::{FrameReader, FrameWriter, MAX_FRAME_SIZE, WireMessage};
 
 fn make_test_snapshot() -> SystemSnapshot {
     SystemSnapshot {
@@ -181,6 +183,113 @@ async fn test_tcp_clean_disconnect() {
     assert!(result.is_none(), "expected None on clean disconnect");
 
     server.await.unwrap();
+}
+
+// ─── v0.3 Containers wire protocol (E3) ───────────────────────────────────
+
+fn sample_container(index: usize, state: ContainerState) -> ContainerSnapshot {
+    ContainerSnapshot {
+        id: format!("abc{index:09}"),
+        name: format!("svc-{index:03}"),
+        image: "nginx:1.27-alpine".into(),
+        state,
+        status_text: format!("Up {} minutes", index * 2),
+        cpu_pct: (index as f32 * 1.5) % 100.0,
+        mem_used_bytes: 64 * 1024 * 1024 + (index as u64 * 1_000),
+        mem_limit_bytes: 256 * 1024 * 1024,
+        net_rx_bytes: index as u64 * 1_024,
+        net_tx_bytes: index as u64 * 512,
+        block_read_bytes: index as u64 * 4_096,
+        block_write_bytes: index as u64 * 2_048,
+        started_at_ms: 1_700_000_000_000 + index as u64,
+    }
+}
+
+fn sample_containers_snapshot(n: usize) -> ContainersSnapshot {
+    let mut containers = Vec::with_capacity(n);
+    let states = [
+        ContainerState::Running,
+        ContainerState::Exited,
+        ContainerState::Paused,
+        ContainerState::Restarting,
+    ];
+    for i in 0..n {
+        containers.push(sample_container(i, states[i % states.len()]));
+    }
+    ContainersSnapshot {
+        engine: EngineKind::Docker,
+        daemon_up: true,
+        containers,
+    }
+}
+
+/// Encode 20 containers, decode, assert equality byte-for-byte.
+#[test]
+fn test_containers_snapshot_roundtrip_20_entries() {
+    let original = sample_containers_snapshot(20);
+    let cfg = config::standard();
+
+    let bytes = bincode::encode_to_vec(&original, cfg).expect("encode");
+    let (decoded, read): (ContainersSnapshot, usize) =
+        bincode::decode_from_slice(&bytes, cfg).expect("decode");
+
+    assert_eq!(read, bytes.len());
+    assert_eq!(original, decoded);
+    assert_eq!(decoded.containers.len(), 20);
+    assert!(decoded.daemon_up);
+    assert_eq!(decoded.engine, EngineKind::Docker);
+}
+
+/// `unavailable()` must round-trip unchanged — daemon_up=false, empty vec,
+/// engine=Unknown. This is the canonical "no Docker" sentinel.
+#[test]
+fn test_containers_snapshot_unavailable_roundtrip() {
+    let original = ContainersSnapshot::unavailable();
+    let cfg = config::standard();
+
+    let bytes = bincode::encode_to_vec(&original, cfg).expect("encode");
+    let (decoded, _): (ContainersSnapshot, usize) =
+        bincode::decode_from_slice(&bytes, cfg).expect("decode");
+
+    assert_eq!(original, decoded);
+    assert!(!decoded.daemon_up);
+    assert!(decoded.containers.is_empty());
+    assert_eq!(decoded.engine, EngineKind::Unknown);
+}
+
+/// Stress: 100 containers with realistic field sizes must fit well under the
+/// 4 MiB `MAX_FRAME_SIZE`. If this ever fails, either the frame cap needs a
+/// bump or the container model is leaking per-row payload.
+#[test]
+fn test_containers_snapshot_100_fits_under_frame_limit() {
+    let snapshot = sample_containers_snapshot(100);
+    let cfg = config::standard();
+    let bytes = bincode::encode_to_vec(&snapshot, cfg).expect("encode");
+
+    let size = bytes.len();
+    assert!(
+        size < 256 * 1024,
+        "100 containers encoded to {size} bytes, exceeds 256 KiB budget"
+    );
+    assert!(
+        size < MAX_FRAME_SIZE as usize,
+        "100 containers encoded to {size} bytes, exceeds MAX_FRAME_SIZE"
+    );
+}
+
+/// Verify the `WireMessage::Error` channel is orthogonal to container data —
+/// a container-engine failure on the server side should surface as a
+/// dedicated Error frame, not a crafted empty Snapshot. This test pins the
+/// convention we plan to use in E4.
+#[test]
+fn test_container_engine_error_uses_wire_error_frame() {
+    let err = WireMessage::Error {
+        code: 1,
+        message: "container engine unreachable".into(),
+    };
+    let frame = err.to_frame().expect("to_frame");
+    let decoded = WireMessage::from_frame(&frame).expect("from_frame");
+    assert_eq!(err, decoded);
 }
 
 /// Test token validation logic.

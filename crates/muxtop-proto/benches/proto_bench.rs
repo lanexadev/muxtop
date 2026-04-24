@@ -1,5 +1,7 @@
+use bincode::config;
 use criterion::{Criterion, criterion_group, criterion_main};
 
+use muxtop_core::containers::{ContainerSnapshot, ContainerState, ContainersSnapshot, EngineKind};
 use muxtop_core::network::{NetworkInterfaceSnapshot, NetworkSnapshot};
 use muxtop_core::process::ProcessInfo;
 use muxtop_core::system::{
@@ -113,10 +115,69 @@ fn bench_frame_roundtrip(c: &mut Criterion) {
     });
 }
 
+// ─── v0.3 Containers wire-protocol benches (E3) ───────────────────────────
+
+fn make_containers_snapshot(n: usize) -> ContainersSnapshot {
+    let states = [
+        ContainerState::Running,
+        ContainerState::Exited,
+        ContainerState::Paused,
+        ContainerState::Restarting,
+    ];
+    let containers: Vec<ContainerSnapshot> = (0..n)
+        .map(|i| ContainerSnapshot {
+            id: format!("container{i:012}"),
+            name: format!("svc-{i:04}"),
+            image: "registry.example.com/library/app:v1.2.3".into(),
+            state: states[i % states.len()],
+            status_text: format!("Up {} hours", i % 24),
+            cpu_pct: (i as f32 * 1.7) % 100.0,
+            mem_used_bytes: (i as u64 * 4 * 1024 * 1024) % (2 * 1024 * 1024 * 1024),
+            mem_limit_bytes: 2 * 1024 * 1024 * 1024,
+            net_rx_bytes: i as u64 * 1_048_576,
+            net_tx_bytes: i as u64 * 524_288,
+            block_read_bytes: i as u64 * 4_096,
+            block_write_bytes: i as u64 * 2_048,
+            started_at_ms: 1_700_000_000_000 + i as u64 * 3_600_000,
+        })
+        .collect();
+
+    ContainersSnapshot {
+        engine: EngineKind::Docker,
+        daemon_up: true,
+        containers,
+    }
+}
+
+fn bench_containers_serialize(c: &mut Criterion) {
+    let snapshot = make_containers_snapshot(100);
+    let cfg = config::standard();
+
+    c.bench_function("containers_serialize_100", |b| {
+        b.iter(|| bincode::encode_to_vec(&snapshot, cfg).unwrap());
+    });
+}
+
+fn bench_containers_deserialize(c: &mut Criterion) {
+    let snapshot = make_containers_snapshot(100);
+    let cfg = config::standard();
+    let bytes = bincode::encode_to_vec(&snapshot, cfg).unwrap();
+
+    c.bench_function("containers_deserialize_100", |b| {
+        b.iter(|| {
+            let (decoded, _): (ContainersSnapshot, usize) =
+                bincode::decode_from_slice(&bytes, cfg).unwrap();
+            decoded
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_snapshot_serialize,
     bench_snapshot_deserialize,
-    bench_frame_roundtrip
+    bench_frame_roundtrip,
+    bench_containers_serialize,
+    bench_containers_deserialize
 );
 criterion_main!(benches);
