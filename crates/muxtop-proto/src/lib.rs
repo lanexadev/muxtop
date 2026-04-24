@@ -89,6 +89,7 @@ mod tests {
                 total_rx: 123_456,
                 total_tx: 78_901,
             },
+            containers: None,
             timestamp_ms: 1_713_200_000_000,
         }
     }

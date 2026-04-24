@@ -78,6 +78,7 @@ fn make_snapshot_3000() -> SystemSnapshot {
             total_rx,
             total_tx,
         },
+        containers: None,
         timestamp_ms: 1_713_200_000_000,
     }
 }

@@ -215,6 +215,7 @@ mod tests {
                 total_rx: 1000,
                 total_tx: 1000,
             },
+            containers: None,
             timestamp_ms: 1_713_200_000_000,
         }
     }

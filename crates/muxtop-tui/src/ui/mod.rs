@@ -399,6 +399,7 @@ mod tests {
                 total_rx: 0,
                 total_tx: 0,
             },
+            containers: None,
             timestamp_ms: 0,
         };
 
@@ -540,6 +541,7 @@ mod tests {
                 total_rx: 1_000_100,
                 total_tx: 500_100,
             },
+            containers: None,
             timestamp_ms: 0,
         };
 
@@ -616,6 +618,7 @@ mod tests {
                 total_rx: 1000,
                 total_tx: 500,
             },
+            containers: None,
             timestamp_ms: 0,
         };
 
@@ -672,6 +675,7 @@ mod tests {
                 total_rx: 0,
                 total_tx: 0,
             },
+            containers: None,
             timestamp_ms: 0,
         };
 

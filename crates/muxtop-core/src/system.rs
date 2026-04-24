@@ -3,6 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
+use crate::containers::ContainersSnapshot;
 use crate::network::NetworkSnapshot;
 use crate::process::ProcessInfo;
 
@@ -41,6 +42,11 @@ pub struct LoadSnapshot {
 }
 
 /// Full system snapshot aggregating all subsystems.
+///
+/// `containers` is `None` whenever the collector runs without a container
+/// engine attached, or before the first container tick has completed.
+/// Once set, it is `Some(ContainersSnapshot::unavailable())` to report
+/// engine failure or `Some(..)` with the current fleet.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct SystemSnapshot {
     pub cpu: CpuSnapshot,
@@ -48,13 +54,22 @@ pub struct SystemSnapshot {
     pub load: LoadSnapshot,
     pub processes: Vec<ProcessInfo>,
     pub networks: NetworkSnapshot,
+    pub containers: Option<ContainersSnapshot>,
     /// Milliseconds since Unix epoch.
     pub timestamp_ms: u64,
 }
 
 impl SystemSnapshot {
     /// Collect a full system snapshot from sysinfo.
-    pub fn collect(sys: &sysinfo::System, networks: &sysinfo::Networks) -> Self {
+    ///
+    /// `containers` is passed through verbatim: callers either supply the
+    /// latest snapshot from their container engine (via [`crate::Collector`])
+    /// or `None` when running without one.
+    pub fn collect(
+        sys: &sysinfo::System,
+        networks: &sysinfo::Networks,
+        containers: Option<ContainersSnapshot>,
+    ) -> Self {
         use sysinfo::System as SysSystem;
 
         let global_usage = sys.global_cpu_usage();
@@ -144,6 +159,7 @@ impl SystemSnapshot {
             load,
             processes,
             networks,
+            containers,
             timestamp_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system clock before Unix epoch")
@@ -176,7 +192,7 @@ mod tests {
         sys.refresh_all();
 
         let networks = sysinfo::Networks::new_with_refreshed_list();
-        let snap = SystemSnapshot::collect(&sys, &networks);
+        let snap = SystemSnapshot::collect(&sys, &networks, None);
         assert!(!snap.cpu.cores.is_empty(), "should have CPU cores");
         assert!(snap.memory.total > 0, "should have total memory");
         assert!(!snap.processes.is_empty(), "should have processes");
@@ -190,7 +206,7 @@ mod tests {
         sys.refresh_all();
 
         let networks = sysinfo::Networks::new_with_refreshed_list();
-        let snap = SystemSnapshot::collect(&sys, &networks);
+        let snap = SystemSnapshot::collect(&sys, &networks, None);
         assert!(
             snap.cpu.global_usage >= 0.0 && snap.cpu.global_usage <= 100.0,
             "global CPU usage should be 0..=100, got {}",
@@ -212,7 +228,7 @@ mod tests {
         sys.refresh_all();
 
         let networks = sysinfo::Networks::new_with_refreshed_list();
-        let snap = SystemSnapshot::collect(&sys, &networks);
+        let snap = SystemSnapshot::collect(&sys, &networks, None);
         assert!(snap.memory.total > 0, "total memory should be positive");
         // used + available can slightly exceed total due to kernel accounting
         // but total should be >= used
@@ -232,7 +248,7 @@ mod tests {
         sys.refresh_all();
         let networks = sysinfo::Networks::new_with_refreshed_list();
 
-        let snap = SystemSnapshot::collect(&sys, &networks);
+        let snap = SystemSnapshot::collect(&sys, &networks, None);
         assert!(
             !snap.networks.interfaces.is_empty(),
             "should have network interfaces"

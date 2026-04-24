@@ -68,6 +68,7 @@ fn make_snapshot(n: usize) -> SystemSnapshot {
             total_rx: 0,
             total_tx: 0,
         },
+        containers: None,
         timestamp_ms: 0,
     }
 }
