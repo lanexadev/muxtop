@@ -172,7 +172,9 @@ just dev      # vérification continue avec bacon
 |---------|----------|
 | **v0.1** ✓ | Remplacement htop — onglets, palette de commandes, vue arborescente |
 | **v0.2** ✓ | Onglet Réseau (remplace iftop) + architecture client-serveur (`muxtop-server`, `--remote`) |
-| v0.3 | Onglet Conteneurs (Docker / Podman / K8s) + monitoring GPU |
+| v0.3 | Onglet Conteneurs Docker / Podman (via [bollard](https://github.com/fussybeaver/bollard)) |
+| v0.3.1 | Support Kubernetes (via [kube-rs](https://github.com/kube-rs/kube)) |
+| v0.4 | Monitoring GPU (NVIDIA / AMD / Apple Silicon) + `docker exec` interactif (PTY) |
 | v1.0 | Système de plugins WASM + thèmes + fichier de configuration |
 
 ---
