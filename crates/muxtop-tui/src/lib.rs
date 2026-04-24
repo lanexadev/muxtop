@@ -55,14 +55,32 @@ impl Default for CliConfig {
 /// Run the TUI event loop. Blocks until the user quits.
 /// The TerminalGuard ensures the terminal is restored on any exit path
 /// (normal return, error propagation via ?, or panic unwind).
-pub fn run(rx: mpsc::Receiver<SystemSnapshot>, config: CliConfig) -> Result<(), TuiError> {
+///
+/// `container_engine` is shared with the Collector so that Stop/Kill/Restart
+/// actions dispatched from the TUI hit the same daemon. Pass `None` to
+/// disable container actions (the UI surfaces a "not configured" status
+/// message instead of spawning work).
+pub fn run(
+    rx: mpsc::Receiver<SystemSnapshot>,
+    config: CliConfig,
+    container_engine: Option<
+        std::sync::Arc<dyn muxtop_core::container_engine::ContainerEngine + Send + Sync>,
+    >,
+) -> Result<(), TuiError> {
     install_panic_hook();
     let mut guard = init_terminal()?;
     let term_caps = detect_terminal_caps();
     let mut app = app::AppState::with_config(config, term_caps);
+    if let Some(engine) = container_engine {
+        app.set_container_engine(engine);
+    }
     let mut handler = EventHandler::new(rx);
 
     while app.running() {
+        // Drain any container-action outcomes produced by spawned tokio
+        // tasks (Stop/Kill/Restart) so they surface as status messages.
+        app.pump_action_results();
+
         guard.0.draw(|frame| ui::draw_root(frame, &app))?;
 
         match handler.poll_event()? {

@@ -181,17 +181,28 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
             Span::raw(" "),
             key_hint("^P", "Palette", theme),
         ],
-        Tab::Containers => vec![
-            key_hint("q", "Quit", theme),
-            Span::raw(" "),
-            key_hint("j/k", "Select", theme),
-            Span::raw(" "),
-            key_hint("/", "Filter", theme),
-            Span::raw(" "),
-            key_hint("s", "Sort", theme),
-            Span::raw(" "),
-            key_hint("^P", "Palette", theme),
-        ],
+        Tab::Containers => {
+            let mut hints = vec![
+                key_hint("q", "Quit", theme),
+                Span::raw(" "),
+                key_hint("j/k", "Select", theme),
+                Span::raw(" "),
+                key_hint("/", "Filter", theme),
+                Span::raw(" "),
+                key_hint("s", "Sort", theme),
+            ];
+            if !app.is_remote() {
+                hints.push(Span::raw(" "));
+                hints.push(key_hint("F9", "Stop", theme));
+                hints.push(Span::raw(" "));
+                hints.push(key_hint("F10", "Kill", theme));
+                hints.push(Span::raw(" "));
+                hints.push(key_hint("F11", "Restart", theme));
+            }
+            hints.push(Span::raw(" "));
+            hints.push(key_hint("^P", "Palette", theme));
+            hints
+        }
     };
     let footer = Paragraph::new(Line::from(shortcuts)).style(Style::default().bg(theme.header_bg));
     frame.render_widget(footer, area);

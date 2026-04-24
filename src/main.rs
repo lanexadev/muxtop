@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -8,6 +9,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use muxtop_core::collector::Collector;
+use muxtop_core::container_engine::{ConnectionTarget, ContainerEngine, detect_socket};
+use muxtop_core::docker_engine::DockerEngine;
 use muxtop_core::process::SortField;
 use muxtop_core::system::SystemSnapshot;
 use muxtop_proto::RemoteCollector;
@@ -56,6 +59,17 @@ struct Cli {
     /// Skip TLS certificate verification (INSECURE — for development only)
     #[arg(long, conflicts_with = "tls_ca")]
     tls_skip_verify: bool,
+
+    /// Override Docker/Podman socket path (e.g. /var/run/docker.sock). If
+    /// omitted, muxtop auto-detects via $DOCKER_HOST, the standard socket
+    /// locations, and falls back to no-engine if nothing is reachable.
+    #[arg(long, value_name = "PATH")]
+    docker_socket: Option<PathBuf>,
+
+    /// Disable container engine autodetection entirely (Containers tab stays
+    /// in "no engine configured" state).
+    #[arg(long)]
+    no_containers: bool,
 
     /// [benchmark] Run the collector + apply snapshots through AppState for N
     /// seconds without rendering, then exit cleanly. Used by the macro
@@ -130,6 +144,16 @@ async fn run_app(cli: Cli) -> Result<()> {
     let (tx, rx) = mpsc::channel::<SystemSnapshot>(4);
     let cancel = CancellationToken::new();
 
+    // Build a container engine in local mode (opt-out via --no-containers).
+    // `None` on remote, or when detection/connection fails — the UI will
+    // render the appropriate fallback.
+    let container_engine: Option<Arc<dyn ContainerEngine + Send + Sync>> =
+        if cli.remote.is_none() && !cli.no_containers {
+            maybe_build_container_engine(cli.docker_socket.as_deref()).await
+        } else {
+            None
+        };
+
     // Determine connection mode and spawn appropriate collector.
     let collector_handle = if let Some(ref addr_str) = cli.remote {
         let addr: SocketAddr = addr_str
@@ -165,7 +189,10 @@ async fn run_app(cli: Cli) -> Result<()> {
         let remote = RemoteCollector::new(addr, Some(token), tls_connector, server_name);
         remote.spawn(tx, None, cancel.clone())
     } else {
-        let collector = Collector::new(Duration::from_secs(cli.refresh));
+        let collector = Collector::with_container_engine(
+            Duration::from_secs(cli.refresh),
+            container_engine.clone(),
+        );
         collector.spawn(tx, cancel.clone())
     };
 
@@ -202,7 +229,10 @@ async fn run_app(cli: Cli) -> Result<()> {
 
     // G-05: Run the TUI on a dedicated blocking thread so it doesn't
     // block the tokio runtime (crossterm::event::poll is a blocking syscall).
-    let tui_result = tokio::task::spawn_blocking(move || muxtop_tui::run(rx, config))
+    // The container engine is shared (Arc) with the Collector so Stop/Kill/
+    // Restart actions hit the same daemon.
+    let tui_engine = container_engine.clone();
+    let tui_result = tokio::task::spawn_blocking(move || muxtop_tui::run(rx, config, tui_engine))
         .await
         .context("TUI thread panicked")?;
 
@@ -241,6 +271,37 @@ async fn bench_run_loop(
                 }
                 None => break,
             }
+        }
+    }
+}
+
+/// Best-effort container engine construction.
+///
+/// Returns `None` when no socket can be detected or when connecting to the
+/// daemon fails; errors are logged as warnings so muxtop keeps booting with
+/// a disabled Containers tab rather than refusing to launch.
+async fn maybe_build_container_engine(
+    override_socket: Option<&std::path::Path>,
+) -> Option<Arc<dyn ContainerEngine + Send + Sync>> {
+    let target = match override_socket {
+        Some(path) => ConnectionTarget::Unix(path.to_path_buf()),
+        None => match detect_socket() {
+            Some(t) => t,
+            None => {
+                tracing::debug!("no container engine socket detected (Docker/Podman)");
+                return None;
+            }
+        },
+    };
+
+    match DockerEngine::connect(target.clone()).await {
+        Ok(engine) => {
+            tracing::info!(engine = ?engine.kind(), ?target, "container engine connected");
+            Some(Arc::new(engine))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, ?target, "container engine unreachable; Containers tab disabled");
+            None
         }
     }
 }

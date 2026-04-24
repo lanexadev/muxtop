@@ -32,6 +32,12 @@ pub enum ConfirmAction {
     },
     /// Change the nice value of a process.
     Renice { pid: u32, name: String, delta: i32 },
+    /// Graceful container shutdown (SIGTERM with grace period).
+    StopContainer { id: String, name: String },
+    /// Force container kill (SIGKILL).
+    KillContainer { id: String, name: String },
+    /// Restart the container.
+    RestartContainer { id: String, name: String },
 }
 
 impl ConfirmAction {
@@ -53,8 +59,21 @@ impl ConfirmAction {
                 };
                 format!("Renice {name} (PID {pid}) to {direction}?  [y/n]")
             }
+            ConfirmAction::StopContainer { id, name } => {
+                format!("Stop container {name} ({})?  [y/n]", short_id(id))
+            }
+            ConfirmAction::KillContainer { id, name } => {
+                format!("Kill container {name} ({})?  [y/n]", short_id(id))
+            }
+            ConfirmAction::RestartContainer { id, name } => {
+                format!("Restart container {name} ({})?  [y/n]", short_id(id))
+            }
         }
     }
+}
+
+fn short_id(id: &str) -> String {
+    id.chars().take(12).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -93,6 +112,9 @@ pub enum Command {
     SortContainersByMem,
     SortContainersByName,
     SortContainersByNetRx,
+    StopContainer,
+    KillContainer,
+    RestartContainer,
 }
 
 impl Command {
@@ -126,6 +148,9 @@ impl Command {
         Command::SortContainersByMem,
         Command::SortContainersByName,
         Command::SortContainersByNetRx,
+        Command::StopContainer,
+        Command::KillContainer,
+        Command::RestartContainer,
     ];
 
     pub fn label(self) -> &'static str {
@@ -159,6 +184,9 @@ impl Command {
             Command::SortContainersByMem => "Sort containers by memory",
             Command::SortContainersByName => "Sort containers by name",
             Command::SortContainersByNetRx => "Sort containers by network RX",
+            Command::StopContainer => "Stop container (SIGTERM)",
+            Command::KillContainer => "Kill container (SIGKILL)",
+            Command::RestartContainer => "Restart container",
         }
     }
 
@@ -193,6 +221,9 @@ impl Command {
             Command::SortContainersByMem => "",
             Command::SortContainersByName => "",
             Command::SortContainersByNetRx => "",
+            Command::StopContainer => "F9",
+            Command::KillContainer => "F10",
+            Command::RestartContainer => "F11",
         }
     }
 
@@ -409,6 +440,19 @@ pub struct AppState {
     container_rx_last: std::collections::HashMap<String, u64>,
     /// Per-container RX deltas (bytes/tick), capped.
     container_rx_hist: std::collections::HashMap<String, std::collections::VecDeque<u64>>,
+    /// Optional container engine for executing Stop/Kill/Restart actions.
+    ///
+    /// Shared (cheaply cloneable `Arc`) between AppState and the Collector's
+    /// container loop. `None` means container actions surface a "not
+    /// configured" status message rather than spawning a task.
+    pub container_engine:
+        Option<std::sync::Arc<dyn muxtop_core::container_engine::ContainerEngine + Send + Sync>>,
+    /// Channel sender for container action outcomes. Spawned tokio tasks
+    /// send their status messages here; the TUI main loop drains them via
+    /// [`pump_action_results`].
+    action_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    /// Matching receiver. Lives on AppState so call sites stay simple.
+    action_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
     /// Whether monitoring local machine or remote server.
     pub connection_mode: ConnectionMode,
 }
@@ -421,6 +465,7 @@ impl Default for AppState {
 
 impl AppState {
     pub fn new() -> Self {
+        let (action_tx, action_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             tab: Tab::default(),
             sort_field: SortField::Cpu,
@@ -455,6 +500,9 @@ impl AppState {
             container_cpu_hist: std::collections::HashMap::new(),
             container_rx_last: std::collections::HashMap::new(),
             container_rx_hist: std::collections::HashMap::new(),
+            container_engine: None,
+            action_tx,
+            action_rx,
             connection_mode: ConnectionMode::default(),
         }
     }
@@ -563,6 +611,146 @@ impl AppState {
             self.visible_tree.get(self.selected).map(|(p, _)| p)
         } else {
             self.visible_processes.get(self.selected)
+        }
+    }
+
+    /// Attach a concrete `ContainerEngine` for use by Stop/Kill/Restart.
+    ///
+    /// Called once by the binary after the engine is built in `main.rs`;
+    /// idempotent on None (kept as None).
+    pub fn set_container_engine(
+        &mut self,
+        engine: std::sync::Arc<dyn muxtop_core::container_engine::ContainerEngine + Send + Sync>,
+    ) {
+        self.container_engine = Some(engine);
+    }
+
+    /// Selected container row (respects filter + sort), if any. Used by the
+    /// action request methods below.
+    pub fn selected_container(&self) -> Option<muxtop_core::containers::ContainerSnapshot> {
+        let snapshot = self.last_snapshot.as_ref()?;
+        let cs = snapshot.containers.as_ref()?;
+        if !cs.daemon_up {
+            return None;
+        }
+        let rows = self.sorted_filtered_container_rows(cs);
+        rows.get(self.containers_selected).cloned()
+    }
+
+    /// Drain outcomes from spawned container action tasks, surfacing them as
+    /// status messages. Called by the TUI main loop every tick.
+    pub fn pump_action_results(&mut self) {
+        while let Ok(msg) = self.action_rx.try_recv() {
+            self.set_status(msg);
+        }
+    }
+
+    /// Shared sort+filter pipeline used by both the UI and action layer.
+    fn sorted_filtered_container_rows(
+        &self,
+        cs: &muxtop_core::containers::ContainersSnapshot,
+    ) -> Vec<muxtop_core::containers::ContainerSnapshot> {
+        use muxtop_core::containers::ContainerSnapshot;
+        let mut rows: Vec<ContainerSnapshot> = if self.containers_filter_input.is_empty() {
+            cs.containers.clone()
+        } else {
+            let f = self.containers_filter_input.to_lowercase();
+            cs.containers
+                .iter()
+                .filter(|c| {
+                    c.name.to_lowercase().contains(&f)
+                        || c.image.to_lowercase().contains(&f)
+                        || c.id.to_lowercase().contains(&f)
+                })
+                .cloned()
+                .collect()
+        };
+        match self.containers_sort_field {
+            ContainerSortField::Name => rows.sort_by(|a, b| a.name.cmp(&b.name)),
+            ContainerSortField::Cpu => rows.sort_by(|a, b| {
+                b.cpu_pct
+                    .partial_cmp(&a.cpu_pct)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+            ContainerSortField::Mem => rows.sort_by_key(|c| std::cmp::Reverse(c.mem_used_bytes)),
+            ContainerSortField::NetRx => rows.sort_by_key(|c| std::cmp::Reverse(c.net_rx_bytes)),
+            ContainerSortField::NetTx => rows.sort_by_key(|c| std::cmp::Reverse(c.net_tx_bytes)),
+            ContainerSortField::Uptime => rows.sort_by_key(|c| c.started_at_ms),
+        }
+        let is_asc = matches!(self.containers_sort_order, SortOrder::Asc);
+        let is_name = matches!(self.containers_sort_field, ContainerSortField::Name);
+        let is_uptime = matches!(self.containers_sort_field, ContainerSortField::Uptime);
+        let default_asc = is_name || is_uptime;
+        if is_asc != default_asc {
+            rows.reverse();
+        }
+        rows
+    }
+
+    fn request_container_action(&mut self, build: impl FnOnce(String, String) -> ConfirmAction) {
+        if self.is_remote() {
+            self.set_status("Actions disabled in remote mode".into());
+            return;
+        }
+        if let Some(c) = self.selected_container() {
+            self.confirm = Some(build(c.id.clone(), c.name.clone()));
+        }
+    }
+
+    /// F9 — graceful stop (SIGTERM + grace).
+    pub fn request_container_stop(&mut self) {
+        self.request_container_action(|id, name| ConfirmAction::StopContainer { id, name });
+    }
+
+    /// F10 — force kill (SIGKILL).
+    pub fn request_container_kill(&mut self) {
+        self.request_container_action(|id, name| ConfirmAction::KillContainer { id, name });
+    }
+
+    /// F11 — restart.
+    pub fn request_container_restart(&mut self) {
+        self.request_container_action(|id, name| ConfirmAction::RestartContainer { id, name });
+    }
+
+    /// Execute a confirmed container action by spawning a tokio task.
+    fn execute_container_action(&mut self, action: ConfirmAction) {
+        let Some(engine) = self.container_engine.clone() else {
+            self.set_status("Container engine not configured".into());
+            return;
+        };
+        let tx = self.action_tx.clone();
+        match action {
+            ConfirmAction::StopContainer { id, name } => {
+                tokio::spawn(async move {
+                    let result = engine.stop(&id, Some(10)).await;
+                    let msg = match result {
+                        Ok(()) => format!("Container {name} stopped"),
+                        Err(e) => format!("Failed to stop {name}: {e}"),
+                    };
+                    let _ = tx.send(msg);
+                });
+            }
+            ConfirmAction::KillContainer { id, name } => {
+                tokio::spawn(async move {
+                    let result = engine.kill(&id).await;
+                    let msg = match result {
+                        Ok(()) => format!("Container {name} killed"),
+                        Err(e) => format!("Failed to kill {name}: {e}"),
+                    };
+                    let _ = tx.send(msg);
+                });
+            }
+            ConfirmAction::RestartContainer { id, name } => {
+                tokio::spawn(async move {
+                    let result = engine.restart(&id).await;
+                    let msg = match result {
+                        Ok(()) => format!("Container {name} restarted"),
+                        Err(e) => format!("Failed to restart {name}: {e}"),
+                    };
+                    let _ = tx.send(msg);
+                });
+            }
+            _ => unreachable!("execute_container_action only handles container variants"),
         }
     }
 
@@ -899,6 +1087,19 @@ impl AppState {
                 }
             }
 
+            // Container actions — F9 Stop, F10 Kill, F11 Restart (Containers
+            // tab, local only). `request_container_*` handles the remote-mode
+            // notice internally.
+            KeyCode::F(9) if self.tab == Tab::Containers => {
+                self.request_container_stop();
+            }
+            KeyCode::F(10) if self.tab == Tab::Containers => {
+                self.request_container_kill();
+            }
+            KeyCode::F(11) if self.tab == Tab::Containers => {
+                self.request_container_restart();
+            }
+
             // Clear filter with Esc (when not in filter input mode)
             KeyCode::Esc => match self.tab {
                 Tab::Network => {
@@ -1002,6 +1203,11 @@ impl AppState {
                     Err(e) => self.set_status(format!("Renice failed: {e}")),
                 }
             }
+            action @ (ConfirmAction::StopContainer { .. }
+            | ConfirmAction::KillContainer { .. }
+            | ConfirmAction::RestartContainer { .. }) => {
+                self.execute_container_action(action);
+            }
         }
     }
 
@@ -1078,6 +1284,9 @@ impl AppState {
         Command::ForceKillProcess,
         Command::NiceDown,
         Command::NiceUp,
+        Command::StopContainer,
+        Command::KillContainer,
+        Command::RestartContainer,
     ];
 
     /// Execute a command from the palette.
@@ -1200,6 +1409,9 @@ impl AppState {
             Command::SortContainersByNetRx => {
                 self.containers_sort_field = ContainerSortField::NetRx;
             }
+            Command::StopContainer => self.request_container_stop(),
+            Command::KillContainer => self.request_container_kill(),
+            Command::RestartContainer => self.request_container_restart(),
         }
     }
 
@@ -2708,5 +2920,181 @@ mod tests {
             cmds.contains(&Command::NiceDown),
             "NiceDown should be in local palette"
         );
+    }
+
+    // ─── Container actions (E6) ───────────────────────────────────────────
+
+    fn make_snapshot_with_container(
+        id: &str,
+        name: &str,
+    ) -> muxtop_core::system::SystemSnapshot {
+        use muxtop_core::containers::{
+            ContainerSnapshot, ContainerState, ContainersSnapshot, EngineKind,
+        };
+        use muxtop_core::network::NetworkSnapshot;
+        use muxtop_core::system::{CpuSnapshot, LoadSnapshot, MemorySnapshot, SystemSnapshot};
+
+        SystemSnapshot {
+            cpu: CpuSnapshot {
+                global_usage: 0.0,
+                cores: vec![],
+            },
+            memory: MemorySnapshot {
+                total: 0,
+                used: 0,
+                available: 0,
+                swap_total: 0,
+                swap_used: 0,
+            },
+            load: LoadSnapshot {
+                one: 0.0,
+                five: 0.0,
+                fifteen: 0.0,
+                uptime_secs: 0,
+            },
+            processes: vec![],
+            networks: NetworkSnapshot {
+                interfaces: vec![],
+                total_rx: 0,
+                total_tx: 0,
+            },
+            containers: Some(ContainersSnapshot {
+                engine: EngineKind::Docker,
+                daemon_up: true,
+                containers: vec![ContainerSnapshot {
+                    id: id.into(),
+                    name: name.into(),
+                    image: "nginx:1.27".into(),
+                    state: ContainerState::Running,
+                    status_text: "Up 1 minute".into(),
+                    cpu_pct: 1.5,
+                    mem_used_bytes: 0,
+                    mem_limit_bytes: 0,
+                    net_rx_bytes: 0,
+                    net_tx_bytes: 0,
+                    block_read_bytes: 0,
+                    block_write_bytes: 0,
+                    started_at_ms: 1_700_000_000_000,
+                }],
+            }),
+            timestamp_ms: 1_700_000_000_000,
+        }
+    }
+
+    #[test]
+    fn test_container_stop_opens_confirm() {
+        let mut app = AppState::new();
+        app.tab = Tab::Containers;
+        app.apply_snapshot(make_snapshot_with_container("abc123def456", "my-nginx"));
+        app.handle_key_event(key(KeyCode::F(9)));
+        match &app.confirm {
+            Some(ConfirmAction::StopContainer { id, name }) => {
+                assert_eq!(id, "abc123def456");
+                assert_eq!(name, "my-nginx");
+            }
+            other => panic!("expected StopContainer confirm dialog, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_container_kill_opens_confirm() {
+        let mut app = AppState::new();
+        app.tab = Tab::Containers;
+        app.apply_snapshot(make_snapshot_with_container("abc", "svc"));
+        app.handle_key_event(key(KeyCode::F(10)));
+        assert!(matches!(
+            app.confirm,
+            Some(ConfirmAction::KillContainer { .. })
+        ));
+    }
+
+    #[test]
+    fn test_container_restart_opens_confirm() {
+        let mut app = AppState::new();
+        app.tab = Tab::Containers;
+        app.apply_snapshot(make_snapshot_with_container("abc", "svc"));
+        app.handle_key_event(key(KeyCode::F(11)));
+        assert!(matches!(
+            app.confirm,
+            Some(ConfirmAction::RestartContainer { .. })
+        ));
+    }
+
+    #[test]
+    fn test_container_actions_disabled_in_remote_mode() {
+        let mut app = make_remote_app();
+        app.tab = Tab::Containers;
+        app.apply_snapshot(make_snapshot_with_container("abc", "svc"));
+        app.handle_key_event(key(KeyCode::F(9)));
+        assert!(app.confirm.is_none(), "confirm dialog should not open");
+        assert!(
+            app.active_status()
+                .is_some_and(|s| s.contains("disabled in remote")),
+            "expected remote-mode notice, got {:?}",
+            app.active_status()
+        );
+    }
+
+    #[test]
+    fn test_container_action_on_other_tabs_ignored() {
+        let mut app = AppState::new();
+        app.apply_snapshot(make_snapshot_with_container("abc", "svc"));
+        for tab in [Tab::General, Tab::Processes, Tab::Network] {
+            app.tab = tab;
+            app.confirm = None;
+            app.handle_key_event(key(KeyCode::F(11)));
+            assert!(
+                app.confirm.is_none(),
+                "F11 on {tab:?} must not open a container confirm"
+            );
+        }
+    }
+
+    #[test]
+    fn test_palette_excludes_container_actions_in_remote() {
+        let mut app = make_remote_app();
+        app.open_palette();
+        let cmds: Vec<Command> = app.palette.filtered.iter().map(|(c, _)| *c).collect();
+        assert!(!cmds.contains(&Command::StopContainer));
+        assert!(!cmds.contains(&Command::KillContainer));
+        assert!(!cmds.contains(&Command::RestartContainer));
+    }
+
+    #[test]
+    fn test_palette_includes_container_actions_in_local() {
+        let mut app = AppState::new();
+        app.open_palette();
+        let cmds: Vec<Command> = app.palette.filtered.iter().map(|(c, _)| *c).collect();
+        assert!(cmds.contains(&Command::StopContainer));
+        assert!(cmds.contains(&Command::KillContainer));
+        assert!(cmds.contains(&Command::RestartContainer));
+    }
+
+    #[tokio::test]
+    async fn test_execute_container_without_engine_sets_status() {
+        let mut app = AppState::new();
+        app.tab = Tab::Containers;
+        app.apply_snapshot(make_snapshot_with_container("abc", "svc"));
+        app.handle_key_event(key(KeyCode::F(9)));
+        app.handle_key_event(key(KeyCode::Char('y')));
+        assert!(app.confirm.is_none());
+        assert!(
+            app.active_status()
+                .is_some_and(|s| s.contains("not configured")),
+            "expected 'not configured' status, got {:?}",
+            app.active_status()
+        );
+    }
+
+    #[test]
+    fn test_confirm_action_prompt_mentions_container_name() {
+        let prompt = ConfirmAction::StopContainer {
+            id: "abcdef123456789".into(),
+            name: "nginx".into(),
+        }
+        .prompt();
+        assert!(prompt.contains("Stop"));
+        assert!(prompt.contains("nginx"));
+        assert!(prompt.contains("abcdef123456"));
     }
 }
