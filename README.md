@@ -125,7 +125,7 @@ Testé sur macOS avec 500+ processus (benchmark Thomas) :
 | Démarrage (`--about`) | < 100 ms | ~5 ms |
 | Taille du binaire | < 10 MB | ~4 MB |
 | FPS (TUI) | > 30 | ~60 |
-| RAM | < 10 MB | < 8 MB |
+| RSS pic (30 s) | < 15 MiB | **10.3 MiB** (htop ~15, btop ~40) |
 
 Lancez le benchmark vous-même :
 
