@@ -56,6 +56,10 @@ bincode = "2"
 # Async trait (dyn-safe async fn in trait — see ADR-01 in forge/24)
 async-trait = "0.1"
 
+# Docker/Podman API client (v0.3 Containers, see ADR-01 in forge/25)
+bollard = "0.20"
+futures = "0.3"
+
 # TLS
 tokio-rustls = "0.26"
 rustls-pki-types = "1"
