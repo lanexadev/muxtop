@@ -61,9 +61,10 @@ cargo build --release
 
 | Fonctionnalité | Détail |
 |---|---|
-| **Onglets** | General (CPU, mémoire, charge), Processes et Network — `Alt+1` / `Alt+2` / `Alt+3` |
+| **Onglets** | General, Processes, Network et Containers — `Alt+1` / `Alt+2` / `Alt+3` / `Alt+4` |
 | **Onglet Réseau** | Tableau d'interfaces avec RX/s, TX/s, totaux, erreurs + sparklines en temps réel |
-| **Palette de commandes** | `Ctrl+P` — `kill firefox`, `sort memory`, `sort net rx`, etc. |
+| **Onglet Conteneurs** | Docker/Podman via [bollard](https://github.com/fussybeaver/bollard) — table CPU/mémoire/réseau/IO, sparklines CPU+RX, actions `F9` stop / `F10` kill / `F11` restart, détection socket automatique |
+| **Palette de commandes** | `Ctrl+P` — `kill firefox`, `sort memory`, `stop nginx`, `restart postgres`, etc. |
 | **Raccourcis htop** | `F3` recherche, `F4` filtre, `F5` arbre, `F6` tri, `F9` kill, `F10` quitter |
 | **Recherche fuzzy** | Propulsé par [nucleo](https://github.com/helix-editor/nucleo) (issu de l'éditeur Helix) |
 | **Vue arborescente** | `F5` bascule l'affichage hiérarchique parent/enfant |
@@ -80,12 +81,17 @@ cargo build --release
 ## Utilisation
 
 ```sh
-muxtop                              # lancement normal
+muxtop                              # lancement normal (autodétecte Docker/Podman)
 muxtop --refresh 2                  # rafraîchissement toutes les 2 secondes
 muxtop --filter firefox             # démarre avec un filtre de processus
 muxtop --sort mem                   # tri par mémoire au démarrage
 muxtop --tree                       # démarre en vue arborescente
 muxtop --about                      # version, licence, déclaration de confidentialité
+
+# Onglet Conteneurs — par défaut muxtop cherche $DOCKER_HOST, /var/run/docker.sock,
+# puis les sockets Podman. Passez un chemin pour forcer, ou désactivez complètement :
+muxtop --docker-socket /var/run/docker.sock   # override du socket
+muxtop --no-containers                        # désactive la collecte conteneurs
 
 # Démarrer le serveur (TLS + auth obligatoire)
 muxtop-server --token "mon-secret-16chars" --tls-generate
@@ -103,16 +109,18 @@ MUXTOP_TOKEN="mon-secret-16chars" muxtop --remote host:port --tls-ca cert.pem
 | Touche | Action |
 |--------|--------|
 | `Ctrl+P` | Palette de commandes |
-| `Alt+1` / `Alt+2` / `Alt+3` | Changer d'onglet (General / Processes / Network) |
+| `Alt+1` / `Alt+2` / `Alt+3` / `Alt+4` | Changer d'onglet (General / Processes / Network / Containers) |
 | `F1` | Aide |
 | `F3` / `/` | Recherche |
 | `F4` | Filtre de processus |
 | `F5` | Vue arborescente |
 | `F6` | Menu de tri |
-| `F9` | Tuer le processus |
-| `F10` / `q` | Quitter |
+| `F9` | Tuer le processus (onglet Processes) · Stop conteneur (onglet Containers) |
+| `F10` | Force kill (SIGKILL) — processus ou conteneur selon l'onglet actif |
+| `F11` | Redémarrer le conteneur (onglet Containers) |
+| `q` | Quitter |
 | `j` / `k` | Navigation (style vim) |
-| `+` / `-` | Renice (priorité) |
+| `+` / `-` | Renice (priorité) — onglet Processes uniquement |
 
 ---
 
@@ -141,17 +149,21 @@ just bench-thomas
 
 ```
 muxtop/
-├── src/                      # Point d'entrée (CLI clap + bootstrap tokio)
+├── src/                         # Point d'entrée (CLI clap + bootstrap tokio)
 └── crates/
-    ├── muxtop-core/          # Collecte système, modèles de données, actions
-    │   ├── src/collector.rs  # Boucle async sysinfo
-    │   ├── src/process.rs    # Tri, filtrage, arbre de processus
-    │   └── src/system.rs     # Snapshots CPU / mémoire / charge
-    ├── muxtop-tui/           # Interface ratatui
-    │   ├── src/app.rs        # Machine à états, gestion des événements
-    │   └── src/ui/           # Onglets General, Processes, palette, thème
-    ├── muxtop-proto/         # Protocole filaire et sérialisation binaire
-    └── muxtop-server/        # Daemon TCP pour le monitoring à distance
+    ├── muxtop-core/             # Collecte système, modèles de données, actions
+    │   ├── src/collector.rs     # Boucle async sysinfo (1 Hz) + boucle conteneurs (0.5 Hz)
+    │   ├── src/process.rs       # Tri, filtrage, arbre de processus
+    │   ├── src/system.rs        # Snapshots CPU / mémoire / charge
+    │   ├── src/network.rs       # Interfaces réseau + historique
+    │   ├── src/containers.rs    # Modèle conteneurs (ContainerSnapshot, états, engine)
+    │   ├── src/container_engine.rs # Trait async + détection socket Docker/Podman
+    │   └── src/docker_engine.rs # Implémentation concrète via bollard
+    ├── muxtop-tui/              # Interface ratatui
+    │   ├── src/app.rs           # Machine à états, gestion des événements
+    │   └── src/ui/              # Onglets General, Processes, Network, Containers, palette, thème
+    ├── muxtop-proto/            # Protocole filaire et sérialisation binaire
+    └── muxtop-server/           # Daemon TCP pour le monitoring à distance
 ```
 
 ---
@@ -172,7 +184,7 @@ just dev      # vérification continue avec bacon
 |---------|----------|
 | **v0.1** ✓ | Remplacement htop — onglets, palette de commandes, vue arborescente |
 | **v0.2** ✓ | Onglet Réseau (remplace iftop) + architecture client-serveur (`muxtop-server`, `--remote`) |
-| v0.3 | Onglet Conteneurs Docker / Podman (via [bollard](https://github.com/fussybeaver/bollard)) |
+| **v0.3** ✓ | Onglet Conteneurs Docker / Podman (via [bollard](https://github.com/fussybeaver/bollard)) + actions Stop/Kill/Restart |
 | v0.3.1 | Support Kubernetes (via [kube-rs](https://github.com/kube-rs/kube)) |
 | v0.4 | Monitoring GPU (NVIDIA / AMD / Apple Silicon) + `docker exec` interactif (PTY) |
 | v1.0 | Système de plugins WASM + thèmes + fichier de configuration |

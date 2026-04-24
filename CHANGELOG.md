@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-04-25
+
+Major feature release: the **Containers** tab (replaces `ctop`) with full Docker/Podman integration via [bollard](https://github.com/fussybeaver/bollard). Auto-detection at startup means `muxtop` gains a fourth tab on any host running a container engine with no extra flags.
+
+### Added
+
+#### Containers (`muxtop-core`, `muxtop-tui`, `muxtop`)
+- New `Tab::Containers` (keybind `Alt+4`) with a full rendering path in `muxtop-tui/src/ui/containers.rs`: sortable table of containers with columns NAME / IMAGE (truncated to 30 chars) / STATE / CPU % / MEM used/limit / NET RX/TX / UPTIME, color-coded by state (running=green, paused/restarting=yellow, dead=red, exited/created=dim), zebra stripes, summary bar with engine kind + running/total counts.
+- Per-selected-row sparklines: CPU % and RX-delta (60-sample rings per container id, dropped when a container disappears).
+- Sort cycles 6 fields: CPU, Mem, Name, NetRx, NetTx, Uptime (`s` cycles, `I/S` toggles direction, header arrow).
+- Filter by name / image / id (`/` to open, `Esc` to clear).
+- Container actions: `F9` Stop (SIGTERM + 10s grace), `F10` Kill (SIGKILL), `F11` Restart, each gated by a y/n confirmation dialog. Disabled in remote mode with the same notice style as Processes kill/renice.
+- 5 new palette commands: `SwitchToContainers`, `SortContainersByCpu/Mem/Name/NetRx`. 3 additional action commands (`StopContainer`, `KillContainer`, `RestartContainer`) with `F9`/`F10`/`F11` shortcut labels and exclusion from the palette in remote mode.
+- Three render fallbacks: `containers = None` → "Waiting for data...", engine configured but `daemon_up = false` → "No container daemon detected" with a CLI hint, empty list → "No containers" or "No containers match filter".
+
+#### Container engine (`muxtop-core`)
+- `ContainerEngine` async trait (`async-trait` crate, see ADR-01 in `forge/24-epic1-container-engine-trait`) with methods `list_and_stats`, `stop`, `kill`, `restart`, `kind`.
+- `DockerEngine` concrete implementation on top of `bollard 0.20`: handles Unix socket + HTTP/TCP targets, probes `/info` within 5 s, detects Docker / Podman / Unknown, fetches stats in parallel via `futures::stream::buffer_unordered(16)`, filters `ContainerNotFound` silently on race-with-removal.
+- CPU percentage computed client-side from a cached `(cpu_usage, system_cpu_usage)` per container with `saturating_sub` on counter resets. First tick after startup yields 0 % — acceptable 2 s warm-up at the collector's 0.5 Hz refresh rate.
+- Socket auto-detection (`detect_socket`) with fallback chain: `$DOCKER_HOST` → `/var/run/docker.sock` → `$XDG_RUNTIME_DIR/podman/podman.sock` → `/run/podman/podman.sock`. Pure path selection only (reachability is `DockerEngine::connect`'s job).
+- `EnvLookup` trait for parallel-safe tests (no `std::env` global mutation).
+- `EngineError` enum with granular variants (`ConnectFailed`, `ContainerNotFound`, `PermissionDenied`, `Timeout`, `Other`) and a `#[from] EngineError` bridge to `CoreError`.
+- `Collector::with_container_engine(interval, Option<Arc<dyn ContainerEngine + Send + Sync>>)`: drives a second `tokio::time::interval(2s)` task that calls the engine and publishes the result (or `ContainersSnapshot::unavailable()`) into a shared `Arc<Mutex<Option<ContainersSnapshot>>>`. Each system-tick `SystemSnapshot` carries the latest container snapshot through the new `containers: Option<ContainersSnapshot>` field.
+
+#### CLI (`muxtop`)
+- `--docker-socket <PATH>` flag to override autodetection.
+- `--no-containers` flag to disable the container engine entirely.
+- `maybe_build_container_engine()` runs autodetection + `DockerEngine::connect` at startup; on failure it logs a tracing warning and degrades to a None engine so muxtop always boots. The built `Arc<dyn ContainerEngine>` is cloned into both the Collector (stats) and the TUI (actions) so both hit the same daemon.
+
+#### Wire protocol (`muxtop-proto`)
+- `ContainerSnapshot`, `ContainersSnapshot`, `ContainerState` (7 variants), `EngineKind` derive `Serialize`, `Deserialize`, `Encode`, `Decode`, `PartialEq`, `Clone`, `Debug` so they cross the wire via `WireMessage::Snapshot(SystemSnapshot)` unchanged.
+- Integration tests: 20-container round-trip, `unavailable()` sentinel round-trip, 100-container frame-size sanity check (< 256 KiB vs the 4 MiB `MAX_FRAME_SIZE`).
+- Criterion benches `containers_serialize_100` + `containers_deserialize_100` for regression tracking.
+
+### Dependencies (workspace)
+- `async-trait = "0.1"` — dyn-safe async trait macro (see ADR-01 in forge/24).
+- `bollard = "0.20"` — Docker/Podman client (brings `hyper 1`, `http 1`, `futures 0.3`).
+- `futures = "0.3"` — `stream::buffer_unordered`.
+- `tempfile = "3"` added as dev-dep to `muxtop-core` for socket-detection tests.
+
+### Changed
+- `SystemSnapshot::collect` signature gained a third argument `containers: Option<ContainersSnapshot>`. All internal call sites updated; the Collector is the sole production caller and passes the latest container snapshot from its shared slot.
+- `muxtop_tui::run` signature gained an `Option<Arc<dyn ContainerEngine + Send + Sync>>` parameter. `src/main.rs` forwards the autodetected engine; passing `None` disables actions (they surface "Container engine not configured" as a status message).
+- `Tab::ALL` now has 4 variants; `Tab::next()` / `Tab::prev()` cycle through General → Processes → Network → Containers. Arrow / Tab / BackTab navigation updated accordingly.
+- `FUTURE_TABS` in the tab bar no longer shows "Containers [soon]" — only "GPU [soon]" remains.
+
+### Tests
+- Workspace test count: 421 (v0.2.2) → **488** (v0.3.0). Breakdown of the +67 new tests: `muxtop-core` containers/container_engine/docker_engine (+44), `muxtop-tui` ui::containers + app container actions (+19), `muxtop-proto` integration (+4). One new `#[ignore]` integration test requires a live Docker daemon (run with `cargo test -- --ignored`).
+- `cargo-deny check` remains clean with the new transitive deps (hyper 1.9, http 1.4, tokio-util features).
+
 ## [0.2.3] - 2026-04-24
 
 ### Added
