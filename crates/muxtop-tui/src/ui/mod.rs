@@ -1,6 +1,7 @@
 // Layout & rendering for the TUI.
 
 mod confirm;
+mod containers;
 mod general;
 mod network;
 mod palette;
@@ -20,7 +21,7 @@ use crate::app::{AppState, Tab};
 use theme::Theme;
 
 /// Labels for future tabs (not yet implemented).
-const FUTURE_TABS: &[&str] = &["Containers [soon]", "GPU [soon]"];
+const FUTURE_TABS: &[&str] = &["GPU [soon]"];
 
 /// Render the full application layout: Header, TabBar, Content, Footer.
 pub fn draw_root(frame: &mut Frame, app: &AppState) {
@@ -118,6 +119,7 @@ fn draw_content(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
         Tab::General => general::draw_general_tab(frame, area, app, theme),
         Tab::Processes => processes::draw_processes_tab(frame, area, app, theme),
         Tab::Network => network::draw_network_tab(frame, area, app, theme),
+        Tab::Containers => containers::draw_containers_tab(frame, area, app, theme),
     }
 }
 
@@ -169,6 +171,17 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
             hints
         }
         Tab::Network => vec![
+            key_hint("q", "Quit", theme),
+            Span::raw(" "),
+            key_hint("j/k", "Select", theme),
+            Span::raw(" "),
+            key_hint("/", "Filter", theme),
+            Span::raw(" "),
+            key_hint("s", "Sort", theme),
+            Span::raw(" "),
+            key_hint("^P", "Palette", theme),
+        ],
+        Tab::Containers => vec![
             key_hint("q", "Quit", theme),
             Span::raw(" "),
             key_hint("j/k", "Select", theme),

@@ -88,6 +88,11 @@ pub enum Command {
     SortNetByTx,
     SortNetByName,
     SortNetByErrors,
+    SwitchToContainers,
+    SortContainersByCpu,
+    SortContainersByMem,
+    SortContainersByName,
+    SortContainersByNetRx,
 }
 
 impl Command {
@@ -116,6 +121,11 @@ impl Command {
         Command::SortNetByTx,
         Command::SortNetByName,
         Command::SortNetByErrors,
+        Command::SwitchToContainers,
+        Command::SortContainersByCpu,
+        Command::SortContainersByMem,
+        Command::SortContainersByName,
+        Command::SortContainersByNetRx,
     ];
 
     pub fn label(self) -> &'static str {
@@ -144,6 +154,11 @@ impl Command {
             Command::SortNetByTx => "Sort network by TX",
             Command::SortNetByName => "Sort network by name",
             Command::SortNetByErrors => "Sort network by errors",
+            Command::SwitchToContainers => "Switch to Containers tab",
+            Command::SortContainersByCpu => "Sort containers by CPU",
+            Command::SortContainersByMem => "Sort containers by memory",
+            Command::SortContainersByName => "Sort containers by name",
+            Command::SortContainersByNetRx => "Sort containers by network RX",
         }
     }
 
@@ -173,6 +188,11 @@ impl Command {
             Command::SortNetByTx => "",
             Command::SortNetByName => "",
             Command::SortNetByErrors => "",
+            Command::SwitchToContainers => "Alt+4",
+            Command::SortContainersByCpu => "",
+            Command::SortContainersByMem => "",
+            Command::SortContainersByName => "",
+            Command::SortContainersByNetRx => "",
         }
     }
 
@@ -274,6 +294,7 @@ pub enum Tab {
     General,
     Processes,
     Network,
+    Containers,
 }
 
 impl std::fmt::Display for Tab {
@@ -283,13 +304,14 @@ impl std::fmt::Display for Tab {
 }
 
 impl Tab {
-    pub const ALL: &[Tab] = &[Tab::General, Tab::Processes, Tab::Network];
+    pub const ALL: &[Tab] = &[Tab::General, Tab::Processes, Tab::Network, Tab::Containers];
 
     pub fn label(self) -> &'static str {
         match self {
             Tab::General => "General",
             Tab::Processes => "Processes",
             Tab::Network => "Network",
+            Tab::Containers => "Containers",
         }
     }
 
@@ -314,6 +336,18 @@ pub enum NetworkSortField {
     TotalRx,
     TotalTx,
     Errors,
+}
+
+/// Sort field for the Containers tab.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerSortField {
+    Name,
+    #[default]
+    Cpu,
+    Mem,
+    NetRx,
+    NetTx,
+    Uptime,
 }
 
 /// Duration before a status message auto-clears.
@@ -357,6 +391,24 @@ pub struct AppState {
     pub net_filter_input: String,
     /// Filter active flag for the Network tab.
     pub net_filter_active: bool,
+    /// Selected container index (Containers tab).
+    pub containers_selected: usize,
+    /// Scroll offset (Containers tab).
+    pub containers_scroll_offset: usize,
+    /// Sort field for the Containers tab.
+    pub containers_sort_field: ContainerSortField,
+    /// Sort order for the Containers tab.
+    pub containers_sort_order: SortOrder,
+    /// Filter input for the Containers tab (matches id / name / image).
+    pub containers_filter_input: String,
+    /// Filter active flag for the Containers tab.
+    pub containers_filter_active: bool,
+    /// Per-container CPU % history (60 samples each, capped by CONTAINER_HISTORY_LEN).
+    container_cpu_hist: std::collections::HashMap<String, std::collections::VecDeque<f32>>,
+    /// Per-container cumulative RX (bytes). Deltas are computed on the fly.
+    container_rx_last: std::collections::HashMap<String, u64>,
+    /// Per-container RX deltas (bytes/tick), capped.
+    container_rx_hist: std::collections::HashMap<String, std::collections::VecDeque<u64>>,
     /// Whether monitoring local machine or remote server.
     pub connection_mode: ConnectionMode,
 }
@@ -394,6 +446,15 @@ impl AppState {
             net_sort_order: SortOrder::Desc,
             net_filter_input: String::new(),
             net_filter_active: false,
+            containers_selected: 0,
+            containers_scroll_offset: 0,
+            containers_sort_field: ContainerSortField::default(),
+            containers_sort_order: SortOrder::Desc,
+            containers_filter_input: String::new(),
+            containers_filter_active: false,
+            container_cpu_hist: std::collections::HashMap::new(),
+            container_rx_last: std::collections::HashMap::new(),
+            container_rx_hist: std::collections::HashMap::new(),
             connection_mode: ConnectionMode::default(),
         }
     }
@@ -479,6 +540,7 @@ impl AppState {
     pub fn item_count(&self) -> usize {
         match self.tab {
             Tab::Network => self.net_interface_count(),
+            Tab::Containers => self.containers_count(),
             _ => self.process_count(),
         }
     }
@@ -487,6 +549,10 @@ impl AppState {
     fn selected_mut(&mut self) -> (&mut usize, &mut usize) {
         match self.tab {
             Tab::Network => (&mut self.net_selected, &mut self.net_scroll_offset),
+            Tab::Containers => (
+                &mut self.containers_selected,
+                &mut self.containers_scroll_offset,
+            ),
             _ => (&mut self.selected, &mut self.scroll_offset),
         }
     }
@@ -503,8 +569,101 @@ impl AppState {
     /// Update the snapshot and recompute derived views.
     pub fn apply_snapshot(&mut self, snapshot: SystemSnapshot) {
         self.network_history.push(snapshot.networks.clone());
+        if let Some(cs) = snapshot.containers.as_ref() {
+            self.push_container_history(cs);
+        }
         self.last_snapshot = Some(snapshot);
         self.recompute_visible();
+    }
+
+    /// Per-container sparkline history cap — 60 samples, enough to fill the
+    /// widest terminals while keeping memory tiny.
+    const CONTAINER_HISTORY_LEN: usize = 60;
+
+    /// Update CPU% + RX-delta rings for every container in `cs`. Containers
+    /// that have disappeared since the last snapshot get their histories
+    /// dropped to avoid unbounded growth.
+    fn push_container_history(&mut self, cs: &muxtop_core::containers::ContainersSnapshot) {
+        use std::collections::{HashMap, VecDeque};
+        let mut seen = std::collections::HashSet::<String>::with_capacity(cs.containers.len());
+
+        for c in &cs.containers {
+            seen.insert(c.id.clone());
+
+            // CPU ring.
+            let cpu_ring = self
+                .container_cpu_hist
+                .entry(c.id.clone())
+                .or_insert_with(|| VecDeque::with_capacity(Self::CONTAINER_HISTORY_LEN));
+            if cpu_ring.len() >= Self::CONTAINER_HISTORY_LEN {
+                cpu_ring.pop_front();
+            }
+            cpu_ring.push_back(c.cpu_pct);
+
+            // RX delta vs last cumulative value.
+            let last = self.container_rx_last.get(&c.id).copied();
+            let delta = match last {
+                Some(prev) => c.net_rx_bytes.saturating_sub(prev),
+                None => 0,
+            };
+            self.container_rx_last.insert(c.id.clone(), c.net_rx_bytes);
+
+            let rx_ring = self
+                .container_rx_hist
+                .entry(c.id.clone())
+                .or_insert_with(|| VecDeque::with_capacity(Self::CONTAINER_HISTORY_LEN));
+            if rx_ring.len() >= Self::CONTAINER_HISTORY_LEN {
+                rx_ring.pop_front();
+            }
+            rx_ring.push_back(delta);
+        }
+
+        // Drop entries for containers that no longer exist.
+        fn drop_missing<V>(map: &mut HashMap<String, V>, seen: &std::collections::HashSet<String>) {
+            map.retain(|k, _| seen.contains(k));
+        }
+        drop_missing(&mut self.container_cpu_hist, &seen);
+        drop_missing(&mut self.container_rx_hist, &seen);
+        drop_missing(&mut self.container_rx_last, &seen);
+    }
+
+    /// CPU% history slice for the given container id. Empty when unknown.
+    pub fn container_cpu_history(&self, id: &str) -> Vec<f32> {
+        self.container_cpu_hist
+            .get(id)
+            .map(|r| r.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// RX delta history (bytes per tick) for the given container id.
+    pub fn container_rx_deltas(&self, id: &str) -> Vec<u64> {
+        self.container_rx_hist
+            .get(id)
+            .map(|r| r.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Visible container count (respects filter).
+    pub fn containers_count(&self) -> usize {
+        let Some(ref snapshot) = self.last_snapshot else {
+            return 0;
+        };
+        let Some(ref cs) = snapshot.containers else {
+            return 0;
+        };
+        if self.containers_filter_input.is_empty() {
+            cs.containers.len()
+        } else {
+            let f = self.containers_filter_input.to_lowercase();
+            cs.containers
+                .iter()
+                .filter(|c| {
+                    c.name.to_lowercase().contains(&f)
+                        || c.image.to_lowercase().contains(&f)
+                        || c.id.to_lowercase().contains(&f)
+                })
+                .count()
+        }
     }
 
     /// Recompute visible_processes and visible_tree from last_snapshot.
@@ -562,7 +721,7 @@ impl AppState {
         }
 
         // Filter mode captures most keys as text input.
-        if self.filter_active || self.net_filter_active {
+        if self.filter_active || self.net_filter_active || self.containers_filter_active {
             self.handle_filter_key(key);
             return;
         }
@@ -620,6 +779,9 @@ impl AppState {
             KeyCode::Char('3') if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.tab = Tab::Network;
             }
+            KeyCode::Char('4') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.tab = Tab::Containers;
+            }
 
             // Arrow tab navigation
             KeyCode::Right => {
@@ -646,28 +808,40 @@ impl AppState {
             }
 
             // Sort cycling (tab-aware)
-            KeyCode::Char('s') => {
-                if self.tab == Tab::Network {
+            KeyCode::Char('s') => match self.tab {
+                Tab::Network => {
                     self.net_sort_field = next_net_sort_field(self.net_sort_field);
-                } else {
+                }
+                Tab::Containers => {
+                    self.containers_sort_field =
+                        next_container_sort_field(self.containers_sort_field);
+                }
+                _ => {
                     self.sort_field = next_sort_field(self.sort_field);
                     self.recompute_visible();
                 }
-            }
-            KeyCode::Char('S') | KeyCode::Char('I') => {
-                if self.tab == Tab::Network {
+            },
+            KeyCode::Char('S') | KeyCode::Char('I') => match self.tab {
+                Tab::Network => {
                     self.net_sort_order = match self.net_sort_order {
                         SortOrder::Asc => SortOrder::Desc,
                         SortOrder::Desc => SortOrder::Asc,
                     };
-                } else {
+                }
+                Tab::Containers => {
+                    self.containers_sort_order = match self.containers_sort_order {
+                        SortOrder::Asc => SortOrder::Desc,
+                        SortOrder::Desc => SortOrder::Asc,
+                    };
+                }
+                _ => {
                     self.sort_order = match self.sort_order {
                         SortOrder::Asc => SortOrder::Desc,
                         SortOrder::Desc => SortOrder::Asc,
                     };
                     self.recompute_visible();
                 }
-            }
+            },
 
             // F-key sort shortcuts
             KeyCode::F(1) => {
@@ -726,25 +900,31 @@ impl AppState {
             }
 
             // Clear filter with Esc (when not in filter input mode)
-            KeyCode::Esc => {
-                if self.tab == Tab::Network {
+            KeyCode::Esc => match self.tab {
+                Tab::Network => {
                     if !self.net_filter_input.is_empty() {
                         self.net_filter_input.clear();
                     }
-                } else if !self.filter_input.is_empty() {
-                    self.filter_input.clear();
-                    self.recompute_visible();
                 }
-            }
+                Tab::Containers => {
+                    if !self.containers_filter_input.is_empty() {
+                        self.containers_filter_input.clear();
+                    }
+                }
+                _ => {
+                    if !self.filter_input.is_empty() {
+                        self.filter_input.clear();
+                        self.recompute_visible();
+                    }
+                }
+            },
 
             // Filter mode (tab-aware)
-            KeyCode::Char('/') => {
-                if self.tab == Tab::Network {
-                    self.net_filter_active = true;
-                } else {
-                    self.filter_active = true;
-                }
-            }
+            KeyCode::Char('/') => match self.tab {
+                Tab::Network => self.net_filter_active = true,
+                Tab::Containers => self.containers_filter_active = true,
+                _ => self.filter_active = true,
+            },
 
             // Command palette toggle
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -982,14 +1162,14 @@ impl AppState {
                     self.request_renice(-1);
                 }
             }
-            Command::ClearFilter => {
-                if self.tab == Tab::Network {
-                    self.net_filter_input.clear();
-                } else {
+            Command::ClearFilter => match self.tab {
+                Tab::Network => self.net_filter_input.clear(),
+                Tab::Containers => self.containers_filter_input.clear(),
+                _ => {
                     self.filter_input.clear();
                     self.recompute_visible();
                 }
-            }
+            },
             Command::SwitchToNetwork => {
                 self.tab = Tab::Network;
             }
@@ -1004,6 +1184,21 @@ impl AppState {
             }
             Command::SortNetByErrors => {
                 self.net_sort_field = NetworkSortField::Errors;
+            }
+            Command::SwitchToContainers => {
+                self.tab = Tab::Containers;
+            }
+            Command::SortContainersByCpu => {
+                self.containers_sort_field = ContainerSortField::Cpu;
+            }
+            Command::SortContainersByMem => {
+                self.containers_sort_field = ContainerSortField::Mem;
+            }
+            Command::SortContainersByName => {
+                self.containers_sort_field = ContainerSortField::Name;
+            }
+            Command::SortContainersByNetRx => {
+                self.containers_sort_field = ContainerSortField::NetRx;
             }
         }
     }
@@ -1032,6 +1227,22 @@ impl AppState {
                 }
                 KeyCode::Char(c) if self.net_filter_input.len() < Self::MAX_FILTER_LEN => {
                     self.net_filter_input.push(c);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if self.containers_filter_active {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.containers_filter_active = false;
+                }
+                KeyCode::Backspace => {
+                    self.containers_filter_input.pop();
+                }
+                KeyCode::Char(c) if self.containers_filter_input.len() < Self::MAX_FILTER_LEN => {
+                    self.containers_filter_input.push(c);
                 }
                 _ => {}
             }
@@ -1096,6 +1307,18 @@ fn next_net_sort_field(field: NetworkSortField) -> NetworkSortField {
     }
 }
 
+/// Cycle to the next container sort field.
+fn next_container_sort_field(field: ContainerSortField) -> ContainerSortField {
+    match field {
+        ContainerSortField::Cpu => ContainerSortField::Mem,
+        ContainerSortField::Mem => ContainerSortField::Name,
+        ContainerSortField::Name => ContainerSortField::NetRx,
+        ContainerSortField::NetRx => ContainerSortField::NetTx,
+        ContainerSortField::NetTx => ContainerSortField::Uptime,
+        ContainerSortField::Uptime => ContainerSortField::Cpu,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1157,14 +1380,16 @@ mod tests {
     fn test_tab_next_cycles() {
         assert_eq!(Tab::General.next(), Tab::Processes);
         assert_eq!(Tab::Processes.next(), Tab::Network);
-        assert_eq!(Tab::Network.next(), Tab::General);
+        assert_eq!(Tab::Network.next(), Tab::Containers);
+        assert_eq!(Tab::Containers.next(), Tab::General);
     }
 
     #[test]
     fn test_tab_prev_cycles() {
+        assert_eq!(Tab::Containers.prev(), Tab::Network);
         assert_eq!(Tab::Network.prev(), Tab::Processes);
         assert_eq!(Tab::Processes.prev(), Tab::General);
-        assert_eq!(Tab::General.prev(), Tab::Network);
+        assert_eq!(Tab::General.prev(), Tab::Containers);
     }
 
     #[test]
@@ -1172,6 +1397,7 @@ mod tests {
         assert_eq!(Tab::General.label(), "General");
         assert_eq!(Tab::Processes.label(), "Processes");
         assert_eq!(Tab::Network.label(), "Network");
+        assert_eq!(Tab::Containers.label(), "Containers");
     }
 
     #[test]
@@ -1179,6 +1405,7 @@ mod tests {
         assert_eq!(format!("{}", Tab::General), "General");
         assert_eq!(format!("{}", Tab::Processes), "Processes");
         assert_eq!(format!("{}", Tab::Network), "Network");
+        assert_eq!(format!("{}", Tab::Containers), "Containers");
     }
 
     #[test]
@@ -1186,7 +1413,8 @@ mod tests {
         assert!(Tab::ALL.contains(&Tab::General));
         assert!(Tab::ALL.contains(&Tab::Processes));
         assert!(Tab::ALL.contains(&Tab::Network));
-        assert_eq!(Tab::ALL.len(), 3);
+        assert!(Tab::ALL.contains(&Tab::Containers));
+        assert_eq!(Tab::ALL.len(), 4);
     }
 
     // -- AppState defaults (STORY-02) --
@@ -1431,6 +1659,8 @@ mod tests {
         app.handle_key_event(key(KeyCode::Tab));
         assert_eq!(app.tab, Tab::Network);
         app.handle_key_event(key(KeyCode::Tab));
+        assert_eq!(app.tab, Tab::Containers);
+        app.handle_key_event(key(KeyCode::Tab));
         assert_eq!(app.tab, Tab::General);
     }
 
@@ -1438,7 +1668,7 @@ mod tests {
     fn test_backtab_switch() {
         let mut app = AppState::new();
         app.handle_key_event(key(KeyCode::BackTab));
-        assert_eq!(app.tab, Tab::Network);
+        assert_eq!(app.tab, Tab::Containers);
     }
 
     #[test]
@@ -1596,13 +1826,13 @@ mod tests {
         let mut app = AppState::new();
         assert_eq!(app.tab, Tab::General);
         app.handle_key_event(key(KeyCode::Left));
-        assert_eq!(app.tab, Tab::Network);
+        assert_eq!(app.tab, Tab::Containers);
     }
 
     #[test]
     fn test_tab_right_arrow_wraps() {
         let mut app = AppState::new();
-        app.tab = Tab::Network;
+        app.tab = Tab::Containers;
         app.handle_key_event(key(KeyCode::Right));
         assert_eq!(app.tab, Tab::General);
     }
