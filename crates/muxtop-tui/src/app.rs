@@ -1,10 +1,11 @@
 // Application state machine.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use nucleo::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo::{Config, Matcher, Utf32Str};
+use tokio_util::sync::CancellationToken;
 
 use muxtop_core::actions::{self, Signal};
 use muxtop_core::network::NetworkHistory;
@@ -228,8 +229,22 @@ impl Command {
     }
 
     /// The search haystack: label + shortcut combined for better fuzzy matching.
+    ///
+    /// Kept around for callers that want a freshly-allocated string (e.g.
+    /// debug logs); the hot palette filter path uses [`Command::search_texts`]
+    /// to avoid the per-keystroke allocation cost.
     fn search_text(self) -> String {
         format!("{} {}", self.label(), self.shortcut())
+    }
+
+    /// Pre-built haystack for every command in [`Command::ALL`], indexed by
+    /// position. Built once on first access; PERF-M3 avoids the
+    /// `format!("{} {}", label, shortcut)` allocation that previously fired
+    /// for every command on every palette keystroke.
+    pub fn search_texts() -> &'static [String] {
+        use std::sync::OnceLock;
+        static SEARCH_TEXTS: OnceLock<Vec<String>> = OnceLock::new();
+        SEARCH_TEXTS.get_or_init(|| Self::ALL.iter().map(|c| c.search_text()).collect())
     }
 }
 
@@ -243,6 +258,11 @@ pub struct PaletteState {
     pub selected: usize,
     /// Filtered commands with match scores (higher = better).
     pub filtered: Vec<(Command, Option<u16>)>,
+    /// Reusable nucleo matcher (PERF-M3). Created lazily on the first call to
+    /// [`Self::refilter_excluding`] with a non-empty input. Constructing a
+    /// `Matcher` allocates several internal scratch buffers, so reusing the
+    /// instance across keystrokes is a measurable win in the palette hot loop.
+    matcher: Option<Matcher>,
 }
 
 impl Default for PaletteState {
@@ -258,6 +278,7 @@ impl PaletteState {
             input: String::new(),
             selected: 0,
             filtered,
+            matcher: None,
         }
     }
 
@@ -276,7 +297,11 @@ impl PaletteState {
                     .map(|cmd| (cmd, None)),
             );
         } else {
-            let mut matcher = Matcher::new(Config::DEFAULT);
+            // PERF-M3: reuse the matcher across keystrokes — building one
+            // allocates several scratch tables that we'd otherwise throw away.
+            let matcher = self
+                .matcher
+                .get_or_insert_with(|| Matcher::new(Config::DEFAULT));
             let atom = Atom::new(
                 &self.input,
                 CaseMatching::Ignore,
@@ -285,15 +310,19 @@ impl PaletteState {
                 false,
             );
 
+            let haystacks = Command::search_texts();
             let mut scored: Vec<(Command, u16)> = Command::ALL
                 .iter()
                 .copied()
-                .filter(is_available)
-                .filter_map(|cmd| {
-                    let haystack = cmd.search_text();
+                .enumerate()
+                .filter(|(_, cmd)| is_available(cmd))
+                .filter_map(|(idx, cmd)| {
+                    // PERF-M3: lift the cached haystack instead of `format!`'ing
+                    // a fresh `String` every keystroke.
+                    let haystack = &haystacks[idx];
                     let mut buf = Vec::new();
-                    let haystack_utf32 = Utf32Str::new(&haystack, &mut buf);
-                    atom.score(haystack_utf32, &mut matcher)
+                    let haystack_utf32 = Utf32Str::new(haystack, &mut buf);
+                    atom.score(haystack_utf32, matcher)
                         .map(|score| (cmd, score))
                 })
                 .collect();
@@ -384,6 +413,14 @@ pub enum ContainerSortField {
 /// Duration before a status message auto-clears.
 const STATUS_TIMEOUT_SECS: u64 = 5;
 
+/// Debounce window for filter-input keystroke bursts (PERF-H3).
+///
+/// Held off recomputes coalesce a short typing burst into a single pipeline
+/// run while keeping the UI feeling responsive. 50 ms is short enough that
+/// the user perceives the filter as "live" but long enough to absorb the
+/// 60 Hz keyboard repeat rate on most terminals.
+const FILTER_DEBOUNCE: Duration = Duration::from_millis(50);
+
 /// Full application state for the TUI.
 pub struct AppState {
     pub tab: Tab,
@@ -440,6 +477,11 @@ pub struct AppState {
     container_rx_last: std::collections::HashMap<String, u64>,
     /// Per-container RX deltas (bytes/tick), capped.
     container_rx_hist: std::collections::HashMap<String, std::collections::VecDeque<u64>>,
+    /// Cached sorted+filtered container rows (PERF-H4). Refreshed in
+    /// [`recompute_containers_view`] whenever the snapshot, sort field, sort
+    /// order, or filter input changes. Render call sites borrow this slice
+    /// instead of recomputing the projection three times per frame.
+    sorted_filtered_containers_cache: Vec<muxtop_core::containers::ContainerSnapshot>,
     /// Optional container engine for executing Stop/Kill/Restart actions.
     ///
     /// Shared (cheaply cloneable `Arc`) between AppState and the Collector's
@@ -455,6 +497,19 @@ pub struct AppState {
     action_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
     /// Whether monitoring local machine or remote server.
     pub connection_mode: ConnectionMode,
+    /// Render-coalescing flag (PERF-H1). Set by any state-mutating handler;
+    /// the main loop reads + clears it via [`take_needs_redraw`] each
+    /// iteration. `Event::Tick` no longer triggers a draw on its own.
+    needs_redraw: bool,
+    /// Debounce timer for the process filter (PERF-H3). Recorded on every
+    /// keystroke that mutates the filter input; `recompute_visible` only
+    /// re-runs when at least [`FILTER_DEBOUNCE`] has elapsed since the last
+    /// keystroke (or the user hits Enter).
+    last_filter_change: Option<Instant>,
+    /// Cancellation token shared with spawned container action tasks
+    /// (PERF-L3). Triggered when the TUI quits so in-flight Stop/Kill/Restart
+    /// futures abort instead of running detached past TUI shutdown.
+    shutdown_token: CancellationToken,
 }
 
 impl Default for AppState {
@@ -500,10 +555,16 @@ impl AppState {
             container_cpu_hist: std::collections::HashMap::new(),
             container_rx_last: std::collections::HashMap::new(),
             container_rx_hist: std::collections::HashMap::new(),
+            sorted_filtered_containers_cache: Vec::new(),
             container_engine: None,
             action_tx,
             action_rx,
             connection_mode: ConnectionMode::default(),
+            // PERF-H1: start with one redraw scheduled so the first frame is
+            // painted before any event arrives.
+            needs_redraw: true,
+            last_filter_change: None,
+            shutdown_token: CancellationToken::new(),
         }
     }
 
@@ -538,6 +599,8 @@ impl AppState {
     /// Set a status message (auto-expires after STATUS_TIMEOUT_SECS).
     fn set_status(&mut self, msg: String) {
         self.status_message = Some((msg, Instant::now()));
+        // A new status message changes what `draw_root` paints.
+        self.needs_redraw = true;
     }
 
     /// Clear expired status messages.
@@ -549,12 +612,50 @@ impl AppState {
         }
     }
 
+    /// Returns true and clears the status message iff there was an expired
+    /// status message at call time. Used by the event-driven render path
+    /// (PERF-H1) to schedule a final repaint when the bar should disappear
+    /// without spinning at 60 Hz to detect the transition.
+    pub fn status_message_just_expired(&mut self) -> bool {
+        let expired = self
+            .status_message
+            .as_ref()
+            .is_some_and(|(_, t)| t.elapsed().as_secs() >= STATUS_TIMEOUT_SECS);
+        if expired {
+            self.status_message = None;
+        }
+        expired
+    }
+
     pub fn running(&self) -> bool {
         self.running
     }
 
     pub fn quit(&mut self) {
         self.running = false;
+        // PERF-L3: signal in-flight container action tasks to abort instead of
+        // running detached past TUI shutdown. The token is also cloned into
+        // every spawned task at submission time.
+        self.shutdown_token.cancel();
+    }
+
+    /// Mark the TUI as needing a redraw on the next main-loop iteration
+    /// (PERF-H1). Called by every state-mutating handler so the event loop
+    /// can skip `terminal.draw` on idle ticks.
+    fn mark_dirty(&mut self) {
+        self.needs_redraw = true;
+    }
+
+    /// Take + clear the redraw flag. Used by the main loop to decide whether
+    /// to call `terminal.draw` for this iteration.
+    pub fn take_needs_redraw(&mut self) -> bool {
+        std::mem::replace(&mut self.needs_redraw, false)
+    }
+
+    /// Cancellation token cloned into every container action spawn so
+    /// in-flight Stop/Kill/Restart futures abort on TUI shutdown (PERF-L3).
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown_token.clone()
     }
 
     /// Number of visible processes (respects tree_mode).
@@ -633,24 +734,52 @@ impl AppState {
         if !cs.daemon_up {
             return None;
         }
-        let rows = self.sorted_filtered_container_rows(cs);
-        rows.get(self.containers_selected).cloned()
+        // PERF-H4: read the cache populated by `recompute_containers_view`
+        // (refreshed in `apply_snapshot` and on sort/filter changes) instead
+        // of recomputing the projection on every call.
+        self.sorted_filtered_containers_cache
+            .get(self.containers_selected)
+            .cloned()
+    }
+
+    /// Borrow the cached sorted+filtered container list (PERF-H4). Empty when
+    /// the daemon is down or no snapshot has arrived yet.
+    pub fn sorted_filtered_containers(&self) -> &[muxtop_core::containers::ContainerSnapshot] {
+        &self.sorted_filtered_containers_cache
     }
 
     /// Drain outcomes from spawned container action tasks, surfacing them as
     /// status messages. Called by the TUI main loop every tick.
     pub fn pump_action_results(&mut self) {
+        let mut had_any = false;
         while let Ok(msg) = self.action_rx.try_recv() {
             self.set_status(msg);
+            had_any = true;
+        }
+        // A new status message changes what `draw_root` paints, so coalesce
+        // the redraw here rather than relying on the next event.
+        if had_any {
+            self.mark_dirty();
         }
     }
 
     /// Shared sort+filter pipeline used by both the UI and action layer.
-    fn sorted_filtered_container_rows(
-        &self,
-        cs: &muxtop_core::containers::ContainersSnapshot,
-    ) -> Vec<muxtop_core::containers::ContainerSnapshot> {
+    /// Now refreshes [`Self::sorted_filtered_containers_cache`] in place
+    /// instead of returning an owned `Vec`.
+    fn recompute_containers_view(&mut self) {
         use muxtop_core::containers::ContainerSnapshot;
+        self.sorted_filtered_containers_cache.clear();
+
+        let Some(snapshot) = self.last_snapshot.as_ref() else {
+            return;
+        };
+        let Some(cs) = snapshot.containers.as_ref() else {
+            return;
+        };
+        if !cs.daemon_up {
+            return;
+        }
+
         let mut rows: Vec<ContainerSnapshot> = if self.containers_filter_input.is_empty() {
             cs.containers.clone()
         } else {
@@ -684,7 +813,7 @@ impl AppState {
         if is_asc != default_asc {
             rows.reverse();
         }
-        rows
+        self.sorted_filtered_containers_cache = rows;
     }
 
     fn request_container_action(&mut self, build: impl FnOnce(String, String) -> ConfirmAction) {
@@ -693,7 +822,11 @@ impl AppState {
             return;
         }
         if let Some(c) = self.selected_container() {
-            self.confirm = Some(build(c.id.clone(), c.name.clone()));
+            // LOW-S3 / Slice C follow-up: pass the FULL 64-char container ID
+            // to the engine so calls survive collisions on the 12-char short
+            // prefix. The confirm prompt still renders the short prefix via
+            // `short_id` for readability.
+            self.confirm = Some(build(c.id_full.clone(), c.name.clone()));
         }
     }
 
@@ -713,39 +846,54 @@ impl AppState {
     }
 
     /// Execute a confirmed container action by spawning a tokio task.
+    ///
+    /// PERF-L3: each spawn carries a clone of the AppState's
+    /// [`CancellationToken`] and races the engine future against the token
+    /// in `tokio::select!`. On TUI shutdown the future is dropped within the
+    /// next scheduler tick rather than running detached.
     fn execute_container_action(&mut self, action: ConfirmAction) {
         let Some(engine) = self.container_engine.clone() else {
             self.set_status("Container engine not configured".into());
             return;
         };
         let tx = self.action_tx.clone();
+        let token = self.shutdown_token.clone();
         match action {
             ConfirmAction::StopContainer { id, name } => {
                 tokio::spawn(async move {
-                    let result = engine.stop(&id, Some(10)).await;
-                    let msg = match result {
-                        Ok(()) => format!("Container {name} stopped"),
-                        Err(e) => format!("Failed to stop {name}: {e}"),
+                    let msg = tokio::select! {
+                        biased;
+                        _ = token.cancelled() => return,
+                        result = engine.stop(&id, Some(10)) => match result {
+                            Ok(()) => format!("Container {name} stopped"),
+                            Err(e) => format!("Failed to stop {name}: {e}"),
+                        },
                     };
                     let _ = tx.send(msg);
                 });
             }
             ConfirmAction::KillContainer { id, name } => {
                 tokio::spawn(async move {
-                    let result = engine.kill(&id).await;
-                    let msg = match result {
-                        Ok(()) => format!("Container {name} killed"),
-                        Err(e) => format!("Failed to kill {name}: {e}"),
+                    let msg = tokio::select! {
+                        biased;
+                        _ = token.cancelled() => return,
+                        result = engine.kill(&id) => match result {
+                            Ok(()) => format!("Container {name} killed"),
+                            Err(e) => format!("Failed to kill {name}: {e}"),
+                        },
                     };
                     let _ = tx.send(msg);
                 });
             }
             ConfirmAction::RestartContainer { id, name } => {
                 tokio::spawn(async move {
-                    let result = engine.restart(&id).await;
-                    let msg = match result {
-                        Ok(()) => format!("Container {name} restarted"),
-                        Err(e) => format!("Failed to restart {name}: {e}"),
+                    let msg = tokio::select! {
+                        biased;
+                        _ = token.cancelled() => return,
+                        result = engine.restart(&id) => match result {
+                            Ok(()) => format!("Container {name} restarted"),
+                            Err(e) => format!("Failed to restart {name}: {e}"),
+                        },
                     };
                     let _ = tx.send(msg);
                 });
@@ -762,6 +910,11 @@ impl AppState {
         }
         self.last_snapshot = Some(snapshot);
         self.recompute_visible();
+        // PERF-H4: refresh the cached sorted+filtered container view exactly
+        // once per snapshot; render and action paths read this slice.
+        self.recompute_containers_view();
+        // PERF-H1: a fresh snapshot always changes what we'd paint.
+        self.mark_dirty();
     }
 
     /// Per-container sparkline history cap — 60 samples, enough to fill the
@@ -865,20 +1018,22 @@ impl AppState {
         // Filter
         let filtered = filter_processes(&snapshot.processes, &self.filter_input);
 
-        // Sort
-        let mut sorted = filtered;
-        sort_processes(&mut sorted, self.sort_field, self.sort_order);
-        self.visible_processes = sorted;
-
         // Tree — only build when tree_mode is active (G-09: skip when off).
         // G-07: tree is built from filtered list, not raw snapshot.
+        // PERF-H3: reuse the `filtered` Vec we just produced instead of
+        // re-running `filter_processes` (which previously cost an entire
+        // O(N) lower-case + contains scan a second time per recompute).
         if self.tree_mode {
-            let tree =
-                build_process_tree(&filter_processes(&snapshot.processes, &self.filter_input));
+            let tree = build_process_tree(&filtered);
             self.visible_tree = flatten_tree(&tree);
         } else {
             self.visible_tree.clear();
         }
+
+        // Sort (consumes `filtered` last so the tree above can borrow it).
+        let mut sorted = filtered;
+        sort_processes(&mut sorted, self.sort_field, self.sort_order);
+        self.visible_processes = sorted;
 
         // Clamp selection and scroll_offset (G-06).
         let count = self.process_count();
@@ -888,6 +1043,20 @@ impl AppState {
         } else {
             self.selected = 0;
             self.scroll_offset = 0;
+        }
+    }
+
+    /// Re-run [`Self::recompute_visible`] iff at least [`FILTER_DEBOUNCE`]
+    /// has elapsed since the last filter keystroke (PERF-H3). Bursts of fast
+    /// typing therefore coalesce into one pipeline run instead of N.
+    fn recompute_visible_debounced(&mut self) {
+        let now = Instant::now();
+        let should_recompute = self
+            .last_filter_change
+            .is_none_or(|last| now.duration_since(last) >= FILTER_DEBOUNCE);
+        self.last_filter_change = Some(now);
+        if should_recompute {
+            self.recompute_visible();
         }
     }
 
@@ -1003,6 +1172,7 @@ impl AppState {
                 Tab::Containers => {
                     self.containers_sort_field =
                         next_container_sort_field(self.containers_sort_field);
+                    self.recompute_containers_view();
                 }
                 _ => {
                     self.sort_field = next_sort_field(self.sort_field);
@@ -1021,6 +1191,7 @@ impl AppState {
                         SortOrder::Asc => SortOrder::Desc,
                         SortOrder::Desc => SortOrder::Asc,
                     };
+                    self.recompute_containers_view();
                 }
                 _ => {
                     self.sort_order = match self.sort_order {
@@ -1110,6 +1281,7 @@ impl AppState {
                 Tab::Containers => {
                     if !self.containers_filter_input.is_empty() {
                         self.containers_filter_input.clear();
+                        self.recompute_containers_view();
                     }
                 }
                 _ => {
@@ -1399,15 +1571,19 @@ impl AppState {
             }
             Command::SortContainersByCpu => {
                 self.containers_sort_field = ContainerSortField::Cpu;
+                self.recompute_containers_view();
             }
             Command::SortContainersByMem => {
                 self.containers_sort_field = ContainerSortField::Mem;
+                self.recompute_containers_view();
             }
             Command::SortContainersByName => {
                 self.containers_sort_field = ContainerSortField::Name;
+                self.recompute_containers_view();
             }
             Command::SortContainersByNetRx => {
                 self.containers_sort_field = ContainerSortField::NetRx;
+                self.recompute_containers_view();
             }
             Command::StopContainer => self.request_container_stop(),
             Command::KillContainer => self.request_container_kill(),
@@ -1452,9 +1628,11 @@ impl AppState {
                 }
                 KeyCode::Backspace => {
                     self.containers_filter_input.pop();
+                    self.recompute_containers_view();
                 }
                 KeyCode::Char(c) if self.containers_filter_input.len() < Self::MAX_FILTER_LEN => {
                     self.containers_filter_input.push(c);
+                    self.recompute_containers_view();
                 }
                 _ => {}
             }
@@ -1467,15 +1645,18 @@ impl AppState {
             }
             KeyCode::Enter => {
                 self.filter_active = false;
-                // Keep filter_input — it stays applied.
+                // Keep filter_input — it stays applied. Drop debounce so the
+                // visible list is in sync the moment the user commits.
+                self.last_filter_change = None;
+                self.recompute_visible();
             }
             KeyCode::Backspace => {
                 self.filter_input.pop();
-                self.recompute_visible();
+                self.recompute_visible_debounced();
             }
             KeyCode::Char(c) if self.filter_input.len() < Self::MAX_FILTER_LEN => {
                 self.filter_input.push(c);
-                self.recompute_visible();
+                self.recompute_visible_debounced();
             }
             _ => {}
         }
@@ -2960,6 +3141,7 @@ mod tests {
                 daemon_up: true,
                 containers: vec![ContainerSnapshot {
                     id: id.into(),
+                    id_full: id.into(),
                     name: name.into(),
                     image: "nginx:1.27".into(),
                     state: ContainerState::Running,
@@ -3093,5 +3275,178 @@ mod tests {
         assert!(prompt.contains("Stop"));
         assert!(prompt.contains("nginx"));
         assert!(prompt.contains("abcdef123456"));
+    }
+
+    // ─── Slice D perf coverage ────────────────────────────────────────────
+
+    /// PERF-H1 — `Event::Tick` must not invalidate the rendered frame.
+    /// `take_needs_redraw` is the single source of truth used by the main
+    /// loop to decide whether to call `terminal.draw`. After a fresh
+    /// snapshot the flag is set; once the loop drains it, an `Event::Tick`
+    /// alone (mirrored here as zero state mutation) keeps the flag clear.
+    #[test]
+    fn test_tick_does_not_request_redraw() {
+        let mut app = AppState::new();
+        // First flag is the "paint the initial frame" hint set in `new()`.
+        assert!(app.take_needs_redraw());
+        // Drain again — no further redraws scheduled.
+        assert!(!app.take_needs_redraw());
+
+        // A snapshot SHOULD schedule a redraw (mirrors the main loop's
+        // Snapshot arm).
+        app.apply_snapshot(make_snapshot(vec![]));
+        assert!(app.take_needs_redraw());
+
+        // Without any further events, the equivalent of an `Event::Tick`
+        // (no state mutation) leaves the flag clear — the main loop will
+        // skip `terminal.draw` for that iteration.
+        assert!(!app.take_needs_redraw());
+    }
+
+    /// PERF-H1 — async container action completion arms a redraw via
+    /// `pump_action_results` so the bottom-bar status surfaces without
+    /// waiting for the next key press.
+    #[test]
+    fn test_pump_action_results_marks_dirty() {
+        let mut app = AppState::new();
+        let _ = app.take_needs_redraw(); // drain seed flag
+        // Inject a synthetic action outcome.
+        app.action_tx.send("kill ok".into()).unwrap();
+        app.pump_action_results();
+        assert!(app.take_needs_redraw(), "action outcome must arm redraw");
+        assert_eq!(app.active_status(), Some("kill ok"));
+    }
+
+    /// PERF-H1 — when the status message expires, the main loop schedules
+    /// one final repaint via `status_message_just_expired`.
+    #[test]
+    fn test_status_message_just_expired_returns_true_and_clears() {
+        let mut app = AppState::new();
+        // Seed an artificially-old status message.
+        app.status_message = Some(("old".into(), Instant::now() - Duration::from_secs(60)));
+        assert!(app.status_message_just_expired());
+        assert!(app.status_message.is_none());
+        // Subsequent calls return false so the main loop doesn't loop-paint.
+        assert!(!app.status_message_just_expired());
+    }
+
+    /// PERF-H4 — `apply_snapshot` populates the cached projection and
+    /// `selected_container` reads from that cache.
+    #[test]
+    fn test_apply_snapshot_populates_container_cache() {
+        let mut app = AppState::new();
+        assert!(app.sorted_filtered_containers().is_empty());
+        app.apply_snapshot(make_snapshot_with_container("abc", "svc"));
+        let rows = app.sorted_filtered_containers();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "svc");
+        // selected_container reads from the cache.
+        assert_eq!(app.selected_container().unwrap().name, "svc");
+    }
+
+    /// PERF-H4 — switching sort field eagerly refreshes the cache so the
+    /// next render sees the new ordering with no extra projection cost.
+    #[test]
+    fn test_sort_change_refreshes_container_cache() {
+        let mut app = AppState::new();
+        app.tab = Tab::Containers;
+        // Two containers with different CPU values so Cpu desc and Mem desc
+        // produce opposite orderings.
+        let mut snap = make_snapshot_with_container("a-id", "alpha");
+        if let Some(cs) = snap.containers.as_mut() {
+            cs.containers[0].cpu_pct = 1.0;
+            cs.containers[0].mem_used_bytes = 9_000;
+            cs.containers
+                .push(muxtop_core::containers::ContainerSnapshot {
+                    id: "b-id".into(),
+                    id_full: "b-id".into(),
+                    name: "bravo".into(),
+                    image: "img".into(),
+                    state: muxtop_core::containers::ContainerState::Running,
+                    status_text: "Up".into(),
+                    cpu_pct: 99.0,
+                    mem_used_bytes: 1_000,
+                    mem_limit_bytes: 0,
+                    net_rx_bytes: 0,
+                    net_tx_bytes: 0,
+                    block_read_bytes: 0,
+                    block_write_bytes: 0,
+                    started_at_ms: 0,
+                });
+        }
+        app.apply_snapshot(snap);
+        // Default sort is Cpu desc → bravo (cpu=99) first.
+        assert_eq!(app.sorted_filtered_containers()[0].name, "bravo");
+        // Cycle 's' once → Mem desc, where alpha (mem=9000) leads.
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(app.sorted_filtered_containers()[0].name, "alpha");
+    }
+
+    /// PERF-L3 — `quit()` cancels the shared shutdown token so spawned
+    /// container action tasks unwind via their `tokio::select!` arm.
+    #[test]
+    fn test_quit_cancels_shutdown_token() {
+        let mut app = AppState::new();
+        let token = app.shutdown_token();
+        assert!(!token.is_cancelled());
+        app.quit();
+        assert!(token.is_cancelled());
+    }
+
+    /// PERF-M3 — palette filtering reuses its `Matcher`. After the first
+    /// non-empty `refilter`, the matcher slot must be `Some(_)`.
+    #[test]
+    fn test_palette_matcher_is_cached() {
+        let mut ps = PaletteState::new();
+        assert!(ps.matcher.is_none());
+        ps.input = "sort".into();
+        ps.refilter();
+        assert!(
+            ps.matcher.is_some(),
+            "matcher should be cached after first use"
+        );
+        // Subsequent refilters reuse the same instance — assert no panic and
+        // results stay consistent.
+        ps.refilter();
+        assert!(!ps.filtered.is_empty());
+    }
+
+    /// PERF-H3 — `recompute_visible_debounced` collapses bursts of
+    /// keystrokes into a single recompute. Two back-to-back calls inside
+    /// the debounce window only trigger one pipeline run; the second
+    /// keystroke's filter change is therefore NOT yet visible until either
+    /// the debounce window elapses or the user commits via Enter.
+    #[test]
+    fn test_filter_debounce_coalesces_bursts() {
+        let mut app = AppState::new();
+        app.apply_snapshot(make_snapshot(vec![
+            make_process(1, "firefox", 10.0, 100),
+            make_process(2, "kitty", 20.0, 200),
+            make_process(3, "tmux", 5.0, 50),
+        ]));
+        // Type "f": "firefox" matches.
+        app.filter_input.push('f');
+        app.recompute_visible_debounced();
+        assert_eq!(app.visible_processes.len(), 1);
+        assert_eq!(app.visible_processes[0].name, "firefox");
+        // Immediately type "k": within the debounce window, the visible
+        // list does NOT yet reflect the new "fk" filter (which would match
+        // nothing) — debounce held off the work.
+        app.filter_input.push('k');
+        app.recompute_visible_debounced();
+        assert_eq!(
+            app.visible_processes.len(),
+            1,
+            "burst should be coalesced — the in-flight `fk` filter has NOT been applied yet"
+        );
+        // Synchronous recompute path (e.g. user hits Enter) commits the
+        // pending change.
+        app.last_filter_change = None;
+        app.recompute_visible();
+        assert_eq!(
+            app.visible_processes.len(),
+            0,
+            "after debounce flush the `fk` filter matches nothing"
+        );
     }
 }

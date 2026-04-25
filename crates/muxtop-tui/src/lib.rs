@@ -79,15 +79,44 @@ pub fn run(
     while app.running() {
         // Drain any container-action outcomes produced by spawned tokio
         // tasks (Stop/Kill/Restart) so they surface as status messages.
+        // `pump_action_results` flips `needs_redraw` if anything arrived.
         app.pump_action_results();
 
-        guard.0.draw(|frame| ui::draw_root(frame, &app))?;
+        // PERF-H1: event-driven render. We only repaint when something the
+        // UI actually shows has changed: a new event from the user / OS, a
+        // new snapshot, an async action outcome, or an expired status
+        // message. Idle ticks at 60 Hz no longer pay for a full draw.
+        let mut should_draw = app.take_needs_redraw();
 
         match handler.poll_event()? {
-            Event::Key(key) => app.handle_key_event(key),
-            Event::Mouse(mouse) => app.handle_mouse_event(mouse),
-            Event::Snapshot(snap) => app.apply_snapshot(snap),
-            Event::Resize(_, _) | Event::Tick => {}
+            Event::Key(key) => {
+                app.handle_key_event(key);
+                should_draw = true;
+            }
+            Event::Mouse(mouse) => {
+                app.handle_mouse_event(mouse);
+                should_draw = true;
+            }
+            Event::Snapshot(snap) => {
+                app.apply_snapshot(snap);
+                should_draw = true;
+            }
+            Event::Resize(_, _) => {
+                should_draw = true;
+            }
+            Event::Tick => {
+                // PERF-H1: ticks no longer force a redraw. The only thing
+                // that "ages" without a key/snapshot/action is the status
+                // message — schedule one final repaint when it expires so
+                // the bottom bar visually clears.
+                if app.status_message_just_expired() {
+                    should_draw = true;
+                }
+            }
+        }
+
+        if should_draw {
+            guard.0.draw(|frame| ui::draw_root(frame, &app))?;
         }
     }
 

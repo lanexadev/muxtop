@@ -13,6 +13,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Sparkline},
 };
 
+use super::sanitize::scrub_ctrl;
 use super::theme::Theme;
 use crate::app::{AppState, ContainerSortField};
 use muxtop_core::containers::{ContainerSnapshot, ContainerState, ContainersSnapshot, EngineKind};
@@ -73,8 +74,9 @@ pub fn draw_containers_tab(frame: &mut Frame, area: Rect, app: &AppState, theme:
     };
 
     // Layout: summary(1) + table(fill) + sparklines(4 optional) + filter(0|1).
+    // PERF-H4: read the cached row count instead of recomputing the projection.
     let filter_h = u16::from(app.containers_filter_active);
-    let sparkline_h = if app.containers_selected < visible_count(app, containers) {
+    let sparkline_h = if app.containers_selected < app.sorted_filtered_containers().len() {
         4
     } else {
         0
@@ -275,7 +277,7 @@ fn draw_body(
     frame: &mut Frame,
     area: Rect,
     app: &AppState,
-    containers: &ContainersSnapshot,
+    _containers: &ContainersSnapshot,
     theme: &Theme,
     now_ms: u64,
 ) {
@@ -284,7 +286,9 @@ fn draw_body(
         return;
     }
 
-    let rows = sorted_filtered_containers(app, containers);
+    // PERF-H4: read the cached projection on AppState — refreshed once per
+    // snapshot or settings change, instead of three times per render.
+    let rows = app.sorted_filtered_containers();
     if rows.is_empty() {
         let msg = if app.containers_filter_input.is_empty() {
             "No containers"
@@ -348,9 +352,19 @@ fn container_row(
         format_bytes(c.mem_limit_bytes),
     );
 
+    // Strip ANSI/control bytes from external strings before they reach the
+    // terminal (MED-S5). `name` and `image` are populated verbatim from the
+    // container engine and could otherwise carry escape sequences planted by
+    // a hostile container author. `status_text` is currently mapped to
+    // `state_str` (a fixed enum label) and not rendered raw, so no scrub is
+    // required at this site — the helper is applied where external strings
+    // actually reach a Span.
+    let safe_name = scrub_ctrl(&c.name);
+    let safe_image = scrub_ctrl(&c.image);
+
     Line::from(vec![
-        Span::styled(col_text(&c.name, COL_NAME), base),
-        Span::styled(col_text(&truncate_image(&c.image), COL_IMAGE), base),
+        Span::styled(col_text(&safe_name, COL_NAME), base),
+        Span::styled(col_text(&truncate_image(&safe_image), COL_IMAGE), base),
         Span::styled(col_text(state_str, COL_STATE), state_style),
         Span::styled(col_text(&cpu_str, COL_CPU), base),
         Span::styled(col_text(&mem_str, COL_MEM), base),
@@ -368,36 +382,32 @@ fn draw_sparklines(
     frame: &mut Frame,
     area: Rect,
     app: &AppState,
-    containers: &ContainersSnapshot,
+    _containers: &ContainersSnapshot,
     theme: &Theme,
 ) {
-    let rows = sorted_filtered_containers(app, containers);
+    // PERF-H4: borrow the cached projection.
+    let rows = app.sorted_filtered_containers();
     let selected = match rows.get(app.containers_selected) {
         Some(c) => c,
         None => return,
     };
 
     let points = area.width as usize;
-    let cpu_data: Vec<u64> = app
-        .container_cpu_history(&selected.id)
+    // PERF-M1: single-pass tail collection — `iter().skip(len-N)` walks the
+    // buffer once with no intermediate Vec, in contrast to the previous
+    // `.iter().rev().take(N).collect().into_iter().rev().collect()` chain
+    // which allocated twice and reversed three times.
+    let cpu_history = app.container_cpu_history(&selected.id);
+    let cpu_skip = cpu_history.len().saturating_sub(points);
+    let cpu_data: Vec<u64> = cpu_history
         .iter()
-        .rev()
-        .take(points)
+        .skip(cpu_skip)
         .map(|v| (*v * 10.0).round() as u64)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
         .collect();
-    let rx_data: Vec<u64> = app
-        .container_rx_deltas(&selected.id)
-        .iter()
-        .rev()
-        .take(points)
-        .copied()
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
+
+    let rx_history = app.container_rx_deltas(&selected.id);
+    let rx_skip = rx_history.len().saturating_sub(points);
+    let rx_data: Vec<u64> = rx_history.iter().skip(rx_skip).copied().collect();
 
     let [cpu_area, rx_area] =
         Layout::vertical([Constraint::Length(2), Constraint::Length(2)]).areas(area);
@@ -462,69 +472,13 @@ fn draw_filter_bar(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme)
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Number of rows that would be rendered given current filter.
-fn visible_count(app: &AppState, containers: &ContainersSnapshot) -> usize {
-    if app.containers_filter_input.is_empty() {
-        containers.containers.len()
-    } else {
-        let f = app.containers_filter_input.to_lowercase();
-        containers
-            .containers
-            .iter()
-            .filter(|c| row_matches_filter(c, &f))
-            .count()
-    }
-}
-
+/// Container-row filter predicate. Used only by the unit test below — the
+/// production projection lives in `AppState::recompute_containers_view`.
+#[cfg(test)]
 fn row_matches_filter(c: &ContainerSnapshot, needle: &str) -> bool {
     c.name.to_lowercase().contains(needle)
         || c.image.to_lowercase().contains(needle)
         || c.id.to_lowercase().contains(needle)
-}
-
-/// Apply current sort + filter to produce the visible rows.
-fn sorted_filtered_containers(
-    app: &AppState,
-    containers: &ContainersSnapshot,
-) -> Vec<ContainerSnapshot> {
-    let mut rows: Vec<ContainerSnapshot> = if app.containers_filter_input.is_empty() {
-        containers.containers.clone()
-    } else {
-        let f = app.containers_filter_input.to_lowercase();
-        containers
-            .containers
-            .iter()
-            .filter(|c| row_matches_filter(c, &f))
-            .cloned()
-            .collect()
-    };
-
-    match app.containers_sort_field {
-        ContainerSortField::Name => rows.sort_by(|a, b| a.name.cmp(&b.name)),
-        ContainerSortField::Cpu => rows.sort_by(|a, b| {
-            b.cpu_pct
-                .partial_cmp(&a.cpu_pct)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        }),
-        ContainerSortField::Mem => rows.sort_by_key(|c| std::cmp::Reverse(c.mem_used_bytes)),
-        ContainerSortField::NetRx => rows.sort_by_key(|c| std::cmp::Reverse(c.net_rx_bytes)),
-        ContainerSortField::NetTx => rows.sort_by_key(|c| std::cmp::Reverse(c.net_tx_bytes)),
-        ContainerSortField::Uptime => {
-            // Older = bigger uptime = smaller started_at_ms.
-            rows.sort_by_key(|c| c.started_at_ms);
-        }
-    }
-
-    let is_asc = matches!(app.containers_sort_order, SortOrder::Asc);
-    let is_name = matches!(app.containers_sort_field, ContainerSortField::Name);
-    let is_uptime = matches!(app.containers_sort_field, ContainerSortField::Uptime);
-    // Defaults: Name ascending, Uptime ascending (oldest first), everything else descending.
-    let default_asc = is_name || is_uptime;
-    if is_asc != default_asc {
-        rows.reverse();
-    }
-
-    rows
 }
 
 fn sort_label(
@@ -723,6 +677,7 @@ mod tests {
     fn sample_container(id: &str, name: &str, cpu: f32, mem: u64) -> ContainerSnapshot {
         ContainerSnapshot {
             id: id.into(),
+            id_full: id.into(),
             name: name.into(),
             image: "nginx:1.27".into(),
             state: ContainerState::Running,

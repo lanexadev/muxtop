@@ -17,6 +17,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use sysinfo::{MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -95,7 +96,18 @@ impl Collector {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    self.sys.refresh_all();
+                    // PERF-L2: targeted sysinfo refresh — `refresh_all` rebuilds
+                    // disk lists, components, users and a host of other tables
+                    // that the TUI never consumes. Limit refresh to the three
+                    // subsystems we actually render (memory, CPU usage,
+                    // processes). Network is refreshed via `Networks` below.
+                    self.sys.refresh_memory_specifics(MemoryRefreshKind::everything());
+                    self.sys.refresh_cpu_usage();
+                    self.sys.refresh_processes_specifics(
+                        ProcessesToUpdate::All,
+                        true,
+                        ProcessRefreshKind::everything(),
+                    );
                     self.networks.refresh(false);
 
                     let containers = last_containers.lock().await.clone();
@@ -199,6 +211,7 @@ mod tests {
         fn sample_container() -> ContainerSnapshot {
             ContainerSnapshot {
                 id: "abc123".into(),
+                id_full: "abc123".to_string() + &"0".repeat(58),
                 name: "mock-svc".into(),
                 image: "mock:latest".into(),
                 state: ContainerState::Running,
