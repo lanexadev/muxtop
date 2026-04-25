@@ -1,5 +1,4 @@
-use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,8 +12,48 @@ use muxtop_core::container_engine::ContainerEngine;
 use muxtop_core::docker_engine::maybe_connect_default_engine;
 use muxtop_core::process::SortField;
 use muxtop_core::system::SystemSnapshot;
-use muxtop_proto::RemoteCollector;
+use muxtop_proto::{RemoteCollector, parse_remote_target};
 use muxtop_tui::{CliConfig, ConnectionMode};
+
+/// Newtype wrapper around the in-memory authentication token whose `Debug`
+/// impl deliberately redacts the secret (MED-S3). Mirrors the same type in
+/// `muxtop-server::main` — kept as a private per-binary type to avoid pulling
+/// the secret across crate boundaries.
+#[derive(Clone)]
+struct Token(String);
+
+impl Token {
+    fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Token(\"[REDACTED]\")")
+    }
+}
+
+/// Read an auth token from a file (trim whitespace, enforce 16-char minimum).
+fn read_token_file(path: &Path) -> Result<Token> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read --token-file {}", path.display()))?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!(
+            "--token-file {} is empty after trimming whitespace",
+            path.display()
+        );
+    }
+    if trimmed.len() < 16 {
+        bail!(
+            "--token-file {} contains a {}-char token; minimum is 16 characters",
+            path.display(),
+            trimmed.len()
+        );
+    }
+    Ok(Token(trimmed.to_string()))
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -48,9 +87,16 @@ struct Cli {
     #[arg(long)]
     remote: Option<String>,
 
-    /// Authentication token for remote server (required for --remote)
-    #[arg(long, env = "MUXTOP_TOKEN")]
+    /// Authentication token for remote server (required for --remote, ≥16
+    /// chars). Note: --token leaks via /proc/<pid>/cmdline and `ps eww` on
+    /// shared hosts; prefer --token-file there.
+    #[arg(long, env = "MUXTOP_TOKEN", conflicts_with = "token_file")]
     token: Option<String>,
+
+    /// Read the authentication token from a file (preferred on shared hosts).
+    /// File is read once at startup; trailing whitespace is trimmed.
+    #[arg(long, value_name = "PATH")]
+    token_file: Option<PathBuf>,
 
     /// Path to CA certificate for TLS verification (PEM format)
     #[arg(long)]
@@ -135,6 +181,22 @@ async fn run_app(cli: Cli) -> Result<()> {
 
     tracing::info!("muxtop starting");
 
+    // HIGH-S1: bright startup banner when TLS verification is off. The
+    // single eprintln! is not enough on its own (it scrolls away in tmux,
+    // systemd, CI), but it's the only signal a user gets *before* a TUI
+    // session starts. The persistent log heartbeat lives inside
+    // `NoVerifier::verify_server_cert` and fires per handshake.
+    if cli.tls_skip_verify {
+        eprintln!(
+            "============================================================\n\
+             WARNING: --tls-skip-verify is set.\n\
+             Server certificates will NOT be validated. Anyone on the\n\
+             network path can impersonate the muxtop-server. Use only\n\
+             on a trusted local-loopback or development network.\n\
+             ============================================================"
+        );
+    }
+
     // Warn about ignored --refresh in remote mode.
     if cli.remote.is_some() && cli.refresh != 1 {
         eprintln!("warning: --refresh is ignored in remote mode (server dictates timing)");
@@ -155,18 +217,38 @@ async fn run_app(cli: Cli) -> Result<()> {
         };
 
     // Determine connection mode and spawn appropriate collector.
-    let collector_handle = if let Some(ref addr_str) = cli.remote {
-        let addr: SocketAddr = addr_str
-            .parse()
-            .context("invalid --remote address (expected host:port, e.g. 127.0.0.1:4242)")?;
+    //
+    // ADR-30-1: --remote accepts `host:port` where `host` may be an IP
+    // literal OR a DNS name. The hostname is preserved as-is for SNI; the
+    // resolved IP is used for the TCP connect. `parse_remote_target` lives
+    // in `muxtop-proto::tls` so its parsing/error semantics are shared with
+    // any future client.
+    let parsed_remote = if let Some(ref addr_str) = cli.remote {
+        let (addr, sni) = parse_remote_target(addr_str)
+            .with_context(|| format!("invalid --remote target: {addr_str}"))?;
+        Some((addr_str.clone(), addr, sni))
+    } else {
+        None
+    };
 
+    let collector_handle = if let Some((_, addr, ref server_name)) = parsed_remote {
         // Token is mandatory for remote connections.
-        let token = match &cli.token {
-            Some(t) if !t.is_empty() => t.clone(),
-            _ => bail!(
-                "Authentication token is required for remote connections. \
-                 Set --token <secret> or MUXTOP_TOKEN env var."
-            ),
+        let token: Token = if let Some(path) = cli.token_file.as_deref() {
+            read_token_file(path)?
+        } else {
+            match cli.token.clone() {
+                Some(t) if t.len() >= 16 => Token(t),
+                Some(t) if !t.is_empty() => bail!(
+                    "Authentication token is too short ({} chars). \
+                     Use at least 16 characters for security.",
+                    t.len()
+                ),
+                _ => bail!(
+                    "Authentication token is required for remote connections. \
+                     Set --token <secret>, --token-file <path>, or the MUXTOP_TOKEN env var \
+                     (minimum 16 characters)."
+                ),
+            }
         };
 
         // Build TLS connector.
@@ -174,7 +256,8 @@ async fn run_app(cli: Cli) -> Result<()> {
             muxtop_proto::tls::connector_from_ca(ca_path)
                 .context("failed to load TLS CA certificate")?
         } else if cli.tls_skip_verify {
-            eprintln!("WARNING: TLS certificate verification is disabled (--tls-skip-verify)");
+            // The bright startup banner has already fired above; the
+            // per-handshake log heartbeat lives inside `NoVerifier`.
             muxtop_proto::tls::connector_insecure()
         } else {
             bail!(
@@ -183,10 +266,12 @@ async fn run_app(cli: Cli) -> Result<()> {
             );
         };
 
-        // Derive server name for TLS SNI (IP addresses use IpAddress variant directly).
-        let server_name = rustls_pki_types::ServerName::IpAddress(addr.ip().into());
-
-        let remote = RemoteCollector::new(addr, Some(token), tls_connector, server_name);
+        let remote = RemoteCollector::new(
+            addr,
+            Some(token.into_inner()),
+            tls_connector,
+            server_name.clone(),
+        );
         remote.spawn(tx, None, cancel.clone())
     } else {
         let collector = Collector::with_container_engine(
@@ -197,10 +282,9 @@ async fn run_app(cli: Cli) -> Result<()> {
     };
 
     // Build connection mode for TUI.
-    let connection_mode = if let Some(ref addr_str) = cli.remote {
-        let addr: SocketAddr = addr_str.parse().unwrap(); // already validated above
+    let connection_mode = if let Some((raw, addr, _)) = parsed_remote {
         ConnectionMode::Remote {
-            hostname: addr_str.clone(),
+            hostname: raw,
             addr,
         }
     } else {

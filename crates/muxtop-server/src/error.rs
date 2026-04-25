@@ -12,9 +12,6 @@ pub enum ServerError {
     #[error("unauthorized")]
     Unauthorized,
 
-    #[error("max clients reached")]
-    MaxClientsReached,
-
     #[error("handshake timeout")]
     HandshakeTimeout,
 

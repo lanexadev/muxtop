@@ -3,12 +3,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::broadcast;
+use tokio::sync::{OwnedSemaphorePermit, broadcast};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
-use muxtop_core::system::SystemSnapshot;
-use muxtop_proto::{FrameReader, FrameWriter, WireMessage};
+use muxtop_proto::{Frame, FrameReader, FrameWriter, WireMessage};
 
 use crate::error::ServerError;
 use crate::server::SharedState;
@@ -19,50 +18,58 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// Handshake timeout: client must send Hello within 5 seconds of connecting.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Pre-authentication payload cap (per ADR-30-2 / MED-S1).
+///
+/// 4 KiB is generous for `WireMessage::Hello { client_version, auth_token }`
+/// (the `client_version` is `env!("CARGO_PKG_VERSION")` and tokens have a
+/// 16-char minimum / no maximum, but anything north of 256 chars is already
+/// a configuration smell). The post-handshake reads keep the global 4 MiB
+/// cap (real snapshots commonly exceed 4 KiB).
+pub const PRE_AUTH_HELLO_MAX_PAYLOAD: usize = 4 * 1024;
+
 /// Handle a single client connection: handshake, then stream snapshots + heartbeats.
 ///
 /// Accepts any async reader/writer pair (works with both plain TCP and TLS streams).
+///
+/// **The caller is responsible for acquiring the `max_clients` semaphore
+/// permit BEFORE the TLS handshake** (per MED-S2 / ADR-30-2). The permit
+/// is passed in here so it lives for the duration of the session and is
+/// released exactly once when this function returns. Acquiring before the
+/// handshake prevents a flood of concurrent TLS handshakes from saturating
+/// CPU even when all client slots are full.
 pub async fn handle<R, W>(
     reader: R,
     writer: W,
     peer: SocketAddr,
     state: Arc<SharedState>,
-    mut snapshot_rx: broadcast::Receiver<SystemSnapshot>,
+    mut snapshot_rx: broadcast::Receiver<Arc<Frame>>,
     token: CancellationToken,
+    permit: OwnedSemaphorePermit,
 ) -> Result<(), ServerError>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    // G-21: Acquire semaphore permit — auto-released when this function returns.
-    let _permit = match state.semaphore.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            tracing::warn!(peer = %peer, "max clients reached, rejecting");
-            let mut frame_reader = FrameReader::new(reader);
-            let mut frame_writer = FrameWriter::new(writer);
-
-            // Wait for Hello first (so the client gets a proper rejection).
-            let _ = time::timeout(HANDSHAKE_TIMEOUT, frame_reader.read_frame()).await;
-
-            let error_msg = WireMessage::Error {
-                code: 503,
-                message: "max clients reached".into(),
-            };
-            let _ = frame_writer.write_frame(&error_msg.to_frame()?).await;
-            return Err(ServerError::MaxClientsReached);
-        }
-    };
+    // The permit is held for the entire session and dropped on return.
+    let _permit = permit;
 
     let mut frame_reader = FrameReader::new(reader);
     let mut frame_writer = FrameWriter::new(writer);
 
     // --- Handshake phase ---
-    let hello_frame = time::timeout(HANDSHAKE_TIMEOUT, frame_reader.read_frame())
-        .await
-        .map_err(|_| ServerError::HandshakeTimeout)?
-        .map_err(ServerError::Proto)?
-        .ok_or(ServerError::HandshakeTimeout)?;
+    // Pre-auth read uses a TIGHT 4 KiB cap (MED-S1 / ADR-30-2). The default
+    // 4 MiB cap is restored implicitly post-Welcome by switching back to
+    // `read_frame()` for snapshot reads (we don't currently read post-Welcome
+    // anyway, so this is purely defense-in-depth for future protocol
+    // additions).
+    let hello_frame = time::timeout(
+        HANDSHAKE_TIMEOUT,
+        frame_reader.read_frame_with_max_payload(PRE_AUTH_HELLO_MAX_PAYLOAD),
+    )
+    .await
+    .map_err(|_| ServerError::HandshakeTimeout)?
+    .map_err(ServerError::Proto)?
+    .ok_or(ServerError::HandshakeTimeout)?;
 
     let hello = WireMessage::from_frame(&hello_frame).map_err(ServerError::Proto)?;
 
@@ -115,10 +122,11 @@ where
         tokio::select! {
             result = snapshot_rx.recv() => {
                 match result {
-                    Ok(snapshot) => {
-                        let msg = WireMessage::Snapshot(snapshot);
+                    Ok(frame) => {
+                        // PERF-L1: the relay task already encoded this snapshot
+                        // into a `Frame`; we just write the cached bytes.
                         frame_writer
-                            .write_frame(&msg.to_frame()?)
+                            .write_frame(&frame)
                             .await
                             .map_err(ServerError::Proto)?;
                         // Reset heartbeat timer after sending a snapshot.
@@ -193,5 +201,11 @@ mod tests {
     #[test]
     fn test_constant_time_eq_empty() {
         assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn test_pre_auth_cap_is_4kib() {
+        // Sanity guard so we don't accidentally widen the pre-auth cap.
+        assert_eq!(PRE_AUTH_HELLO_MAX_PAYLOAD, 4096);
     }
 }

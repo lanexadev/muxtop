@@ -10,6 +10,7 @@ pub use frame::{
     MSG_SNAPSHOT, MSG_WELCOME, decode_frame, encode_frame,
 };
 pub use remote::{ConnectionEvent, RemoteCollector};
+pub use tls::{RemoteTargetError, parse_remote_target};
 pub use wire::WireMessage;
 
 #[cfg(test)]
