@@ -176,7 +176,7 @@ impl ContainerEngine for DockerEngine {
         // Fan out stats fetches with bounded parallelism.
         let docker = self.docker.clone();
         let results: Vec<Result<(ContainerSnapshot, CachedCpu), EngineError>> =
-            futures::stream::iter(containers.into_iter())
+            futures::stream::iter(containers)
                 .map(|container| {
                     let docker = docker.clone();
                     let prev = container
