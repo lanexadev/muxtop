@@ -9,8 +9,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use muxtop_core::collector::Collector;
-use muxtop_core::container_engine::{ConnectionTarget, ContainerEngine, detect_socket};
-use muxtop_core::docker_engine::DockerEngine;
+use muxtop_core::container_engine::ContainerEngine;
+use muxtop_core::docker_engine::maybe_connect_default_engine;
 use muxtop_core::process::SortField;
 use muxtop_core::system::SystemSnapshot;
 use muxtop_proto::RemoteCollector;
@@ -149,7 +149,7 @@ async fn run_app(cli: Cli) -> Result<()> {
     // render the appropriate fallback.
     let container_engine: Option<Arc<dyn ContainerEngine + Send + Sync>> =
         if cli.remote.is_none() && !cli.no_containers {
-            maybe_build_container_engine(cli.docker_socket.as_deref()).await
+            maybe_connect_default_engine(cli.docker_socket.as_deref()).await
         } else {
             None
         };
@@ -271,37 +271,6 @@ async fn bench_run_loop(
                 }
                 None => break,
             }
-        }
-    }
-}
-
-/// Best-effort container engine construction.
-///
-/// Returns `None` when no socket can be detected or when connecting to the
-/// daemon fails; errors are logged as warnings so muxtop keeps booting with
-/// a disabled Containers tab rather than refusing to launch.
-async fn maybe_build_container_engine(
-    override_socket: Option<&std::path::Path>,
-) -> Option<Arc<dyn ContainerEngine + Send + Sync>> {
-    let target = match override_socket {
-        Some(path) => ConnectionTarget::Unix(path.to_path_buf()),
-        None => match detect_socket() {
-            Some(t) => t,
-            None => {
-                tracing::debug!("no container engine socket detected (Docker/Podman)");
-                return None;
-            }
-        },
-    };
-
-    match DockerEngine::connect(target.clone()).await {
-        Ok(engine) => {
-            tracing::info!(engine = ?engine.kind(), ?target, "container engine connected");
-            Some(Arc::new(engine))
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, ?target, "container engine unreachable; Containers tab disabled");
-            None
         }
     }
 }

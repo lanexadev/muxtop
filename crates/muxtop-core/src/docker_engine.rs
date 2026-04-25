@@ -91,6 +91,46 @@ impl DockerEngine {
     }
 }
 
+/// Best-effort engine construction shared by the `muxtop` and `muxtop-server`
+/// binaries.
+///
+/// 1. If `override_socket` is `Some(path)`, treat it as a Unix socket directly.
+/// 2. Otherwise, run [`crate::container_engine::detect_socket`] (DOCKER_HOST →
+///    `/var/run/docker.sock` → Podman paths).
+/// 3. Try [`DockerEngine::connect`]. Failure is logged as a warning and
+///    swallowed — the caller gets `None` and renders the "no engine" / "no
+///    daemon" fallback in the UI rather than refusing to launch.
+///
+/// Never returns `Err`: callers want to keep booting even when no daemon is
+/// reachable.
+pub async fn maybe_connect_default_engine(
+    override_socket: Option<&std::path::Path>,
+) -> Option<std::sync::Arc<dyn ContainerEngine + Send + Sync>> {
+    use crate::container_engine::{ConnectionTarget, detect_socket};
+
+    let target = match override_socket {
+        Some(path) => ConnectionTarget::Unix(path.to_path_buf()),
+        None => match detect_socket() {
+            Some(t) => t,
+            None => {
+                tracing::debug!("no container engine socket detected (Docker/Podman)");
+                return None;
+            }
+        },
+    };
+
+    match DockerEngine::connect(target.clone()).await {
+        Ok(engine) => {
+            tracing::info!(engine = ?engine.kind(), ?target, "container engine connected");
+            Some(std::sync::Arc::new(engine))
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, ?target, "container engine unreachable; Containers tab disabled");
+            None
+        }
+    }
+}
+
 #[async_trait]
 impl ContainerEngine for DockerEngine {
     async fn list_and_stats(&self) -> Result<Vec<ContainerSnapshot>, EngineError> {

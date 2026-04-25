@@ -2924,10 +2924,7 @@ mod tests {
 
     // ─── Container actions (E6) ───────────────────────────────────────────
 
-    fn make_snapshot_with_container(
-        id: &str,
-        name: &str,
-    ) -> muxtop_core::system::SystemSnapshot {
+    fn make_snapshot_with_container(id: &str, name: &str) -> muxtop_core::system::SystemSnapshot {
         use muxtop_core::containers::{
             ContainerSnapshot, ContainerState, ContainersSnapshot, EngineKind,
         };

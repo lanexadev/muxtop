@@ -14,6 +14,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use muxtop_core::collector::Collector;
+use muxtop_core::container_engine::ContainerEngine;
+use muxtop_core::docker_engine::maybe_connect_default_engine;
 use muxtop_core::system::SystemSnapshot;
 
 #[derive(Parser, Debug)]
@@ -51,6 +53,16 @@ struct Cli {
     /// Auto-generate a self-signed TLS certificate (for development)
     #[arg(long, conflicts_with_all = ["tls_cert", "tls_key"])]
     tls_generate: bool,
+
+    /// Override Docker/Podman socket path. If omitted, the server auto-detects
+    /// via $DOCKER_HOST and the standard socket locations.
+    #[arg(long, value_name = "PATH")]
+    docker_socket: Option<PathBuf>,
+
+    /// Disable container engine autodetection entirely. Remote clients see an
+    /// empty Containers tab.
+    #[arg(long)]
+    no_containers: bool,
 }
 
 fn init_tracing() -> Result<()> {
@@ -178,11 +190,28 @@ async fn main() -> Result<()> {
         "muxtop-server starting (TLS enabled)"
     );
 
+    // Auto-detect a container engine for the Containers tab on remote
+    // clients. `None` keeps the previous behaviour (Containers tab shows the
+    // "no engine configured" fallback).
+    let container_engine: Option<std::sync::Arc<dyn ContainerEngine + Send + Sync>> =
+        if cli.no_containers {
+            None
+        } else {
+            maybe_connect_default_engine(cli.docker_socket.as_deref()).await
+        };
+
+    if let Some(engine) = &container_engine {
+        tracing::info!(engine = ?engine.kind(), "Containers tab enabled for remote clients");
+    } else if !cli.no_containers {
+        tracing::info!("Containers tab unavailable (no engine detected)");
+    }
+
     let token = CancellationToken::new();
 
-    // Spawn the system collector.
+    // Spawn the system collector with optional container engine.
     let (collector_tx, collector_rx) = mpsc::channel::<SystemSnapshot>(4);
-    let collector = Collector::new(Duration::from_secs(cli.refresh));
+    let collector =
+        Collector::with_container_engine(Duration::from_secs(cli.refresh), container_engine);
     let collector_handle = collector.spawn(collector_tx, token.clone());
 
     // Run the TCP+TLS server.
@@ -285,5 +314,27 @@ mod tests {
             result.is_err(),
             "--tls-generate conflicts with --tls-cert/--tls-key"
         );
+    }
+
+    #[test]
+    fn test_cli_default_no_container_flags() {
+        let cli = Cli::parse_from(["muxtop-server"]);
+        assert!(cli.docker_socket.is_none());
+        assert!(!cli.no_containers);
+    }
+
+    #[test]
+    fn test_cli_docker_socket_override() {
+        let cli = Cli::parse_from(["muxtop-server", "--docker-socket", "/var/run/docker.sock"]);
+        assert_eq!(
+            cli.docker_socket.as_deref(),
+            Some(std::path::Path::new("/var/run/docker.sock"))
+        );
+    }
+
+    #[test]
+    fn test_cli_no_containers_flag() {
+        let cli = Cli::parse_from(["muxtop-server", "--no-containers"]);
+        assert!(cli.no_containers);
     }
 }
