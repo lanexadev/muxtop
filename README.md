@@ -6,8 +6,8 @@
 [![Crates.io](https://img.shields.io/crates/v/muxtop.svg)](https://crates.io/crates/muxtop)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](LICENSE-MIT)
 
-muxtop remplace le workflow `htop` + `iftop` + `ctop` par une interface à onglets unique.
-Pensez htop, mais avec une UX de multiplexeur (à la tmux/zellij) et une palette de commandes à la VS Code.
+muxtop replaces the `htop` + `iftop` + `ctop` workflow with a single tabbed interface.
+Think htop, but with multiplexer-style UX (à la tmux/zellij) and a VS Code-style command palette.
 
 ---
 
@@ -29,123 +29,123 @@ brew install muxtop
 ### Via APT (Debian / Ubuntu)
 
 ```sh
-# Ajout du repo (une seule fois)
+# Add the repo (one time)
 curl -fsSL https://lanexadev.github.io/apt/gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/lanexadev.gpg
 echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/lanexadev.gpg] https://lanexadev.github.io/apt stable main" | sudo tee /etc/apt/sources.list.d/lanexadev.list
 
-# Installation
+# Install
 sudo apt update
 sudo apt install muxtop
 ```
 
-### Binaire pré-compilé (Linux / macOS)
+### Pre-built binary (Linux / macOS)
 
 ```sh
 curl -sSfL https://raw.githubusercontent.com/lanexadev/muxtop/main/scripts/install.sh | sh
 ```
 
-### Depuis les sources
+### From source
 
 ```sh
 git clone https://github.com/lanexadev/muxtop.git
 cd muxtop
 cargo build --release
-# Binaire disponible dans target/release/muxtop
+# Binary available at target/release/muxtop
 ```
 
-> MSRV : Rust **1.88**
+> MSRV: Rust **1.88**
 
 ---
 
-## Fonctionnalités
+## Features
 
-| Fonctionnalité | Détail |
+| Feature | Detail |
 |---|---|
-| **Onglets** | General, Processes, Network et Containers — `Alt+1` / `Alt+2` / `Alt+3` / `Alt+4` |
-| **Onglet Réseau** | Tableau d'interfaces avec RX/s, TX/s, totaux, erreurs + sparklines en temps réel |
-| **Onglet Conteneurs** | Docker/Podman via [bollard](https://github.com/fussybeaver/bollard) — table CPU/mémoire/réseau/IO, sparklines CPU+RX, actions `F9` stop / `F10` kill / `F11` restart, détection socket automatique |
-| **Palette de commandes** | `Ctrl+P` — `kill firefox`, `sort memory`, `stop nginx`, `restart postgres`, etc. |
-| **Raccourcis htop** | `F3` recherche, `F4` filtre, `F5` arbre, `F6` tri, `F9` kill, `F10` quitter |
-| **Recherche fuzzy** | Propulsé par [nucleo](https://github.com/helix-editor/nucleo) (issu de l'éditeur Helix) |
-| **Vue arborescente** | `F5` bascule l'affichage hiérarchique parent/enfant |
-| **Renice** | `+` / `-` pour ajuster la priorité d'un processus |
-| **Monitoring distant** | `--remote host:port` + `--token` pour surveiller un serveur distant via TLS chiffré |
-| **TLS natif** | Chiffrement rustls (TLS 1.2/1.3), génération auto de certificats self-signed (`--tls-generate`), auth par token obligatoire |
-| **Collecte asynchrone** | Basé sur tokio — le UI n'est jamais bloqué, même à 3000+ processus |
-| **Thème Tokyo Night** | TrueColor natif, repli automatique sur les terminaux ANSI/16 couleurs |
-| **Binaire statique** | Un seul binaire musl, aucune dépendance système |
-| **Zéro télémétrie** | Aucun appel réseau côté client, jamais (voir [Vie privée](#vie-privée--télémétrie)) |
+| **Tabs** | General, Processes, Network and Containers — `Alt+1` / `Alt+2` / `Alt+3` / `Alt+4` |
+| **Network tab** | Interface table with RX/s, TX/s, totals, errors + real-time sparklines |
+| **Containers tab** | Docker/Podman via [bollard](https://github.com/fussybeaver/bollard) — CPU/memory/network/IO table, CPU+RX sparklines, `F9` stop / `F10` kill / `F11` restart actions, automatic socket detection |
+| **Command palette** | `Ctrl+P` — `kill firefox`, `sort memory`, `stop nginx`, `restart postgres`, etc. |
+| **htop shortcuts** | `F3` search, `F4` filter, `F5` tree, `F6` sort, `F9` kill, `F10` quit |
+| **Fuzzy search** | Powered by [nucleo](https://github.com/helix-editor/nucleo) (from the Helix editor) |
+| **Tree view** | `F5` toggles the parent/child hierarchical display |
+| **Renice** | `+` / `-` to adjust process priority |
+| **Remote monitoring** | `--remote host:port` + `--token` to monitor a remote server over encrypted TLS |
+| **Native TLS** | rustls encryption (TLS 1.3-only since 0.3.1), self-signed cert auto-generation (`--tls-generate`), mandatory token auth |
+| **Async collection** | tokio-based — the UI never blocks, even at 3000+ processes |
+| **Tokyo Night theme** | Native TrueColor, automatic fallback for ANSI/16-color terminals |
+| **Static binary** | Single musl binary, no system dependencies |
+| **Zero telemetry** | No client-side network calls, ever (see [Privacy](#privacy--telemetry)) |
 
 ---
 
-## Privilèges
+## Privileges
 
-L'accès à la socket Docker (`/var/run/docker.sock`) est **équivalent à un accès root** sur la machine hôte : tout utilisateur du groupe `docker` peut lancer un conteneur privilégié et s'évader. Pour exécuter muxtop avec un budget de privilèges minimal, utilisez **Podman en mode rootless** — la socket utilisateur (`$XDG_RUNTIME_DIR/podman/podman.sock`) est isolée par utilisateur et muxtop la détecte automatiquement. Évitez de lancer `muxtop-server` en root sur un hôte exposé : préférez un compte de service avec uniquement la socket Podman rootless montée en lecture/écriture.
+Access to the Docker socket (`/var/run/docker.sock`) is **equivalent to root access** on the host machine: any user in the `docker` group can launch a privileged container and break out. To run muxtop with a minimal privilege budget, use **rootless Podman** — the user-scoped socket (`$XDG_RUNTIME_DIR/podman/podman.sock`) is isolated per user and muxtop detects it automatically. Avoid running `muxtop-server` as root on an exposed host: prefer a service account with only the rootless Podman socket mounted read/write.
 
 ---
 
-## Utilisation
+## Usage
 
 ```sh
-muxtop                              # lancement normal (autodétecte Docker/Podman)
-muxtop --refresh 2                  # rafraîchissement toutes les 2 secondes
-muxtop --filter firefox             # démarre avec un filtre de processus
-muxtop --sort mem                   # tri par mémoire au démarrage
-muxtop --tree                       # démarre en vue arborescente
-muxtop --about                      # version, licence, déclaration de confidentialité
+muxtop                              # normal launch (auto-detects Docker/Podman)
+muxtop --refresh 2                  # refresh every 2 seconds
+muxtop --filter firefox             # start with a process filter
+muxtop --sort mem                   # sort by memory at startup
+muxtop --tree                       # start in tree view
+muxtop --about                      # version, license, privacy pledge
 
-# Onglet Conteneurs — par défaut muxtop cherche $DOCKER_HOST, /var/run/docker.sock,
-# puis les sockets Podman. Passez un chemin pour forcer, ou désactivez complètement :
-muxtop --docker-socket /var/run/docker.sock   # override du socket
-muxtop --no-containers                        # désactive la collecte conteneurs
+# Containers tab — by default muxtop checks $DOCKER_HOST, /var/run/docker.sock,
+# then the Podman sockets. Pass a path to force, or disable entirely:
+muxtop --docker-socket /var/run/docker.sock   # socket override
+muxtop --no-containers                        # disable container collection
 
-# Démarrer le serveur (TLS + auth obligatoire)
-muxtop-server --token "mon-secret-16chars" --tls-generate
-muxtop-server --token "mon-secret-16chars" --tls-cert cert.pem --tls-key key.pem
-muxtop-server --token "mon-secret-16chars" --tls-generate --bind 0.0.0.0:4242 --max-clients 10
+# Run the server (TLS + auth required)
+muxtop-server --token "my-secret-16chars" --tls-generate
+muxtop-server --token "my-secret-16chars" --tls-cert cert.pem --tls-key key.pem
+muxtop-server --token "my-secret-16chars" --tls-generate --bind 0.0.0.0:4242 --max-clients 10
 
-# Monitoring distant (TLS)
-muxtop --remote host:port --token "mon-secret-16chars" --tls-skip-verify  # dev
-muxtop --remote host:port --token "mon-secret-16chars" --tls-ca cert.pem  # production
-MUXTOP_TOKEN="mon-secret-16chars" muxtop --remote host:port --tls-ca cert.pem
+# Remote monitoring (TLS)
+muxtop --remote host:port --token "my-secret-16chars" --tls-skip-verify  # dev
+muxtop --remote host:port --token "my-secret-16chars" --tls-ca cert.pem  # production
+MUXTOP_TOKEN="my-secret-16chars" muxtop --remote host:port --tls-ca cert.pem
 ```
 
-### Raccourcis clavier
+### Keyboard shortcuts
 
-| Touche | Action |
+| Key | Action |
 |--------|--------|
-| `Ctrl+P` | Palette de commandes |
-| `Alt+1` / `Alt+2` / `Alt+3` / `Alt+4` | Changer d'onglet (General / Processes / Network / Containers) |
-| `F1` | Aide |
-| `F3` / `/` | Recherche |
-| `F4` | Filtre de processus |
-| `F5` | Vue arborescente |
-| `F6` | Menu de tri |
-| `F9` | Tuer le processus (onglet Processes) · Stop conteneur (onglet Containers) |
-| `F10` | Force kill (SIGKILL) — processus ou conteneur selon l'onglet actif |
-| `F11` | Redémarrer le conteneur (onglet Containers) |
-| `q` | Quitter |
-| `j` / `k` | Navigation (style vim) |
-| `+` / `-` | Renice (priorité) — onglet Processes uniquement |
+| `Ctrl+P` | Command palette |
+| `Alt+1` / `Alt+2` / `Alt+3` / `Alt+4` | Switch tab (General / Processes / Network / Containers) |
+| `F1` | Help |
+| `F3` / `/` | Search |
+| `F4` | Process filter |
+| `F5` | Tree view |
+| `F6` | Sort menu |
+| `F9` | Kill process (Processes tab) · Stop container (Containers tab) |
+| `F10` | Force kill (SIGKILL) — process or container depending on the active tab |
+| `F11` | Restart container (Containers tab) |
+| `q` | Quit |
+| `j` / `k` | Navigation (vim-style) |
+| `+` / `-` | Renice (priority) — Processes tab only |
 
 ---
 
 ## Benchmarks
 
-Testé sur macOS avec 500+ processus (benchmark Thomas) :
+Tested on macOS with 500+ processes (Thomas benchmark):
 
-| Métrique | Cible | muxtop |
+| Metric | Target | muxtop |
 |----------|-------|--------|
-| Démarrage (`--about`) | < 100 ms | ~12 ms |
-| Taille du binaire | < 10 MB | **5.3 MiB** (LTO + strip) |
-| FPS (TUI) | > 30 | ~60 (event-driven, idle ≈ 0 redraw) |
-| RSS pic (30 s) | < 15 MiB | **11.3 MiB** (htop ~15, btop ~40) |
+| Startup (`--about`) | < 100 ms | ~12 ms |
+| Binary size | < 10 MB | **5.3 MiB** (LTO + strip) |
+| FPS (TUI) | > 30 | ~60 (event-driven, idle ≈ 0 redraws) |
+| Peak RSS (30 s) | < 15 MiB | **11.3 MiB** (htop ~15, btop ~40) |
 
-Lancez le benchmark vous-même :
+Run the benchmark yourself:
 
 ```sh
 just bench-thomas
-# ou
+# or
 ./scripts/bench-thomas.sh
 ```
 
@@ -155,66 +155,67 @@ just bench-thomas
 
 ```
 muxtop/
-├── src/                         # Point d'entrée (CLI clap + bootstrap tokio)
+├── src/                         # Entry point (clap CLI + tokio bootstrap)
 └── crates/
-    ├── muxtop-core/             # Collecte système, modèles de données, actions
-    │   ├── src/collector.rs     # Boucle async sysinfo (1 Hz) + boucle conteneurs (0.5 Hz)
-    │   ├── src/process.rs       # Tri, filtrage, arbre de processus
-    │   ├── src/system.rs        # Snapshots CPU / mémoire / charge
-    │   ├── src/network.rs       # Interfaces réseau + historique
-    │   ├── src/containers.rs    # Modèle conteneurs (ContainerSnapshot, états, engine)
-    │   ├── src/container_engine.rs # Trait async + détection socket Docker/Podman
-    │   └── src/docker_engine.rs # Implémentation concrète via bollard
-    ├── muxtop-tui/              # Interface ratatui
-    │   ├── src/app.rs           # Machine à états, gestion des événements
-    │   └── src/ui/              # Onglets General, Processes, Network, Containers, palette, thème
-    ├── muxtop-proto/            # Protocole filaire et sérialisation binaire
-    └── muxtop-server/           # Daemon TCP pour le monitoring à distance
+    ├── muxtop-core/             # System collection, data models, actions
+    │   ├── src/collector.rs     # Async sysinfo loop (1 Hz) + container loop (0.5 Hz)
+    │   ├── src/process.rs       # Sort, filter, process tree
+    │   ├── src/system.rs        # CPU / memory / load snapshots
+    │   ├── src/network.rs       # Network interfaces + history
+    │   ├── src/containers.rs    # Container model (ContainerSnapshot, states, engine)
+    │   ├── src/container_engine.rs # Async trait + Docker/Podman socket detection
+    │   └── src/docker_engine.rs # Concrete bollard-backed implementation
+    ├── muxtop-tui/              # ratatui interface
+    │   ├── src/app.rs           # State machine, event handling
+    │   └── src/ui/              # Tabs General, Processes, Network, Containers, palette, theme
+    ├── muxtop-proto/            # Wire protocol and binary serialization
+    └── muxtop-server/           # TCP daemon for remote monitoring
 ```
 
 ---
 
-## Développement
+## Development
 
 ```sh
 just check    # fmt + clippy + tests
-just bench    # micro-benchmarks criterion
-just dev      # vérification continue avec bacon
+just bench    # criterion micro-benchmarks
+just dev      # continuous check with bacon
 ```
 
 ---
 
-## Feuille de route
+## Roadmap
 
-| Version | Objectif |
+| Version | Goal |
 |---------|----------|
-| **v0.1** ✓ | Remplacement htop — onglets, palette de commandes, vue arborescente |
-| **v0.2** ✓ | Onglet Réseau (remplace iftop) + architecture client-serveur (`muxtop-server`, `--remote`) |
-| **v0.3** ✓ | Onglet Conteneurs Docker / Podman (via [bollard](https://github.com/fussybeaver/bollard)) + actions Stop/Kill/Restart |
-| v0.3.1 | Support Kubernetes (via [kube-rs](https://github.com/kube-rs/kube)) |
-| v0.4 | Monitoring GPU (NVIDIA / AMD / Apple Silicon) + `docker exec` interactif (PTY) |
-| v1.0 | Système de plugins WASM + thèmes + fichier de configuration |
+| **v0.1** ✓ | htop replacement — tabs, command palette, tree view |
+| **v0.2** ✓ | Network tab (replaces iftop) + client/server architecture (`muxtop-server`, `--remote`) |
+| **v0.3** ✓ | Docker / Podman Containers tab (via [bollard](https://github.com/fussybeaver/bollard)) + Stop/Kill/Restart actions |
+| **v0.3.1** ✓ | TLS 1.3 hardening, per-IP rate limit, ANSI sanitizer, event-driven render, `lto=fat` build sweep |
+| v0.4 | Kubernetes support (via [kube-rs](https://github.com/kube-rs/kube)) |
+| v0.5 | GPU monitoring (NVIDIA / AMD / Apple Silicon) + interactive `docker exec` (PTY) |
+| v1.0 | WASM plugin system + themes + configuration file |
 
 ---
 
-## Vie privée & télémétrie
+## Privacy & telemetry
 
-muxtop ne collecte **AUCUNE** télémétrie, **AUCUNE** statistique et ne contacte **PERSONNE**. Jamais.
+muxtop collects **NO** telemetry, **NO** statistics and contacts **NO ONE**. Ever.
 
-Il ne fait aucun appel réseau. Il est conçu pour les serveurs de production air-gappés.
-Si vous observez une activité réseau sortante depuis muxtop, c'est un bug — veuillez le [signaler](https://github.com/lanexadev/muxtop/issues).
-
----
-
-## Contribuer
-
-Les contributions sont les bienvenues ! Consultez [CONTRIBUTING.md](CONTRIBUTING.md) pour les prérequis, les conventions de code, le workflow de branches et les instructions pour soumettre une PR.
+It makes no network calls. It is designed for air-gapped production servers.
+If you observe outbound network activity from muxtop, that is a bug — please [report it](https://github.com/lanexadev/muxtop/issues).
 
 ---
 
-## Licence
+## Contributing
 
-Disponible sous l'un ou l'autre des licences suivantes, à votre choix :
+Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for prerequisites, code conventions, the branch workflow and PR submission instructions.
+
+---
+
+## License
+
+Available under either of the following licenses, at your option:
 
 - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
 - MIT License ([LICENSE-MIT](LICENSE-MIT))
