@@ -8,6 +8,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
+use super::sanitize::scrub_ctrl;
 use super::theme::Theme;
 use crate::app::AppState;
 use muxtop_core::process::{ProcessInfo, SortField, SortOrder};
@@ -184,9 +185,14 @@ fn process_row(
     row_idx: usize,
 ) -> Line<'static> {
     let (sc, sc_color) = status_style(&proc.status, theme, unicode);
+    // Scrub external strings before they hit a Span (MED-S5). Process `comm`
+    // and `cmdline` come from `/proc/*/comm` and `/proc/*/cmdline` — both are
+    // attacker-controlled by any local user able to spawn a process.
+    let safe_command = scrub_ctrl(&proc.command);
+    let safe_user = scrub_ctrl(&proc.user);
     let cmd_text = match tree_pfx {
-        Some(pfx) => format!("{pfx}{}", proc.command),
-        None => proc.command.clone(),
+        Some(pfx) => format!("{pfx}{safe_command}"),
+        None => safe_command.into_owned(),
     };
 
     let bg = if selected {
@@ -214,7 +220,7 @@ fn process_row(
 
     Line::from(vec![
         Span::styled(format!("{:>6} ", proc.pid), base),
-        Span::styled(col_text(&proc.user, COL_USER), base),
+        Span::styled(col_text(&safe_user, COL_USER), base),
         Span::styled(format!("{sc} "), st),
         Span::styled(format!("{:>5.1} ", proc.cpu_percent), base),
         Span::styled(format!("{:>5.1} ", proc.memory_percent), base),

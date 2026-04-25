@@ -191,6 +191,7 @@ async fn test_tcp_clean_disconnect() {
 fn sample_container(index: usize, state: ContainerState) -> ContainerSnapshot {
     ContainerSnapshot {
         id: format!("abc{index:09}"),
+        id_full: format!("abc{index:09}{:0>52}", ""),
         name: format!("svc-{index:03}"),
         image: "nginx:1.27-alpine".into(),
         state,

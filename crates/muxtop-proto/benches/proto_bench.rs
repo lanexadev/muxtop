@@ -128,6 +128,7 @@ fn make_containers_snapshot(n: usize) -> ContainersSnapshot {
     let containers: Vec<ContainerSnapshot> = (0..n)
         .map(|i| ContainerSnapshot {
             id: format!("container{i:012}"),
+            id_full: format!("container{i:012}{:0>43}", ""),
             name: format!("svc-{i:04}"),
             image: "registry.example.com/library/app:v1.2.3".into(),
             state: states[i % states.len()],

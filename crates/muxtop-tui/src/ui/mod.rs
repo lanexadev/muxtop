@@ -6,6 +6,7 @@ mod general;
 mod network;
 mod palette;
 mod processes;
+pub mod sanitize;
 pub mod theme;
 
 use ratatui::{

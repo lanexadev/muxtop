@@ -78,6 +78,12 @@ cargo build --release
 
 ---
 
+## Privilèges
+
+L'accès à la socket Docker (`/var/run/docker.sock`) est **équivalent à un accès root** sur la machine hôte : tout utilisateur du groupe `docker` peut lancer un conteneur privilégié et s'évader. Pour exécuter muxtop avec un budget de privilèges minimal, utilisez **Podman en mode rootless** — la socket utilisateur (`$XDG_RUNTIME_DIR/podman/podman.sock`) est isolée par utilisateur et muxtop la détecte automatiquement. Évitez de lancer `muxtop-server` en root sur un hôte exposé : préférez un compte de service avec uniquement la socket Podman rootless montée en lecture/écriture.
+
+---
+
 ## Utilisation
 
 ```sh

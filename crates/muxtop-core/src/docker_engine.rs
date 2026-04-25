@@ -52,11 +52,29 @@ pub struct DockerEngine {
 impl DockerEngine {
     /// Connect to a Docker/Podman daemon and probe its kind.
     ///
+    /// Auto-detected paths refuse to follow symlinks. Use [`Self::connect_explicit`]
+    /// when the user supplied the path themselves and may legitimately be
+    /// pointing at a symlink (e.g. `/var/run/docker.sock` → `/run/docker.sock`).
+    ///
     /// Bubbles `EngineError::ConnectFailed` if the connection can't be
     /// established, `EngineError::Timeout` if `/info` takes longer than 5 s.
     pub async fn connect(target: ConnectionTarget) -> Result<Self, EngineError> {
+        Self::connect_with(target, false).await
+    }
+
+    /// Same as [`Self::connect`] but tolerates symlinked Unix sockets — used
+    /// when the user supplied the path explicitly via `--docker-socket`.
+    pub async fn connect_explicit(target: ConnectionTarget) -> Result<Self, EngineError> {
+        Self::connect_with(target, true).await
+    }
+
+    async fn connect_with(
+        target: ConnectionTarget,
+        allow_symlink: bool,
+    ) -> Result<Self, EngineError> {
         let docker = match target {
             ConnectionTarget::Unix(path) => {
+                check_socket_symlink(&path, allow_symlink)?;
                 let socket_path = path.to_str().ok_or_else(|| {
                     EngineError::ConnectFailed(format!("non-UTF-8 socket path: {path:?}"))
                 })?;
@@ -108,6 +126,7 @@ pub async fn maybe_connect_default_engine(
 ) -> Option<std::sync::Arc<dyn ContainerEngine + Send + Sync>> {
     use crate::container_engine::{ConnectionTarget, detect_socket};
 
+    let explicit = override_socket.is_some();
     let target = match override_socket {
         Some(path) => ConnectionTarget::Unix(path.to_path_buf()),
         None => match detect_socket() {
@@ -119,7 +138,14 @@ pub async fn maybe_connect_default_engine(
         },
     };
 
-    match DockerEngine::connect(target.clone()).await {
+    // `connect` and `connect_explicit` are distinct opaque futures; await
+    // each in its own arm so the resulting `Result` types unify.
+    let result = if explicit {
+        DockerEngine::connect_explicit(target.clone()).await
+    } else {
+        DockerEngine::connect(target.clone()).await
+    };
+    match result {
         Ok(engine) => {
             tracing::info!(engine = ?engine.kind(), ?target, "container engine connected");
             Some(std::sync::Arc::new(engine))
@@ -181,7 +207,12 @@ impl ContainerEngine for DockerEngine {
                 }
                 // Raced with removal: drop silently.
                 Err(EngineError::ContainerNotFound(_)) => {}
-                Err(e) => return Err(e),
+                // Per-container failure isolation (LOW-S4): a single 403
+                // / timeout / unexpected error must not blank the whole tab.
+                // Drop just this row and warn; other containers continue.
+                Err(e) => {
+                    tracing::warn!(error = %e, "container stats failed; dropping row");
+                }
             }
         }
 
@@ -228,6 +259,40 @@ impl ContainerEngine for DockerEngine {
 }
 
 // ─── helpers (pure, directly unit-tested) ──────────────────────────────────
+
+/// Reject Unix socket paths that are symlinks (LOW-S5).
+///
+/// Auto-detected sockets must be real sockets — a symlink at one of the
+/// canonical paths is a strong sign of redirection (intentional or otherwise).
+/// When `allow_symlink` is `true` (user-supplied `--docker-socket`), we log a
+/// warning but proceed.
+///
+/// `symlink_metadata` is used so we never traverse the link itself.
+fn check_socket_symlink(path: &std::path::Path, allow_symlink: bool) -> Result<(), EngineError> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        // Path doesn't exist yet, or we can't stat it: bollard will surface a
+        // clearer error on connect — don't second-guess here.
+        Err(_) => return Ok(()),
+    };
+
+    if meta.file_type().is_symlink() {
+        if allow_symlink {
+            tracing::warn!(
+                socket = %path.display(),
+                "user-supplied docker socket is a symlink; proceeding because --docker-socket was explicit",
+            );
+            Ok(())
+        } else {
+            Err(EngineError::ConnectFailed(format!(
+                "refusing to follow symlinked socket: {} (auto-detected; pass --docker-socket explicitly to override)",
+                path.display()
+            )))
+        }
+    } else {
+        Ok(())
+    }
+}
 
 /// Map a bollard error into our semantic [`EngineError`] enum.
 fn map_bollard_error(e: BollardError) -> EngineError {
@@ -420,6 +485,7 @@ fn build_snapshot(
 
     let snap = ContainerSnapshot {
         id: short_id,
+        id_full: id,
         name,
         image,
         state,
@@ -783,6 +849,7 @@ mod tests {
         let (snap, cache) = build_snapshot(summary, &stats, Some(prev));
 
         assert_eq!(snap.id, "abcdef123456");
+        assert_eq!(snap.id_full, "abcdef1234567890");
         assert_eq!(snap.name, "my-nginx");
         assert_eq!(snap.image, "nginx:1.27");
         assert_eq!(snap.state, ContainerState::Running);
@@ -801,6 +868,114 @@ mod tests {
         assert_eq!(snap.started_at_ms, 1_700_000_000_000);
         assert_eq!(cache.cpu_usage, 2_000);
         assert_eq!(cache.system_usage, 10_000);
+    }
+
+    // ─── check_socket_symlink (LOW-S5) ────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_socket_is_rejected_for_autodetect() {
+        use std::os::unix::fs as unix_fs;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.sock");
+        std::fs::File::create(&real).unwrap();
+        let link = dir.path().join("link.sock");
+        unix_fs::symlink(&real, &link).unwrap();
+
+        let err = check_socket_symlink(&link, /* allow_symlink */ false)
+            .expect_err("symlink should be rejected");
+        match err {
+            EngineError::ConnectFailed(msg) => assert!(
+                msg.contains("symlink"),
+                "expected symlink mention, got {msg:?}"
+            ),
+            other => panic!("expected ConnectFailed, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_socket_is_allowed_when_explicit() {
+        use std::os::unix::fs as unix_fs;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.sock");
+        std::fs::File::create(&real).unwrap();
+        let link = dir.path().join("link.sock");
+        unix_fs::symlink(&real, &link).unwrap();
+
+        // allow_symlink=true → ok (warns but proceeds).
+        check_socket_symlink(&link, /* allow_symlink */ true).expect("explicit should allow");
+    }
+
+    #[test]
+    fn non_symlink_socket_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.sock");
+        std::fs::File::create(&real).unwrap();
+        check_socket_symlink(&real, false).expect("plain file should pass");
+    }
+
+    #[test]
+    fn missing_socket_passes_through() {
+        // The `connect` call will fail later with a clearer message — we don't
+        // pre-empt that here.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("not-here.sock");
+        check_socket_symlink(&missing, false).expect("missing path should pass");
+    }
+
+    // ─── per-container error isolation (LOW-S4) ───────────────────────────
+
+    /// Replicates the result-handling loop of `list_and_stats` to verify a
+    /// single per-container error does NOT abort the whole batch.
+    #[test]
+    fn per_container_error_is_isolated() {
+        // Synthetic results: one ok, one PermissionDenied, one ContainerNotFound.
+        let ok_snap = ContainerSnapshot {
+            id: "aaaaaaaaaaaa".into(),
+            id_full: "aaaaaaaaaaaa".to_string() + &"0".repeat(52),
+            name: "ok".into(),
+            image: "img:1".into(),
+            state: ContainerState::Running,
+            status_text: "Up".into(),
+            cpu_pct: 0.0,
+            mem_used_bytes: 0,
+            mem_limit_bytes: 0,
+            net_rx_bytes: 0,
+            net_tx_bytes: 0,
+            block_read_bytes: 0,
+            block_write_bytes: 0,
+            started_at_ms: 0,
+        };
+        let cached = CachedCpu {
+            cpu_usage: 0,
+            system_usage: 0,
+        };
+        let results: Vec<Result<(ContainerSnapshot, CachedCpu), EngineError>> = vec![
+            Ok((ok_snap.clone(), cached)),
+            Err(EngineError::PermissionDenied("denied".into())),
+            Err(EngineError::ContainerNotFound("removed".into())),
+        ];
+
+        // Mirror of the loop in `list_and_stats`.
+        let mut snapshots = Vec::new();
+        let mut new_cache: HashMap<String, CachedCpu> = HashMap::new();
+        for result in results {
+            match result {
+                Ok((snap, cached)) => {
+                    new_cache.insert(snap.id.clone(), cached);
+                    snapshots.push(snap);
+                }
+                Err(EngineError::ContainerNotFound(_)) => {}
+                Err(_e) => {
+                    // Drop and continue (the production path also tracing::warn!s).
+                }
+            }
+        }
+
+        assert_eq!(snapshots.len(), 1, "only the ok row should survive");
+        assert_eq!(snapshots[0].id, "aaaaaaaaaaaa");
+        assert_eq!(new_cache.len(), 1);
     }
 
     // ─── real Docker integration ──────────────────────────────────────────

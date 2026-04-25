@@ -39,6 +39,10 @@ pub enum EngineKind {
 pub struct ContainerSnapshot {
     /// Short container id (first 12 hex chars).
     pub id: String,
+    /// Full 64-hex container id, used for unambiguous engine actions.
+    ///
+    /// Wire protocol break vs v0.3.0 — clients must be on the same minor version.
+    pub id_full: String,
     /// Primary container name (without leading `/`).
     pub name: String,
     /// Image reference (e.g. `nginx:1.27`).
@@ -89,6 +93,7 @@ mod tests {
     fn sample_snapshot() -> ContainerSnapshot {
         ContainerSnapshot {
             id: "abc123def456".into(),
+            id_full: "abc123def4567890000000000000000000000000000000000000000000000000".into(),
             name: "nginx".into(),
             image: "nginx:1.27".into(),
             state: ContainerState::Running,

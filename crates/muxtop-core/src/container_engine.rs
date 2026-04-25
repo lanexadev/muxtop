@@ -153,10 +153,22 @@ pub fn parse_docker_host(raw: &str) -> Option<ConnectionTarget> {
 /// 1. `env.var("DOCKER_HOST")` if it parses via [`parse_docker_host`].
 /// 2. Otherwise, the first `candidates` entry where `Path::exists()` holds.
 /// 3. Otherwise `None`.
+///
+/// Side effect: when the resolved target is a non-loopback HTTP endpoint
+/// (MED-S4), emits a `tracing::warn!` once at detection time.
 pub fn detect_with<E: EnvLookup>(env: &E, candidates: &[&Path]) -> Option<ConnectionTarget> {
     if let Some(raw) = env.var("DOCKER_HOST")
         && let Some(target) = parse_docker_host(&raw)
     {
+        if let ConnectionTarget::Http(url) = &target
+            && !http_host_is_loopback(url)
+        {
+            tracing::warn!(
+                target: "muxtop::docker",
+                host = %url,
+                "DOCKER_HOST points to a non-loopback target — container metadata will be sent there",
+            );
+        }
         return Some(target);
     }
     for candidate in candidates {
@@ -165,6 +177,58 @@ pub fn detect_with<E: EnvLookup>(env: &E, candidates: &[&Path]) -> Option<Connec
         }
     }
     None
+}
+
+/// Extract the host portion of an `http(s)://host[:port][/path]` URL and
+/// decide whether it parses to a loopback IP literal (or to the literal
+/// hostname `localhost`).
+///
+/// Hand-rolled — adding the `url` crate just for this single check would pull
+/// in 4 transitive deps for ~20 lines of work.
+///
+/// Conservative: when the host can't be parsed as an IP and isn't `localhost`,
+/// we treat it as non-loopback (warn) rather than silently passing.
+fn http_host_is_loopback(url: &str) -> bool {
+    // Strip scheme.
+    let after_scheme = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+
+    // Drop optional userinfo (`user:pass@host`) — not standard for DOCKER_HOST
+    // but doesn't hurt to be defensive.
+    let after_userinfo = match after_scheme.rfind('@') {
+        Some(idx) => &after_scheme[idx + 1..],
+        None => after_scheme,
+    };
+
+    // Cut at first `/` or `?` — leaves `host[:port]`.
+    let host_port = after_userinfo
+        .split(['/', '?'])
+        .next()
+        .unwrap_or(after_userinfo);
+
+    // Strip port. IPv6 literals are wrapped in `[…]` per RFC 3986.
+    let host = if let Some(stripped) = host_port.strip_prefix('[') {
+        // `[::1]:port` → take through `]`.
+        match stripped.find(']') {
+            Some(end) => &stripped[..end],
+            None => stripped, // malformed; best-effort
+        }
+    } else {
+        host_port.split(':').next().unwrap_or(host_port)
+    };
+
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+
+    // Try parsing as an IP literal (v4 or v6). Non-IP hostnames cannot be
+    // judged loopback without DNS — warn.
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => false,
+    }
 }
 
 /// Resolve the production candidate list and call [`detect_with`] with the
@@ -357,6 +421,57 @@ mod tests {
     fn engine_error_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<EngineError>();
+    }
+
+    // -------- http_host_is_loopback (MED-S4) --------
+
+    #[test]
+    fn loopback_ipv4_is_loopback() {
+        assert!(http_host_is_loopback("http://127.0.0.1:2375"));
+        assert!(http_host_is_loopback("http://127.1.2.3"));
+        assert!(http_host_is_loopback("https://127.0.0.1:2376/v1.40/info"));
+    }
+
+    #[test]
+    fn loopback_ipv6_is_loopback() {
+        assert!(http_host_is_loopback("http://[::1]:2375"));
+        assert!(http_host_is_loopback("http://[::1]"));
+    }
+
+    #[test]
+    fn localhost_literal_is_loopback() {
+        assert!(http_host_is_loopback("http://localhost:2375"));
+        assert!(http_host_is_loopback("https://LOCALHOST"));
+    }
+
+    #[test]
+    fn rfc1918_addresses_are_not_loopback() {
+        assert!(!http_host_is_loopback("http://10.0.0.1:2375"));
+        assert!(!http_host_is_loopback("http://192.168.1.10:2375"));
+        assert!(!http_host_is_loopback("https://172.16.0.1"));
+    }
+
+    #[test]
+    fn public_ipv4_is_not_loopback() {
+        assert!(!http_host_is_loopback("http://1.2.3.4:2375"));
+        assert!(!http_host_is_loopback("https://203.0.113.5"));
+    }
+
+    #[test]
+    fn arbitrary_hostname_is_not_loopback() {
+        // Conservative: can't be sure without DNS, so we warn.
+        assert!(!http_host_is_loopback("http://docker.example.com:2375"));
+    }
+
+    #[test]
+    fn detect_with_non_loopback_docker_host_returns_target() {
+        // Smoke test: warning is fired (not asserted here — we don't wire a
+        // tracing subscriber), and the returned target is unchanged.
+        let env = FakeEnv::default().with("DOCKER_HOST", "tcp://10.0.0.1:2375");
+        assert_eq!(
+            detect_with(&env, &[]),
+            Some(ConnectionTarget::Http("http://10.0.0.1:2375".into()))
+        );
     }
 
     // -------- integration: real detect_socket() is callable --------
