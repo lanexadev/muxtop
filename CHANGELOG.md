@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-04-25
+
+Hardening + performance follow-up to the v0.3.0 Containers release. Closes every finding from the 2026-04-25 security & performance audit, plus a build-profile sweep that almost halves the binary size.
+
+### Security
+
+#### Server / wire protocol (`muxtop-server`, `muxtop-proto`)
+- **TLS 1.3 only.** `ServerConfig` and `ClientConfig` are now pinned via `builder_with_protocol_versions(&[&TLS13])`; a regression test asserts a TLS-1.2 client handshake fails.
+- **Hardened self-signed certificates.** Rebuilt around explicit `CertificateParams` with `iPAddress` + `DnsName` SAN (was DNS-only), `PKCS_ECDSA_P256_SHA256`, 90-day validity. The generated key file is opened with `O_NOFOLLOW` + mode `0600`; the parent data dir is `chmod 0700` (Unix). A `<data_dir>/server.fingerprint` is persisted (mode `0644`) so operators can recover the SHA-256 even if the startup banner is swallowed by systemd / CI.
+- **Per-IP token-bucket rate limiter** (default 10/s, configurable via `--rate-limit-per-ip`; `0` disables). No new dependency.
+- **`max_clients` semaphore acquired in the accept loop *before* the TLS handshake.** Over-quota TCP streams are dropped silently — no TLS handshake, no Error frame.
+- **Pre-auth Hello frame capped at 4 KiB** via `FrameReader::read_frame_with_max_payload(usize)`. Post-handshake reads keep the 4 MiB cap.
+- **Allocation-bounded bincode decode** (`config::standard().with_limit::<MAX_DECODE_BYTES>()`); a payload claiming a 100 MiB string is rejected without allocation.
+- **`--token-file <path>`** flag on both binaries (mutually exclusive with `--token`). 16-char minimum after trim. The in-memory token is wrapped in a private `Token(String)` newtype that redacts on `Debug`. `--token` help now warns about `/proc/<pid>/cmdline` leakage.
+- **Insecure-mode visibility.** `--tls-skip-verify` fires `tracing::warn!(target: "muxtop::insecure")` on every handshake; the CLI prints a bordered banner immediately after parsing.
+- **Hostname-aware SNI.** New `muxtop_proto::parse_remote_target(s) -> (SocketAddr, ServerName)`: IP literals → `ServerName::IpAddress`, DNS names → `ServerName::DnsName(host)`. Drops the previous SocketAddr-only parse that forced IP-bound certs.
+
+#### Containers + TUI (`muxtop-core`, `muxtop-tui`)
+- **`DOCKER_HOST` exfiltration warning.** `container_engine::detect_with` emits `tracing::warn!` whenever `$DOCKER_HOST` resolves to a non-loopback `http://` / `tcp://` target. New `http_host_is_loopback` helper handles IP literals and bracketed IPv6.
+- **Symlinked-socket rejection.** `DockerEngine::connect_explicit(allow_symlink: bool)` is the new primary entry point. Auto-detection refuses to follow a symlinked Unix socket; explicit user paths log a warning but proceed.
+- **Per-container stats failure isolation.** `list_and_stats` no longer aborts the whole tab when one container returns `PermissionDenied` / `Timeout` / `Other` on stats — the bad row is dropped with a warn log, the rest render normally.
+- **ANSI / control-char sanitizer.** New `tui::ui::sanitize::scrub_ctrl(&str) -> Cow<str>` strips bytes in `0x00..=0x1f` (except `\t`) and `0x7f`, applied at every row-render site that displays attacker-controlled strings (process name/command/user, container name/image/status, network interface name). Closes the terminal-escape spoofing surface.
+
+### Performance
+
+#### Event-driven render (TUI keystone)
+- `terminal.draw` is now called only on `Snapshot | Resize | Key | Mouse | needs_redraw_flag | status_message_just_expired`. Tick events no longer trigger an unconditional 60 Hz redraw against 1 Hz data. New `AppState::needs_redraw` flag armed by `apply_snapshot`, `pump_action_results`, `set_status`, and any state-mutating key handler. **Idle CPU drops ~5–10×; render-loop allocations from ~24k/s to near-zero.**
+
+#### Hot-path allocation cuts
+- `recompute_visible` no longer calls `filter_processes` twice in tree mode (was both at 866 and 877; now reuses the first result).
+- 50 ms debounce on burst typing in the filter (`FILTER_DEBOUNCE` + `last_filter_change`); `Enter` / `Esc` commit immediately.
+- `AppState::sorted_filtered_containers_cache` populated in `apply_snapshot` and refreshed on every container sort/filter mutation. `draw_body`, `draw_sparklines`, and `selected_container` read from the cache (was three independent `Vec` clones + sorts per render).
+- Sparkline data built single-pass with `iter().skip(len.saturating_sub(N))` (was double-reverse + double collect).
+- New `process::contains_ignore_case` helper — ASCII fast path with no per-row `to_lowercase` allocation, falls back to a Unicode-correct path.
+- `PaletteState::matcher` caches the nucleo `Matcher` across keystrokes; `Command::search_texts()` interns haystacks via `OnceLock<Vec<String>>`. Result: `palette_refilter/short_query` **5 allocs / 257 B** vs 52 allocs / 134 KB before; `palette_refilter/no_match` **1 alloc / 10 B** vs 49 allocs / 134 KB; `long_query` and `no_match` time **−83 to −85 %**.
+- `network::draw_network_tab` pre-computes a `BandwidthMap` once per render and threads it into the summary bar, body, and sort comparators (was O(N² log N) string-compare lookups).
+- Server-side `Collector` now uses targeted `refresh_memory_specifics` + `refresh_cpu_usage` + `refresh_processes_specifics(...)` instead of `refresh_all` (was walking `/proc` per-process every tick). Per-core CPU labels interned via `OnceLock<RwLock<Vec<String>>>`.
+
+#### Tree mode + recompute_visible
+- `apply_snapshot/tree` allocations: 37 376 / 2 088 KB → **29 374 / 1 744 KB** per tick (**−21 % allocs, −16 % bytes**).
+- `recompute_visible/tree/500`: **−37 %** time (statistically significant, p = 0.00).
+
+#### Build profile sweep
+- New workspace `[profile.release]`: `lto = "fat"`, `codegen-units = 1`, `strip = "symbols"`, `panic = "abort"`. **Binary size 9.2 MiB → 5.3 MiB (−42 %)**, with a small win on cold startup (`--about` 14 ms → 12 ms). `mimalloc` was evaluated but degraded RSS on macOS by ~0.6 MiB (Apple `libmalloc` already returns pages aggressively); not adopted.
+- Peak RSS: 10.3 MiB → **11.3 MiB** — net cost of v0.3.0 Containers + bollard, not a regression of this release.
+
+#### Container-action hygiene
+- Container Stop/Kill/Restart spawns now race their engine call against a `CancellationToken` cancelled in `quit()` — avoids 10 s of detached tasks surviving past TUI shutdown.
+- Engine actions now dispatch with `c.id_full.clone()` instead of the truncated 12-char id (closes the Docker prefix-match risk).
+
+### Wire protocol break
+
+- `ContainerSnapshot` gains `id_full: String` (the 64-char ID). bincode is order-sensitive, so this is a wire-format break — pre-v0.3.1 clients cannot decode v0.3.1 snapshots and vice versa.
+
+### Server / CLI follow-up (carrying v0.3.0 functionality across to remote)
+- `maybe_connect_default_engine()` extracted from `src/main.rs` and hoisted into `muxtop-core/src/docker_engine.rs` as the single source of truth for both binaries.
+- `muxtop-server` gains `--docker-socket <PATH>` and `--no-containers` flags mirroring the client. The server now calls `Collector::with_container_engine`, so remote clients see actual containers in their `Alt+4` tab.
+
+### Tests
+
+- Workspace test count: 488 (v0.3.0) → **560** (v0.3.1) + 1 `#[ignore]` integration test requiring a live Docker daemon. Breakdown of new tests: rate_limit, frame cap, bincode limit, cert generation (parsed via `x509-parser`), TLS 1.3 enforcement, key file permissions, fingerprint persistence, `--token-file` path, hostname SNI parsing, `scrub_ctrl` clean/dirty/tab/OSC/null/multi-byte UTF-8, `connect_explicit` symlink rejection, per-container error isolation, `http_host_is_loopback` truth table, `tick_does_not_request_redraw`, `pump_action_results_marks_dirty`, `apply_snapshot_populates_container_cache`, `quit_cancels_shutdown_token`, `palette_matcher_is_cached`, `filter_debounce_coalesces_bursts`, `broadcast_arc_frame_shared_across_subscribers`, `contains_ignore_case` ASCII + Unicode paths.
+- `cargo check / test --workspace / clippy -D warnings / fmt / deny`: all green.
+
 ## [0.3.0] - 2026-04-25
 
 Major feature release: the **Containers** tab (replaces `ctop`) with full Docker/Podman integration via [bollard](https://github.com/fussybeaver/bollard). Auto-detection at startup means `muxtop` gains a fourth tab on any host running a container engine with no extra flags.

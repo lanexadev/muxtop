@@ -136,10 +136,10 @@ Testé sur macOS avec 500+ processus (benchmark Thomas) :
 
 | Métrique | Cible | muxtop |
 |----------|-------|--------|
-| Démarrage (`--about`) | < 100 ms | ~5 ms |
-| Taille du binaire | < 10 MB | ~4 MB |
-| FPS (TUI) | > 30 | ~60 |
-| RSS pic (30 s) | < 15 MiB | **10.3 MiB** (htop ~15, btop ~40) |
+| Démarrage (`--about`) | < 100 ms | ~12 ms |
+| Taille du binaire | < 10 MB | **5.3 MiB** (LTO + strip) |
+| FPS (TUI) | > 30 | ~60 (event-driven, idle ≈ 0 redraw) |
+| RSS pic (30 s) | < 15 MiB | **11.3 MiB** (htop ~15, btop ~40) |
 
 Lancez le benchmark vous-même :
 
