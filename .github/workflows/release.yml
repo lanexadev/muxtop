@@ -205,18 +205,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Publish muxtop-proto
+      - name: Publish muxtop-core
         run: |
-          if out=$(cargo publish --package muxtop-proto 2>&1); then
+          if out=$(cargo publish --package muxtop-core 2>&1); then
             echo "$out"
           else
             echo "$out"
             echo "$out" | grep -q "already exists" || exit 1
           fi
           sleep 30
-      - name: Publish muxtop-core
+      - name: Publish muxtop-proto
         run: |
-          if out=$(cargo publish --package muxtop-core 2>&1); then
+          if out=$(cargo publish --package muxtop-proto 2>&1); then
             echo "$out"
           else
             echo "$out"
