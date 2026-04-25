@@ -1,5 +1,7 @@
 // Network tab — interface table with bandwidth rates, sparklines, and summary bar.
 
+use std::collections::HashMap;
+
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Layout, Rect},
@@ -8,10 +10,18 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Sparkline},
 };
 
+use super::sanitize::scrub_ctrl;
 use super::theme::Theme;
 use crate::app::{AppState, NetworkSortField};
 use muxtop_core::network::NetworkInterfaceSnapshot;
 use muxtop_core::process::SortOrder;
+
+/// Map from interface name to (rx_bps, tx_bps).
+///
+/// PERF-M4: pre-computed once per `draw_network_tab` so the sort comparator
+/// (called O(N log N) times, each previously linear-scanning the history
+/// rings twice) becomes O(N log N · 1) instead of O(N² log N).
+type BandwidthMap<'a> = HashMap<&'a str, (f64, f64)>;
 
 // Fixed column widths.
 const COL_IFACE: usize = 14;
@@ -24,11 +34,14 @@ const COL_ERRORS: usize = 8;
 
 /// Render the Network tab content area.
 pub fn draw_network_tab(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
-    if app.last_snapshot.is_none() {
-        let para = Paragraph::new("Waiting for data...").alignment(Alignment::Center);
-        frame.render_widget(para, area);
-        return;
-    }
+    let snapshot = match &app.last_snapshot {
+        Some(s) => s,
+        None => {
+            let para = Paragraph::new("Waiting for data...").alignment(Alignment::Center);
+            frame.render_widget(para, area);
+            return;
+        }
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -40,6 +53,25 @@ pub fn draw_network_tab(frame: &mut Frame, area: Rect, app: &AppState, theme: &T
     if inner.height == 0 || inner.width == 0 {
         return;
     }
+
+    // PERF-M4: build the bandwidth lookup once. `bandwidth_rx`/`_tx` walk
+    // the history ring per call; the sort comparator below would otherwise
+    // call them twice per comparison and turn the sort into O(N² log N).
+    let bw_map: BandwidthMap<'_> = snapshot
+        .networks
+        .interfaces
+        .iter()
+        .map(|iface| {
+            let key = iface.name.as_str();
+            (
+                key,
+                (
+                    app.network_history.bandwidth_rx(key),
+                    app.network_history.bandwidth_tx(key),
+                ),
+            )
+        })
+        .collect();
 
     // Layout: summary(1) + table(fill) + sparklines(4 optional) + filter(0|1)
     let filter_h = u16::from(app.net_filter_active);
@@ -64,13 +96,13 @@ pub fn draw_network_tab(frame: &mut Frame, area: Rect, app: &AppState, theme: &T
     };
     let areas = Layout::vertical(constraints).split(inner);
 
-    draw_summary_bar(frame, areas[0], app, theme);
+    draw_summary_bar(frame, areas[0], app, theme, &bw_map);
 
     if areas[1].height >= 2 {
         let [header_area, body_area] =
             Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(areas[1]);
         draw_header(frame, header_area, app, theme);
-        draw_body(frame, body_area, app, theme);
+        draw_body(frame, body_area, app, theme, &bw_map);
     }
 
     if sparkline_h > 0 && areas.len() > 2 {
@@ -84,7 +116,13 @@ pub fn draw_network_tab(frame: &mut Frame, area: Rect, app: &AppState, theme: &T
 }
 
 /// Summary bar: total bandwidth and interface count.
-fn draw_summary_bar(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
+fn draw_summary_bar(
+    frame: &mut Frame,
+    area: Rect,
+    app: &AppState,
+    theme: &Theme,
+    bw_map: &BandwidthMap<'_>,
+) {
     let snapshot = match &app.last_snapshot {
         Some(s) => s,
         None => return,
@@ -98,12 +136,14 @@ fn draw_summary_bar(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme
         .count();
     let total = snapshot.networks.interfaces.len();
 
-    // Compute total bandwidth from history
-    let mut total_rx_rate = 0.0_f64;
-    let mut total_tx_rate = 0.0_f64;
+    // PERF-M4: total bandwidth pulls directly from the pre-computed map
+    // instead of re-walking the history ring per interface.
+    let (mut total_rx_rate, mut total_tx_rate) = (0.0_f64, 0.0_f64);
     for iface in &snapshot.networks.interfaces {
-        total_rx_rate += app.network_history.bandwidth_rx(&iface.name);
-        total_tx_rate += app.network_history.bandwidth_tx(&iface.name);
+        if let Some((rx, tx)) = bw_map.get(iface.name.as_str()) {
+            total_rx_rate += *rx;
+            total_tx_rate += *tx;
+        }
     }
 
     let line = Line::from(vec![
@@ -202,13 +242,19 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
 }
 
 /// Render the interface rows with virtualized scrolling.
-fn draw_body(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
+fn draw_body(
+    frame: &mut Frame,
+    area: Rect,
+    app: &AppState,
+    theme: &Theme,
+    bw_map: &BandwidthMap<'_>,
+) {
     let vis_h = area.height as usize;
     if vis_h == 0 {
         return;
     }
 
-    let interfaces = sorted_filtered_interfaces(app);
+    let interfaces = sorted_filtered_interfaces(app, bw_map);
     if interfaces.is_empty() {
         let msg = if app.net_filter_input.is_empty() {
             "No network interfaces found"
@@ -228,8 +274,11 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
     let lines: Vec<Line<'static>> = (scroll..end)
         .map(|i| {
             let iface = &interfaces[i];
-            let rx_rate = app.network_history.bandwidth_rx(&iface.name);
-            let tx_rate = app.network_history.bandwidth_tx(&iface.name);
+            // PERF-M4: read pre-computed rates from the map.
+            let (rx_rate, tx_rate) = bw_map
+                .get(iface.name.as_str())
+                .copied()
+                .unwrap_or((0.0, 0.0));
             interface_row(iface, rx_rate, tx_rate, i == app.net_selected, theme, i)
         })
         .collect();
@@ -295,8 +344,13 @@ fn interface_row(
         base
     };
 
+    // Interface name comes from sysinfo / /proc/net/dev — defensively
+    // scrubbed (MED-S5) in case a non-default network namespace exposes a
+    // name with embedded control bytes.
+    let safe_iface_name = scrub_ctrl(&iface.name);
+
     Line::from(vec![
-        Span::styled(col_text(&iface.name, COL_IFACE), base),
+        Span::styled(col_text(&safe_iface_name, COL_IFACE), base),
         Span::styled(col_text(status_str, COL_STATUS), status_style),
         Span::styled(
             col_text(&format!("{}/s", format_rate(rx_rate as u64)), COL_RX_RATE),
@@ -314,14 +368,38 @@ fn interface_row(
 
 /// Draw RX/TX sparklines for the selected interface.
 fn draw_sparklines(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
-    let interfaces = sorted_filtered_interfaces(app);
+    // Sparkline path is single-shot per render (only the selected row), so a
+    // dedicated `bw_map` here would cost more than it saves. We continue to
+    // call `bandwidth_*` directly for the two values needed.
+    let Some(snapshot) = app.last_snapshot.as_ref() else {
+        return;
+    };
+    let bw_map: BandwidthMap<'_> = snapshot
+        .networks
+        .interfaces
+        .iter()
+        .map(|iface| {
+            let key = iface.name.as_str();
+            (
+                key,
+                (
+                    app.network_history.bandwidth_rx(key),
+                    app.network_history.bandwidth_tx(key),
+                ),
+            )
+        })
+        .collect();
+
+    let interfaces = sorted_filtered_interfaces(app, &bw_map);
     let selected_iface = match interfaces.get(app.net_selected) {
         Some(iface) => &iface.name,
         None => return,
     };
 
-    let rx_rate = app.network_history.bandwidth_rx(selected_iface);
-    let tx_rate = app.network_history.bandwidth_tx(selected_iface);
+    let (rx_rate, tx_rate) = bw_map
+        .get(selected_iface.as_str())
+        .copied()
+        .unwrap_or((0.0, 0.0));
 
     let points = area.width as usize;
     let rx_data = app.network_history.sparkline_rx(selected_iface, points);
@@ -392,7 +470,14 @@ fn draw_filter_bar(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme)
 // ---------------------------------------------------------------------------
 
 /// Get sorted and filtered interfaces from the current snapshot.
-fn sorted_filtered_interfaces(app: &AppState) -> Vec<NetworkInterfaceSnapshot> {
+///
+/// PERF-M4: the sort comparator looks up rates from `bw_map` rather than
+/// re-walking the history ring, so the comparator stays O(1) and the sort
+/// itself stays O(N log N) overall.
+fn sorted_filtered_interfaces(
+    app: &AppState,
+    bw_map: &BandwidthMap<'_>,
+) -> Vec<NetworkInterfaceSnapshot> {
     let Some(ref snapshot) = app.last_snapshot else {
         return Vec::new();
     };
@@ -410,22 +495,22 @@ fn sorted_filtered_interfaces(app: &AppState) -> Vec<NetworkInterfaceSnapshot> {
             .collect()
     };
 
-    let history = &app.network_history;
+    let lookup = |name: &str| bw_map.get(name).copied().unwrap_or((0.0, 0.0));
     match app.net_sort_field {
         NetworkSortField::Name => {
             interfaces.sort_by(|a, b| a.name.cmp(&b.name));
         }
         NetworkSortField::RxRate => {
             interfaces.sort_by(|a, b| {
-                let ra = history.bandwidth_rx(&a.name);
-                let rb = history.bandwidth_rx(&b.name);
+                let ra = lookup(a.name.as_str()).0;
+                let rb = lookup(b.name.as_str()).0;
                 rb.partial_cmp(&ra).unwrap_or(std::cmp::Ordering::Equal)
             });
         }
         NetworkSortField::TxRate => {
             interfaces.sort_by(|a, b| {
-                let ta = history.bandwidth_tx(&a.name);
-                let tb = history.bandwidth_tx(&b.name);
+                let ta = lookup(a.name.as_str()).1;
+                let tb = lookup(b.name.as_str()).1;
                 tb.partial_cmp(&ta).unwrap_or(std::cmp::Ordering::Equal)
             });
         }

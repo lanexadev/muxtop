@@ -73,6 +73,7 @@ fn make_snapshot() -> SystemSnapshot {
             total_rx: 1000,
             total_tx: 1000,
         },
+        containers: None,
         timestamp_ms: 1_713_200_000_000,
     }
 }
@@ -144,7 +145,9 @@ async fn run_test_server(
         }
     });
 
-    // Accept loop.
+    // Accept loop. Mirrors the production server's MED-S2 ordering:
+    // 1) acquire the max_clients permit BEFORE starting any per-client
+    //    work, 2) drop the TCP stream silently if the bucket is full.
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -153,14 +156,22 @@ async fn run_test_server(
                     Err(_) => break,
                 };
 
-                let semaphore = Arc::clone(&semaphore);
+                let permit = match Arc::clone(&semaphore).try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        // Drop the stream — production behaviour.
+                        drop(stream);
+                        continue;
+                    }
+                };
+
                 let auth_token = auth_token.clone();
                 let snapshot_rx = broadcast_tx.subscribe();
                 let client_token = token.clone();
 
                 tokio::spawn(async move {
                     let _ = handle_test_client(
-                        stream, peer, semaphore, auth_token, refresh_hz,
+                        stream, peer, permit, auth_token, refresh_hz,
                         start_time, snapshot_rx, client_token,
                     ).await;
                 });
@@ -174,30 +185,13 @@ async fn run_test_server(
 async fn handle_test_client(
     stream: TcpStream,
     _peer: SocketAddr,
-    semaphore: Arc<tokio::sync::Semaphore>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
     auth_token: Option<String>,
     refresh_hz: u32,
     start_time: std::time::Instant,
     mut snapshot_rx: broadcast::Receiver<SystemSnapshot>,
     token: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let _permit = match semaphore.try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => {
-            let (reader, writer) = stream.into_split();
-            let mut fw = FrameWriter::new(writer);
-            let mut fr = FrameReader::new(reader);
-            // Read Hello first.
-            let _ = tokio::time::timeout(Duration::from_secs(5), fr.read_frame()).await;
-            let err = WireMessage::Error {
-                code: 503,
-                message: "max clients reached".into(),
-            };
-            let _ = fw.write_frame(&err.to_frame()?).await;
-            return Ok(());
-        }
-    };
-
     let (reader, writer) = stream.into_split();
     let mut fr = FrameReader::new(reader);
     let mut fw = FrameWriter::new(writer);
@@ -343,6 +337,10 @@ async fn test_client_receives_snapshots() {
 }
 
 // ── AC-07: Max clients rejection ──
+//
+// MED-S2: post-fix, an over-quota TCP stream is dropped immediately (no TLS
+// handshake, no `Error { 503 }` payload). The client observes either a
+// connection reset or a clean EOF when it tries to read the Welcome.
 
 #[tokio::test]
 async fn test_max_clients_rejection() {
@@ -352,13 +350,36 @@ async fn test_max_clients_rejection() {
     let (_fr1, _fw1, response1) = connect_and_handshake(addr, None).await;
     assert!(matches!(response1, WireMessage::Welcome { .. }));
 
-    // Second client — should be rejected with 503.
-    let (_fr2, _fw2, response2) = connect_and_handshake(addr, None).await;
-    match response2 {
-        WireMessage::Error { code, .. } => {
-            assert_eq!(code, 503);
+    // Second client — TCP stream is closed immediately by the server
+    // because the semaphore is exhausted. We connect, send Hello (which may
+    // succeed or fail depending on close timing), and assert that the read
+    // returns either an EOF or an error.
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (reader, writer) = stream.into_split();
+    let mut fr = FrameReader::new(reader);
+    let mut fw = FrameWriter::new(writer);
+
+    let hello = WireMessage::Hello {
+        client_version: "test".into(),
+        auth_token: None,
+    };
+    // The write may succeed (TCP buffer absorbs it) or fail (server already
+    // closed). Either way is fine — we care about the read.
+    let _ = fw.write_frame(&hello.to_frame().unwrap()).await;
+
+    let read_result = tokio::time::timeout(Duration::from_secs(3), fr.read_frame()).await;
+    match read_result {
+        Ok(Ok(None)) => {} // EOF — server closed cleanly
+        Ok(Err(_)) => {}   // I/O error — server reset
+        Ok(Ok(Some(frame))) => {
+            // If we DID get a frame, it must NOT be a Welcome (we shouldn't be admitted).
+            let msg = WireMessage::from_frame(&frame).unwrap();
+            assert!(
+                !matches!(msg, WireMessage::Welcome { .. }),
+                "second client must not be admitted, got {msg:?}"
+            );
         }
-        other => panic!("expected Error 503, got {other:?}"),
+        Err(_) => panic!("timeout waiting for server to close over-quota client"),
     }
 
     token.cancel();
@@ -663,8 +684,16 @@ async fn run_tls_test_server(
                     Err(_) => break,
                 };
 
+                // MED-S2: acquire the permit BEFORE the TLS handshake.
+                let permit = match Arc::clone(&semaphore).try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        drop(tcp_stream);
+                        continue;
+                    }
+                };
+
                 let acceptor = acceptor.clone();
-                let semaphore = Arc::clone(&semaphore);
                 let auth_token = auth_token.clone();
                 let snapshot_rx = broadcast_tx.subscribe();
                 let client_token = token.clone();
@@ -676,7 +705,7 @@ async fn run_tls_test_server(
                     };
                     let (reader, writer) = tokio::io::split(tls_stream);
                     let _ = handle_tls_test_client(
-                        reader, writer, peer, semaphore, auth_token, refresh_hz,
+                        reader, writer, peer, permit, auth_token, refresh_hz,
                         start_time, snapshot_rx, client_token,
                     ).await;
                 });
@@ -691,7 +720,7 @@ async fn handle_tls_test_client<R, W>(
     reader: R,
     writer: W,
     _peer: SocketAddr,
-    semaphore: Arc<tokio::sync::Semaphore>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
     auth_token: Option<String>,
     refresh_hz: u32,
     start_time: std::time::Instant,
@@ -702,21 +731,6 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let _permit = match semaphore.try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => {
-            let mut fw = FrameWriter::new(writer);
-            let mut fr = FrameReader::new(reader);
-            let _ = tokio::time::timeout(Duration::from_secs(5), fr.read_frame()).await;
-            let err = WireMessage::Error {
-                code: 503,
-                message: "max clients reached".into(),
-            };
-            let _ = fw.write_frame(&err.to_frame()?).await;
-            return Ok(());
-        }
-    };
-
     let mut fr = FrameReader::new(reader);
     let mut fw = FrameWriter::new(writer);
 
@@ -930,6 +944,69 @@ async fn test_tls_full_streaming() {
     assert_eq!(received, 3);
 
     token.cancel();
+}
+
+// ── MED-S1: pre-auth bincode allocation cap ──
+//
+// The server must reject Hello frames whose payload exceeds the 4 KiB
+// pre-auth cap (per ADR-30-2). We send a hand-crafted frame whose
+// length-prefix claims a 5 KiB payload. The server must drop the
+// connection BEFORE allocating the payload buffer.
+//
+// We exercise this against the *test* server's plain-TCP path. The
+// production server uses the same `read_frame_with_max_payload(4096)`
+// internally — see `crates/muxtop-server/src/client.rs::handle`.
+
+/// Mirror of the production server's pre-auth Hello path: read with a
+/// 4 KiB cap and return whatever the proto layer says. Used by the
+/// MED-S1 integration test to prove that the cap is enforced.
+async fn handle_capped_hello_test_client(
+    stream: TcpStream,
+) -> Result<WireMessage, Box<dyn std::error::Error + Send + Sync>> {
+    let (reader, writer) = stream.into_split();
+    let mut fr = FrameReader::new(reader);
+    let mut _fw = FrameWriter::new(writer);
+
+    let frame = tokio::time::timeout(Duration::from_secs(5), fr.read_frame_with_max_payload(4096))
+        .await??
+        .ok_or("no Hello received")?;
+    Ok(WireMessage::from_frame(&frame)?)
+}
+
+#[tokio::test]
+async fn test_pre_auth_hello_cap_rejects_oversize_frame() {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    // Server task: accept one stream and read with the 4 KiB pre-auth cap.
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        handle_capped_hello_test_client(stream).await
+    });
+
+    // Client task: send a hand-crafted frame whose length-prefix claims
+    // 5 KiB of payload (5121 = 5120 payload + 1 type byte). We don't
+    // even bother sending the payload — the server should reject on the
+    // header alone.
+    let mut tcp = TcpStream::connect(addr).await.unwrap();
+    let payload_len: u32 = 5 * 1024;
+    let content_len: u32 = payload_len + 1;
+    tcp.write_all(&content_len.to_be_bytes()).await.unwrap();
+    tcp.flush().await.unwrap();
+    // Hold the connection open briefly so the server gets a chance to
+    // read the header and reject.
+    drop(tcp);
+
+    // Server must surface a FrameTooLarge error (proto layer).
+    let result = server.await.unwrap();
+    let err = result.expect_err("oversize Hello must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("frame too large") || msg.contains("FrameTooLarge"),
+        "expected FrameTooLarge error, got: {msg}"
+    );
 }
 
 // ── TLS AC-08b: Auth rejection over TLS ──

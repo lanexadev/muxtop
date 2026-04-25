@@ -1,10 +1,11 @@
 // Application state machine.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use nucleo::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo::{Config, Matcher, Utf32Str};
+use tokio_util::sync::CancellationToken;
 
 use muxtop_core::actions::{self, Signal};
 use muxtop_core::network::NetworkHistory;
@@ -32,6 +33,12 @@ pub enum ConfirmAction {
     },
     /// Change the nice value of a process.
     Renice { pid: u32, name: String, delta: i32 },
+    /// Graceful container shutdown (SIGTERM with grace period).
+    StopContainer { id: String, name: String },
+    /// Force container kill (SIGKILL).
+    KillContainer { id: String, name: String },
+    /// Restart the container.
+    RestartContainer { id: String, name: String },
 }
 
 impl ConfirmAction {
@@ -53,8 +60,21 @@ impl ConfirmAction {
                 };
                 format!("Renice {name} (PID {pid}) to {direction}?  [y/n]")
             }
+            ConfirmAction::StopContainer { id, name } => {
+                format!("Stop container {name} ({})?  [y/n]", short_id(id))
+            }
+            ConfirmAction::KillContainer { id, name } => {
+                format!("Kill container {name} ({})?  [y/n]", short_id(id))
+            }
+            ConfirmAction::RestartContainer { id, name } => {
+                format!("Restart container {name} ({})?  [y/n]", short_id(id))
+            }
         }
     }
+}
+
+fn short_id(id: &str) -> String {
+    id.chars().take(12).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -88,6 +108,14 @@ pub enum Command {
     SortNetByTx,
     SortNetByName,
     SortNetByErrors,
+    SwitchToContainers,
+    SortContainersByCpu,
+    SortContainersByMem,
+    SortContainersByName,
+    SortContainersByNetRx,
+    StopContainer,
+    KillContainer,
+    RestartContainer,
 }
 
 impl Command {
@@ -116,6 +144,14 @@ impl Command {
         Command::SortNetByTx,
         Command::SortNetByName,
         Command::SortNetByErrors,
+        Command::SwitchToContainers,
+        Command::SortContainersByCpu,
+        Command::SortContainersByMem,
+        Command::SortContainersByName,
+        Command::SortContainersByNetRx,
+        Command::StopContainer,
+        Command::KillContainer,
+        Command::RestartContainer,
     ];
 
     pub fn label(self) -> &'static str {
@@ -144,6 +180,14 @@ impl Command {
             Command::SortNetByTx => "Sort network by TX",
             Command::SortNetByName => "Sort network by name",
             Command::SortNetByErrors => "Sort network by errors",
+            Command::SwitchToContainers => "Switch to Containers tab",
+            Command::SortContainersByCpu => "Sort containers by CPU",
+            Command::SortContainersByMem => "Sort containers by memory",
+            Command::SortContainersByName => "Sort containers by name",
+            Command::SortContainersByNetRx => "Sort containers by network RX",
+            Command::StopContainer => "Stop container (SIGTERM)",
+            Command::KillContainer => "Kill container (SIGKILL)",
+            Command::RestartContainer => "Restart container",
         }
     }
 
@@ -173,12 +217,34 @@ impl Command {
             Command::SortNetByTx => "",
             Command::SortNetByName => "",
             Command::SortNetByErrors => "",
+            Command::SwitchToContainers => "Alt+4",
+            Command::SortContainersByCpu => "",
+            Command::SortContainersByMem => "",
+            Command::SortContainersByName => "",
+            Command::SortContainersByNetRx => "",
+            Command::StopContainer => "F9",
+            Command::KillContainer => "F10",
+            Command::RestartContainer => "F11",
         }
     }
 
     /// The search haystack: label + shortcut combined for better fuzzy matching.
+    ///
+    /// Kept around for callers that want a freshly-allocated string (e.g.
+    /// debug logs); the hot palette filter path uses [`Command::search_texts`]
+    /// to avoid the per-keystroke allocation cost.
     fn search_text(self) -> String {
         format!("{} {}", self.label(), self.shortcut())
+    }
+
+    /// Pre-built haystack for every command in [`Command::ALL`], indexed by
+    /// position. Built once on first access; PERF-M3 avoids the
+    /// `format!("{} {}", label, shortcut)` allocation that previously fired
+    /// for every command on every palette keystroke.
+    pub fn search_texts() -> &'static [String] {
+        use std::sync::OnceLock;
+        static SEARCH_TEXTS: OnceLock<Vec<String>> = OnceLock::new();
+        SEARCH_TEXTS.get_or_init(|| Self::ALL.iter().map(|c| c.search_text()).collect())
     }
 }
 
@@ -192,6 +258,11 @@ pub struct PaletteState {
     pub selected: usize,
     /// Filtered commands with match scores (higher = better).
     pub filtered: Vec<(Command, Option<u16>)>,
+    /// Reusable nucleo matcher (PERF-M3). Created lazily on the first call to
+    /// [`Self::refilter_excluding`] with a non-empty input. Constructing a
+    /// `Matcher` allocates several internal scratch buffers, so reusing the
+    /// instance across keystrokes is a measurable win in the palette hot loop.
+    matcher: Option<Matcher>,
 }
 
 impl Default for PaletteState {
@@ -207,6 +278,7 @@ impl PaletteState {
             input: String::new(),
             selected: 0,
             filtered,
+            matcher: None,
         }
     }
 
@@ -225,7 +297,11 @@ impl PaletteState {
                     .map(|cmd| (cmd, None)),
             );
         } else {
-            let mut matcher = Matcher::new(Config::DEFAULT);
+            // PERF-M3: reuse the matcher across keystrokes — building one
+            // allocates several scratch tables that we'd otherwise throw away.
+            let matcher = self
+                .matcher
+                .get_or_insert_with(|| Matcher::new(Config::DEFAULT));
             let atom = Atom::new(
                 &self.input,
                 CaseMatching::Ignore,
@@ -234,15 +310,19 @@ impl PaletteState {
                 false,
             );
 
+            let haystacks = Command::search_texts();
             let mut scored: Vec<(Command, u16)> = Command::ALL
                 .iter()
                 .copied()
-                .filter(is_available)
-                .filter_map(|cmd| {
-                    let haystack = cmd.search_text();
+                .enumerate()
+                .filter(|(_, cmd)| is_available(cmd))
+                .filter_map(|(idx, cmd)| {
+                    // PERF-M3: lift the cached haystack instead of `format!`'ing
+                    // a fresh `String` every keystroke.
+                    let haystack = &haystacks[idx];
                     let mut buf = Vec::new();
-                    let haystack_utf32 = Utf32Str::new(&haystack, &mut buf);
-                    atom.score(haystack_utf32, &mut matcher)
+                    let haystack_utf32 = Utf32Str::new(haystack, &mut buf);
+                    atom.score(haystack_utf32, matcher)
                         .map(|score| (cmd, score))
                 })
                 .collect();
@@ -274,6 +354,7 @@ pub enum Tab {
     General,
     Processes,
     Network,
+    Containers,
 }
 
 impl std::fmt::Display for Tab {
@@ -283,13 +364,14 @@ impl std::fmt::Display for Tab {
 }
 
 impl Tab {
-    pub const ALL: &[Tab] = &[Tab::General, Tab::Processes, Tab::Network];
+    pub const ALL: &[Tab] = &[Tab::General, Tab::Processes, Tab::Network, Tab::Containers];
 
     pub fn label(self) -> &'static str {
         match self {
             Tab::General => "General",
             Tab::Processes => "Processes",
             Tab::Network => "Network",
+            Tab::Containers => "Containers",
         }
     }
 
@@ -316,8 +398,28 @@ pub enum NetworkSortField {
     Errors,
 }
 
+/// Sort field for the Containers tab.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerSortField {
+    Name,
+    #[default]
+    Cpu,
+    Mem,
+    NetRx,
+    NetTx,
+    Uptime,
+}
+
 /// Duration before a status message auto-clears.
 const STATUS_TIMEOUT_SECS: u64 = 5;
+
+/// Debounce window for filter-input keystroke bursts (PERF-H3).
+///
+/// Held off recomputes coalesce a short typing burst into a single pipeline
+/// run while keeping the UI feeling responsive. 50 ms is short enough that
+/// the user perceives the filter as "live" but long enough to absorb the
+/// 60 Hz keyboard repeat rate on most terminals.
+const FILTER_DEBOUNCE: Duration = Duration::from_millis(50);
 
 /// Full application state for the TUI.
 pub struct AppState {
@@ -357,8 +459,57 @@ pub struct AppState {
     pub net_filter_input: String,
     /// Filter active flag for the Network tab.
     pub net_filter_active: bool,
+    /// Selected container index (Containers tab).
+    pub containers_selected: usize,
+    /// Scroll offset (Containers tab).
+    pub containers_scroll_offset: usize,
+    /// Sort field for the Containers tab.
+    pub containers_sort_field: ContainerSortField,
+    /// Sort order for the Containers tab.
+    pub containers_sort_order: SortOrder,
+    /// Filter input for the Containers tab (matches id / name / image).
+    pub containers_filter_input: String,
+    /// Filter active flag for the Containers tab.
+    pub containers_filter_active: bool,
+    /// Per-container CPU % history (60 samples each, capped by CONTAINER_HISTORY_LEN).
+    container_cpu_hist: std::collections::HashMap<String, std::collections::VecDeque<f32>>,
+    /// Per-container cumulative RX (bytes). Deltas are computed on the fly.
+    container_rx_last: std::collections::HashMap<String, u64>,
+    /// Per-container RX deltas (bytes/tick), capped.
+    container_rx_hist: std::collections::HashMap<String, std::collections::VecDeque<u64>>,
+    /// Cached sorted+filtered container rows (PERF-H4). Refreshed in
+    /// [`recompute_containers_view`] whenever the snapshot, sort field, sort
+    /// order, or filter input changes. Render call sites borrow this slice
+    /// instead of recomputing the projection three times per frame.
+    sorted_filtered_containers_cache: Vec<muxtop_core::containers::ContainerSnapshot>,
+    /// Optional container engine for executing Stop/Kill/Restart actions.
+    ///
+    /// Shared (cheaply cloneable `Arc`) between AppState and the Collector's
+    /// container loop. `None` means container actions surface a "not
+    /// configured" status message rather than spawning a task.
+    pub container_engine:
+        Option<std::sync::Arc<dyn muxtop_core::container_engine::ContainerEngine + Send + Sync>>,
+    /// Channel sender for container action outcomes. Spawned tokio tasks
+    /// send their status messages here; the TUI main loop drains them via
+    /// [`pump_action_results`].
+    action_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    /// Matching receiver. Lives on AppState so call sites stay simple.
+    action_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
     /// Whether monitoring local machine or remote server.
     pub connection_mode: ConnectionMode,
+    /// Render-coalescing flag (PERF-H1). Set by any state-mutating handler;
+    /// the main loop reads + clears it via [`take_needs_redraw`] each
+    /// iteration. `Event::Tick` no longer triggers a draw on its own.
+    needs_redraw: bool,
+    /// Debounce timer for the process filter (PERF-H3). Recorded on every
+    /// keystroke that mutates the filter input; `recompute_visible` only
+    /// re-runs when at least [`FILTER_DEBOUNCE`] has elapsed since the last
+    /// keystroke (or the user hits Enter).
+    last_filter_change: Option<Instant>,
+    /// Cancellation token shared with spawned container action tasks
+    /// (PERF-L3). Triggered when the TUI quits so in-flight Stop/Kill/Restart
+    /// futures abort instead of running detached past TUI shutdown.
+    shutdown_token: CancellationToken,
 }
 
 impl Default for AppState {
@@ -369,6 +520,7 @@ impl Default for AppState {
 
 impl AppState {
     pub fn new() -> Self {
+        let (action_tx, action_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             tab: Tab::default(),
             sort_field: SortField::Cpu,
@@ -394,7 +546,25 @@ impl AppState {
             net_sort_order: SortOrder::Desc,
             net_filter_input: String::new(),
             net_filter_active: false,
+            containers_selected: 0,
+            containers_scroll_offset: 0,
+            containers_sort_field: ContainerSortField::default(),
+            containers_sort_order: SortOrder::Desc,
+            containers_filter_input: String::new(),
+            containers_filter_active: false,
+            container_cpu_hist: std::collections::HashMap::new(),
+            container_rx_last: std::collections::HashMap::new(),
+            container_rx_hist: std::collections::HashMap::new(),
+            sorted_filtered_containers_cache: Vec::new(),
+            container_engine: None,
+            action_tx,
+            action_rx,
             connection_mode: ConnectionMode::default(),
+            // PERF-H1: start with one redraw scheduled so the first frame is
+            // painted before any event arrives.
+            needs_redraw: true,
+            last_filter_change: None,
+            shutdown_token: CancellationToken::new(),
         }
     }
 
@@ -429,6 +599,8 @@ impl AppState {
     /// Set a status message (auto-expires after STATUS_TIMEOUT_SECS).
     fn set_status(&mut self, msg: String) {
         self.status_message = Some((msg, Instant::now()));
+        // A new status message changes what `draw_root` paints.
+        self.needs_redraw = true;
     }
 
     /// Clear expired status messages.
@@ -440,12 +612,50 @@ impl AppState {
         }
     }
 
+    /// Returns true and clears the status message iff there was an expired
+    /// status message at call time. Used by the event-driven render path
+    /// (PERF-H1) to schedule a final repaint when the bar should disappear
+    /// without spinning at 60 Hz to detect the transition.
+    pub fn status_message_just_expired(&mut self) -> bool {
+        let expired = self
+            .status_message
+            .as_ref()
+            .is_some_and(|(_, t)| t.elapsed().as_secs() >= STATUS_TIMEOUT_SECS);
+        if expired {
+            self.status_message = None;
+        }
+        expired
+    }
+
     pub fn running(&self) -> bool {
         self.running
     }
 
     pub fn quit(&mut self) {
         self.running = false;
+        // PERF-L3: signal in-flight container action tasks to abort instead of
+        // running detached past TUI shutdown. The token is also cloned into
+        // every spawned task at submission time.
+        self.shutdown_token.cancel();
+    }
+
+    /// Mark the TUI as needing a redraw on the next main-loop iteration
+    /// (PERF-H1). Called by every state-mutating handler so the event loop
+    /// can skip `terminal.draw` on idle ticks.
+    fn mark_dirty(&mut self) {
+        self.needs_redraw = true;
+    }
+
+    /// Take + clear the redraw flag. Used by the main loop to decide whether
+    /// to call `terminal.draw` for this iteration.
+    pub fn take_needs_redraw(&mut self) -> bool {
+        std::mem::replace(&mut self.needs_redraw, false)
+    }
+
+    /// Cancellation token cloned into every container action spawn so
+    /// in-flight Stop/Kill/Restart futures abort on TUI shutdown (PERF-L3).
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown_token.clone()
     }
 
     /// Number of visible processes (respects tree_mode).
@@ -479,6 +689,7 @@ impl AppState {
     pub fn item_count(&self) -> usize {
         match self.tab {
             Tab::Network => self.net_interface_count(),
+            Tab::Containers => self.containers_count(),
             _ => self.process_count(),
         }
     }
@@ -487,6 +698,10 @@ impl AppState {
     fn selected_mut(&mut self) -> (&mut usize, &mut usize) {
         match self.tab {
             Tab::Network => (&mut self.net_selected, &mut self.net_scroll_offset),
+            Tab::Containers => (
+                &mut self.containers_selected,
+                &mut self.containers_scroll_offset,
+            ),
             _ => (&mut self.selected, &mut self.scroll_offset),
         }
     }
@@ -500,11 +715,296 @@ impl AppState {
         }
     }
 
+    /// Attach a concrete `ContainerEngine` for use by Stop/Kill/Restart.
+    ///
+    /// Called once by the binary after the engine is built in `main.rs`;
+    /// idempotent on None (kept as None).
+    pub fn set_container_engine(
+        &mut self,
+        engine: std::sync::Arc<dyn muxtop_core::container_engine::ContainerEngine + Send + Sync>,
+    ) {
+        self.container_engine = Some(engine);
+    }
+
+    /// Selected container row (respects filter + sort), if any. Used by the
+    /// action request methods below.
+    pub fn selected_container(&self) -> Option<muxtop_core::containers::ContainerSnapshot> {
+        let snapshot = self.last_snapshot.as_ref()?;
+        let cs = snapshot.containers.as_ref()?;
+        if !cs.daemon_up {
+            return None;
+        }
+        // PERF-H4: read the cache populated by `recompute_containers_view`
+        // (refreshed in `apply_snapshot` and on sort/filter changes) instead
+        // of recomputing the projection on every call.
+        self.sorted_filtered_containers_cache
+            .get(self.containers_selected)
+            .cloned()
+    }
+
+    /// Borrow the cached sorted+filtered container list (PERF-H4). Empty when
+    /// the daemon is down or no snapshot has arrived yet.
+    pub fn sorted_filtered_containers(&self) -> &[muxtop_core::containers::ContainerSnapshot] {
+        &self.sorted_filtered_containers_cache
+    }
+
+    /// Drain outcomes from spawned container action tasks, surfacing them as
+    /// status messages. Called by the TUI main loop every tick.
+    pub fn pump_action_results(&mut self) {
+        let mut had_any = false;
+        while let Ok(msg) = self.action_rx.try_recv() {
+            self.set_status(msg);
+            had_any = true;
+        }
+        // A new status message changes what `draw_root` paints, so coalesce
+        // the redraw here rather than relying on the next event.
+        if had_any {
+            self.mark_dirty();
+        }
+    }
+
+    /// Shared sort+filter pipeline used by both the UI and action layer.
+    /// Now refreshes [`Self::sorted_filtered_containers_cache`] in place
+    /// instead of returning an owned `Vec`.
+    fn recompute_containers_view(&mut self) {
+        use muxtop_core::containers::ContainerSnapshot;
+        self.sorted_filtered_containers_cache.clear();
+
+        let Some(snapshot) = self.last_snapshot.as_ref() else {
+            return;
+        };
+        let Some(cs) = snapshot.containers.as_ref() else {
+            return;
+        };
+        if !cs.daemon_up {
+            return;
+        }
+
+        let mut rows: Vec<ContainerSnapshot> = if self.containers_filter_input.is_empty() {
+            cs.containers.clone()
+        } else {
+            let f = self.containers_filter_input.to_lowercase();
+            cs.containers
+                .iter()
+                .filter(|c| {
+                    c.name.to_lowercase().contains(&f)
+                        || c.image.to_lowercase().contains(&f)
+                        || c.id.to_lowercase().contains(&f)
+                })
+                .cloned()
+                .collect()
+        };
+        match self.containers_sort_field {
+            ContainerSortField::Name => rows.sort_by(|a, b| a.name.cmp(&b.name)),
+            ContainerSortField::Cpu => rows.sort_by(|a, b| {
+                b.cpu_pct
+                    .partial_cmp(&a.cpu_pct)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+            ContainerSortField::Mem => rows.sort_by_key(|c| std::cmp::Reverse(c.mem_used_bytes)),
+            ContainerSortField::NetRx => rows.sort_by_key(|c| std::cmp::Reverse(c.net_rx_bytes)),
+            ContainerSortField::NetTx => rows.sort_by_key(|c| std::cmp::Reverse(c.net_tx_bytes)),
+            ContainerSortField::Uptime => rows.sort_by_key(|c| c.started_at_ms),
+        }
+        let is_asc = matches!(self.containers_sort_order, SortOrder::Asc);
+        let is_name = matches!(self.containers_sort_field, ContainerSortField::Name);
+        let is_uptime = matches!(self.containers_sort_field, ContainerSortField::Uptime);
+        let default_asc = is_name || is_uptime;
+        if is_asc != default_asc {
+            rows.reverse();
+        }
+        self.sorted_filtered_containers_cache = rows;
+    }
+
+    fn request_container_action(&mut self, build: impl FnOnce(String, String) -> ConfirmAction) {
+        if self.is_remote() {
+            self.set_status("Actions disabled in remote mode".into());
+            return;
+        }
+        if let Some(c) = self.selected_container() {
+            // LOW-S3 / Slice C follow-up: pass the FULL 64-char container ID
+            // to the engine so calls survive collisions on the 12-char short
+            // prefix. The confirm prompt still renders the short prefix via
+            // `short_id` for readability.
+            self.confirm = Some(build(c.id_full.clone(), c.name.clone()));
+        }
+    }
+
+    /// F9 — graceful stop (SIGTERM + grace).
+    pub fn request_container_stop(&mut self) {
+        self.request_container_action(|id, name| ConfirmAction::StopContainer { id, name });
+    }
+
+    /// F10 — force kill (SIGKILL).
+    pub fn request_container_kill(&mut self) {
+        self.request_container_action(|id, name| ConfirmAction::KillContainer { id, name });
+    }
+
+    /// F11 — restart.
+    pub fn request_container_restart(&mut self) {
+        self.request_container_action(|id, name| ConfirmAction::RestartContainer { id, name });
+    }
+
+    /// Execute a confirmed container action by spawning a tokio task.
+    ///
+    /// PERF-L3: each spawn carries a clone of the AppState's
+    /// [`CancellationToken`] and races the engine future against the token
+    /// in `tokio::select!`. On TUI shutdown the future is dropped within the
+    /// next scheduler tick rather than running detached.
+    fn execute_container_action(&mut self, action: ConfirmAction) {
+        let Some(engine) = self.container_engine.clone() else {
+            self.set_status("Container engine not configured".into());
+            return;
+        };
+        let tx = self.action_tx.clone();
+        let token = self.shutdown_token.clone();
+        match action {
+            ConfirmAction::StopContainer { id, name } => {
+                tokio::spawn(async move {
+                    let msg = tokio::select! {
+                        biased;
+                        _ = token.cancelled() => return,
+                        result = engine.stop(&id, Some(10)) => match result {
+                            Ok(()) => format!("Container {name} stopped"),
+                            Err(e) => format!("Failed to stop {name}: {e}"),
+                        },
+                    };
+                    let _ = tx.send(msg);
+                });
+            }
+            ConfirmAction::KillContainer { id, name } => {
+                tokio::spawn(async move {
+                    let msg = tokio::select! {
+                        biased;
+                        _ = token.cancelled() => return,
+                        result = engine.kill(&id) => match result {
+                            Ok(()) => format!("Container {name} killed"),
+                            Err(e) => format!("Failed to kill {name}: {e}"),
+                        },
+                    };
+                    let _ = tx.send(msg);
+                });
+            }
+            ConfirmAction::RestartContainer { id, name } => {
+                tokio::spawn(async move {
+                    let msg = tokio::select! {
+                        biased;
+                        _ = token.cancelled() => return,
+                        result = engine.restart(&id) => match result {
+                            Ok(()) => format!("Container {name} restarted"),
+                            Err(e) => format!("Failed to restart {name}: {e}"),
+                        },
+                    };
+                    let _ = tx.send(msg);
+                });
+            }
+            _ => unreachable!("execute_container_action only handles container variants"),
+        }
+    }
+
     /// Update the snapshot and recompute derived views.
     pub fn apply_snapshot(&mut self, snapshot: SystemSnapshot) {
         self.network_history.push(snapshot.networks.clone());
+        if let Some(cs) = snapshot.containers.as_ref() {
+            self.push_container_history(cs);
+        }
         self.last_snapshot = Some(snapshot);
         self.recompute_visible();
+        // PERF-H4: refresh the cached sorted+filtered container view exactly
+        // once per snapshot; render and action paths read this slice.
+        self.recompute_containers_view();
+        // PERF-H1: a fresh snapshot always changes what we'd paint.
+        self.mark_dirty();
+    }
+
+    /// Per-container sparkline history cap — 60 samples, enough to fill the
+    /// widest terminals while keeping memory tiny.
+    const CONTAINER_HISTORY_LEN: usize = 60;
+
+    /// Update CPU% + RX-delta rings for every container in `cs`. Containers
+    /// that have disappeared since the last snapshot get their histories
+    /// dropped to avoid unbounded growth.
+    fn push_container_history(&mut self, cs: &muxtop_core::containers::ContainersSnapshot) {
+        use std::collections::{HashMap, VecDeque};
+        let mut seen = std::collections::HashSet::<String>::with_capacity(cs.containers.len());
+
+        for c in &cs.containers {
+            seen.insert(c.id.clone());
+
+            // CPU ring.
+            let cpu_ring = self
+                .container_cpu_hist
+                .entry(c.id.clone())
+                .or_insert_with(|| VecDeque::with_capacity(Self::CONTAINER_HISTORY_LEN));
+            if cpu_ring.len() >= Self::CONTAINER_HISTORY_LEN {
+                cpu_ring.pop_front();
+            }
+            cpu_ring.push_back(c.cpu_pct);
+
+            // RX delta vs last cumulative value.
+            let last = self.container_rx_last.get(&c.id).copied();
+            let delta = match last {
+                Some(prev) => c.net_rx_bytes.saturating_sub(prev),
+                None => 0,
+            };
+            self.container_rx_last.insert(c.id.clone(), c.net_rx_bytes);
+
+            let rx_ring = self
+                .container_rx_hist
+                .entry(c.id.clone())
+                .or_insert_with(|| VecDeque::with_capacity(Self::CONTAINER_HISTORY_LEN));
+            if rx_ring.len() >= Self::CONTAINER_HISTORY_LEN {
+                rx_ring.pop_front();
+            }
+            rx_ring.push_back(delta);
+        }
+
+        // Drop entries for containers that no longer exist.
+        fn drop_missing<V>(map: &mut HashMap<String, V>, seen: &std::collections::HashSet<String>) {
+            map.retain(|k, _| seen.contains(k));
+        }
+        drop_missing(&mut self.container_cpu_hist, &seen);
+        drop_missing(&mut self.container_rx_hist, &seen);
+        drop_missing(&mut self.container_rx_last, &seen);
+    }
+
+    /// CPU% history slice for the given container id. Empty when unknown.
+    pub fn container_cpu_history(&self, id: &str) -> Vec<f32> {
+        self.container_cpu_hist
+            .get(id)
+            .map(|r| r.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// RX delta history (bytes per tick) for the given container id.
+    pub fn container_rx_deltas(&self, id: &str) -> Vec<u64> {
+        self.container_rx_hist
+            .get(id)
+            .map(|r| r.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Visible container count (respects filter).
+    pub fn containers_count(&self) -> usize {
+        let Some(ref snapshot) = self.last_snapshot else {
+            return 0;
+        };
+        let Some(ref cs) = snapshot.containers else {
+            return 0;
+        };
+        if self.containers_filter_input.is_empty() {
+            cs.containers.len()
+        } else {
+            let f = self.containers_filter_input.to_lowercase();
+            cs.containers
+                .iter()
+                .filter(|c| {
+                    c.name.to_lowercase().contains(&f)
+                        || c.image.to_lowercase().contains(&f)
+                        || c.id.to_lowercase().contains(&f)
+                })
+                .count()
+        }
     }
 
     /// Recompute visible_processes and visible_tree from last_snapshot.
@@ -518,20 +1018,22 @@ impl AppState {
         // Filter
         let filtered = filter_processes(&snapshot.processes, &self.filter_input);
 
-        // Sort
-        let mut sorted = filtered;
-        sort_processes(&mut sorted, self.sort_field, self.sort_order);
-        self.visible_processes = sorted;
-
         // Tree — only build when tree_mode is active (G-09: skip when off).
         // G-07: tree is built from filtered list, not raw snapshot.
+        // PERF-H3: reuse the `filtered` Vec we just produced instead of
+        // re-running `filter_processes` (which previously cost an entire
+        // O(N) lower-case + contains scan a second time per recompute).
         if self.tree_mode {
-            let tree =
-                build_process_tree(&filter_processes(&snapshot.processes, &self.filter_input));
+            let tree = build_process_tree(&filtered);
             self.visible_tree = flatten_tree(&tree);
         } else {
             self.visible_tree.clear();
         }
+
+        // Sort (consumes `filtered` last so the tree above can borrow it).
+        let mut sorted = filtered;
+        sort_processes(&mut sorted, self.sort_field, self.sort_order);
+        self.visible_processes = sorted;
 
         // Clamp selection and scroll_offset (G-06).
         let count = self.process_count();
@@ -541,6 +1043,20 @@ impl AppState {
         } else {
             self.selected = 0;
             self.scroll_offset = 0;
+        }
+    }
+
+    /// Re-run [`Self::recompute_visible`] iff at least [`FILTER_DEBOUNCE`]
+    /// has elapsed since the last filter keystroke (PERF-H3). Bursts of fast
+    /// typing therefore coalesce into one pipeline run instead of N.
+    fn recompute_visible_debounced(&mut self) {
+        let now = Instant::now();
+        let should_recompute = self
+            .last_filter_change
+            .is_none_or(|last| now.duration_since(last) >= FILTER_DEBOUNCE);
+        self.last_filter_change = Some(now);
+        if should_recompute {
+            self.recompute_visible();
         }
     }
 
@@ -562,7 +1078,7 @@ impl AppState {
         }
 
         // Filter mode captures most keys as text input.
-        if self.filter_active || self.net_filter_active {
+        if self.filter_active || self.net_filter_active || self.containers_filter_active {
             self.handle_filter_key(key);
             return;
         }
@@ -620,6 +1136,9 @@ impl AppState {
             KeyCode::Char('3') if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.tab = Tab::Network;
             }
+            KeyCode::Char('4') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.tab = Tab::Containers;
+            }
 
             // Arrow tab navigation
             KeyCode::Right => {
@@ -646,28 +1165,42 @@ impl AppState {
             }
 
             // Sort cycling (tab-aware)
-            KeyCode::Char('s') => {
-                if self.tab == Tab::Network {
+            KeyCode::Char('s') => match self.tab {
+                Tab::Network => {
                     self.net_sort_field = next_net_sort_field(self.net_sort_field);
-                } else {
+                }
+                Tab::Containers => {
+                    self.containers_sort_field =
+                        next_container_sort_field(self.containers_sort_field);
+                    self.recompute_containers_view();
+                }
+                _ => {
                     self.sort_field = next_sort_field(self.sort_field);
                     self.recompute_visible();
                 }
-            }
-            KeyCode::Char('S') | KeyCode::Char('I') => {
-                if self.tab == Tab::Network {
+            },
+            KeyCode::Char('S') | KeyCode::Char('I') => match self.tab {
+                Tab::Network => {
                     self.net_sort_order = match self.net_sort_order {
                         SortOrder::Asc => SortOrder::Desc,
                         SortOrder::Desc => SortOrder::Asc,
                     };
-                } else {
+                }
+                Tab::Containers => {
+                    self.containers_sort_order = match self.containers_sort_order {
+                        SortOrder::Asc => SortOrder::Desc,
+                        SortOrder::Desc => SortOrder::Asc,
+                    };
+                    self.recompute_containers_view();
+                }
+                _ => {
                     self.sort_order = match self.sort_order {
                         SortOrder::Asc => SortOrder::Desc,
                         SortOrder::Desc => SortOrder::Asc,
                     };
                     self.recompute_visible();
                 }
-            }
+            },
 
             // F-key sort shortcuts
             KeyCode::F(1) => {
@@ -725,26 +1258,46 @@ impl AppState {
                 }
             }
 
+            // Container actions — F9 Stop, F10 Kill, F11 Restart (Containers
+            // tab, local only). `request_container_*` handles the remote-mode
+            // notice internally.
+            KeyCode::F(9) if self.tab == Tab::Containers => {
+                self.request_container_stop();
+            }
+            KeyCode::F(10) if self.tab == Tab::Containers => {
+                self.request_container_kill();
+            }
+            KeyCode::F(11) if self.tab == Tab::Containers => {
+                self.request_container_restart();
+            }
+
             // Clear filter with Esc (when not in filter input mode)
-            KeyCode::Esc => {
-                if self.tab == Tab::Network {
+            KeyCode::Esc => match self.tab {
+                Tab::Network => {
                     if !self.net_filter_input.is_empty() {
                         self.net_filter_input.clear();
                     }
-                } else if !self.filter_input.is_empty() {
-                    self.filter_input.clear();
-                    self.recompute_visible();
                 }
-            }
+                Tab::Containers => {
+                    if !self.containers_filter_input.is_empty() {
+                        self.containers_filter_input.clear();
+                        self.recompute_containers_view();
+                    }
+                }
+                _ => {
+                    if !self.filter_input.is_empty() {
+                        self.filter_input.clear();
+                        self.recompute_visible();
+                    }
+                }
+            },
 
             // Filter mode (tab-aware)
-            KeyCode::Char('/') => {
-                if self.tab == Tab::Network {
-                    self.net_filter_active = true;
-                } else {
-                    self.filter_active = true;
-                }
-            }
+            KeyCode::Char('/') => match self.tab {
+                Tab::Network => self.net_filter_active = true,
+                Tab::Containers => self.containers_filter_active = true,
+                _ => self.filter_active = true,
+            },
 
             // Command palette toggle
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -822,6 +1375,11 @@ impl AppState {
                     Err(e) => self.set_status(format!("Renice failed: {e}")),
                 }
             }
+            action @ (ConfirmAction::StopContainer { .. }
+            | ConfirmAction::KillContainer { .. }
+            | ConfirmAction::RestartContainer { .. }) => {
+                self.execute_container_action(action);
+            }
         }
     }
 
@@ -898,6 +1456,9 @@ impl AppState {
         Command::ForceKillProcess,
         Command::NiceDown,
         Command::NiceUp,
+        Command::StopContainer,
+        Command::KillContainer,
+        Command::RestartContainer,
     ];
 
     /// Execute a command from the palette.
@@ -982,14 +1543,14 @@ impl AppState {
                     self.request_renice(-1);
                 }
             }
-            Command::ClearFilter => {
-                if self.tab == Tab::Network {
-                    self.net_filter_input.clear();
-                } else {
+            Command::ClearFilter => match self.tab {
+                Tab::Network => self.net_filter_input.clear(),
+                Tab::Containers => self.containers_filter_input.clear(),
+                _ => {
                     self.filter_input.clear();
                     self.recompute_visible();
                 }
-            }
+            },
             Command::SwitchToNetwork => {
                 self.tab = Tab::Network;
             }
@@ -1005,6 +1566,28 @@ impl AppState {
             Command::SortNetByErrors => {
                 self.net_sort_field = NetworkSortField::Errors;
             }
+            Command::SwitchToContainers => {
+                self.tab = Tab::Containers;
+            }
+            Command::SortContainersByCpu => {
+                self.containers_sort_field = ContainerSortField::Cpu;
+                self.recompute_containers_view();
+            }
+            Command::SortContainersByMem => {
+                self.containers_sort_field = ContainerSortField::Mem;
+                self.recompute_containers_view();
+            }
+            Command::SortContainersByName => {
+                self.containers_sort_field = ContainerSortField::Name;
+                self.recompute_containers_view();
+            }
+            Command::SortContainersByNetRx => {
+                self.containers_sort_field = ContainerSortField::NetRx;
+                self.recompute_containers_view();
+            }
+            Command::StopContainer => self.request_container_stop(),
+            Command::KillContainer => self.request_container_kill(),
+            Command::RestartContainer => self.request_container_restart(),
         }
     }
 
@@ -1038,21 +1621,42 @@ impl AppState {
             return;
         }
 
+        if self.containers_filter_active {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.containers_filter_active = false;
+                }
+                KeyCode::Backspace => {
+                    self.containers_filter_input.pop();
+                    self.recompute_containers_view();
+                }
+                KeyCode::Char(c) if self.containers_filter_input.len() < Self::MAX_FILTER_LEN => {
+                    self.containers_filter_input.push(c);
+                    self.recompute_containers_view();
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match key.code {
             KeyCode::Esc => {
                 self.filter_active = false;
             }
             KeyCode::Enter => {
                 self.filter_active = false;
-                // Keep filter_input — it stays applied.
+                // Keep filter_input — it stays applied. Drop debounce so the
+                // visible list is in sync the moment the user commits.
+                self.last_filter_change = None;
+                self.recompute_visible();
             }
             KeyCode::Backspace => {
                 self.filter_input.pop();
-                self.recompute_visible();
+                self.recompute_visible_debounced();
             }
             KeyCode::Char(c) if self.filter_input.len() < Self::MAX_FILTER_LEN => {
                 self.filter_input.push(c);
-                self.recompute_visible();
+                self.recompute_visible_debounced();
             }
             _ => {}
         }
@@ -1093,6 +1697,18 @@ fn next_net_sort_field(field: NetworkSortField) -> NetworkSortField {
         NetworkSortField::Errors => NetworkSortField::TotalRx,
         NetworkSortField::TotalRx => NetworkSortField::TotalTx,
         NetworkSortField::TotalTx => NetworkSortField::RxRate,
+    }
+}
+
+/// Cycle to the next container sort field.
+fn next_container_sort_field(field: ContainerSortField) -> ContainerSortField {
+    match field {
+        ContainerSortField::Cpu => ContainerSortField::Mem,
+        ContainerSortField::Mem => ContainerSortField::Name,
+        ContainerSortField::Name => ContainerSortField::NetRx,
+        ContainerSortField::NetRx => ContainerSortField::NetTx,
+        ContainerSortField::NetTx => ContainerSortField::Uptime,
+        ContainerSortField::Uptime => ContainerSortField::Cpu,
     }
 }
 
@@ -1141,6 +1757,7 @@ mod tests {
                 total_rx: 0,
                 total_tx: 0,
             },
+            containers: None,
             timestamp_ms: 0,
         }
     }
@@ -1156,14 +1773,16 @@ mod tests {
     fn test_tab_next_cycles() {
         assert_eq!(Tab::General.next(), Tab::Processes);
         assert_eq!(Tab::Processes.next(), Tab::Network);
-        assert_eq!(Tab::Network.next(), Tab::General);
+        assert_eq!(Tab::Network.next(), Tab::Containers);
+        assert_eq!(Tab::Containers.next(), Tab::General);
     }
 
     #[test]
     fn test_tab_prev_cycles() {
+        assert_eq!(Tab::Containers.prev(), Tab::Network);
         assert_eq!(Tab::Network.prev(), Tab::Processes);
         assert_eq!(Tab::Processes.prev(), Tab::General);
-        assert_eq!(Tab::General.prev(), Tab::Network);
+        assert_eq!(Tab::General.prev(), Tab::Containers);
     }
 
     #[test]
@@ -1171,6 +1790,7 @@ mod tests {
         assert_eq!(Tab::General.label(), "General");
         assert_eq!(Tab::Processes.label(), "Processes");
         assert_eq!(Tab::Network.label(), "Network");
+        assert_eq!(Tab::Containers.label(), "Containers");
     }
 
     #[test]
@@ -1178,6 +1798,7 @@ mod tests {
         assert_eq!(format!("{}", Tab::General), "General");
         assert_eq!(format!("{}", Tab::Processes), "Processes");
         assert_eq!(format!("{}", Tab::Network), "Network");
+        assert_eq!(format!("{}", Tab::Containers), "Containers");
     }
 
     #[test]
@@ -1185,7 +1806,8 @@ mod tests {
         assert!(Tab::ALL.contains(&Tab::General));
         assert!(Tab::ALL.contains(&Tab::Processes));
         assert!(Tab::ALL.contains(&Tab::Network));
-        assert_eq!(Tab::ALL.len(), 3);
+        assert!(Tab::ALL.contains(&Tab::Containers));
+        assert_eq!(Tab::ALL.len(), 4);
     }
 
     // -- AppState defaults (STORY-02) --
@@ -1430,6 +2052,8 @@ mod tests {
         app.handle_key_event(key(KeyCode::Tab));
         assert_eq!(app.tab, Tab::Network);
         app.handle_key_event(key(KeyCode::Tab));
+        assert_eq!(app.tab, Tab::Containers);
+        app.handle_key_event(key(KeyCode::Tab));
         assert_eq!(app.tab, Tab::General);
     }
 
@@ -1437,7 +2061,7 @@ mod tests {
     fn test_backtab_switch() {
         let mut app = AppState::new();
         app.handle_key_event(key(KeyCode::BackTab));
-        assert_eq!(app.tab, Tab::Network);
+        assert_eq!(app.tab, Tab::Containers);
     }
 
     #[test]
@@ -1595,13 +2219,13 @@ mod tests {
         let mut app = AppState::new();
         assert_eq!(app.tab, Tab::General);
         app.handle_key_event(key(KeyCode::Left));
-        assert_eq!(app.tab, Tab::Network);
+        assert_eq!(app.tab, Tab::Containers);
     }
 
     #[test]
     fn test_tab_right_arrow_wraps() {
         let mut app = AppState::new();
-        app.tab = Tab::Network;
+        app.tab = Tab::Containers;
         app.handle_key_event(key(KeyCode::Right));
         assert_eq!(app.tab, Tab::General);
     }
@@ -2476,6 +3100,353 @@ mod tests {
         assert!(
             cmds.contains(&Command::NiceDown),
             "NiceDown should be in local palette"
+        );
+    }
+
+    // ─── Container actions (E6) ───────────────────────────────────────────
+
+    fn make_snapshot_with_container(id: &str, name: &str) -> muxtop_core::system::SystemSnapshot {
+        use muxtop_core::containers::{
+            ContainerSnapshot, ContainerState, ContainersSnapshot, EngineKind,
+        };
+        use muxtop_core::network::NetworkSnapshot;
+        use muxtop_core::system::{CpuSnapshot, LoadSnapshot, MemorySnapshot, SystemSnapshot};
+
+        SystemSnapshot {
+            cpu: CpuSnapshot {
+                global_usage: 0.0,
+                cores: vec![],
+            },
+            memory: MemorySnapshot {
+                total: 0,
+                used: 0,
+                available: 0,
+                swap_total: 0,
+                swap_used: 0,
+            },
+            load: LoadSnapshot {
+                one: 0.0,
+                five: 0.0,
+                fifteen: 0.0,
+                uptime_secs: 0,
+            },
+            processes: vec![],
+            networks: NetworkSnapshot {
+                interfaces: vec![],
+                total_rx: 0,
+                total_tx: 0,
+            },
+            containers: Some(ContainersSnapshot {
+                engine: EngineKind::Docker,
+                daemon_up: true,
+                containers: vec![ContainerSnapshot {
+                    id: id.into(),
+                    id_full: id.into(),
+                    name: name.into(),
+                    image: "nginx:1.27".into(),
+                    state: ContainerState::Running,
+                    status_text: "Up 1 minute".into(),
+                    cpu_pct: 1.5,
+                    mem_used_bytes: 0,
+                    mem_limit_bytes: 0,
+                    net_rx_bytes: 0,
+                    net_tx_bytes: 0,
+                    block_read_bytes: 0,
+                    block_write_bytes: 0,
+                    started_at_ms: 1_700_000_000_000,
+                }],
+            }),
+            timestamp_ms: 1_700_000_000_000,
+        }
+    }
+
+    #[test]
+    fn test_container_stop_opens_confirm() {
+        let mut app = AppState::new();
+        app.tab = Tab::Containers;
+        app.apply_snapshot(make_snapshot_with_container("abc123def456", "my-nginx"));
+        app.handle_key_event(key(KeyCode::F(9)));
+        match &app.confirm {
+            Some(ConfirmAction::StopContainer { id, name }) => {
+                assert_eq!(id, "abc123def456");
+                assert_eq!(name, "my-nginx");
+            }
+            other => panic!("expected StopContainer confirm dialog, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_container_kill_opens_confirm() {
+        let mut app = AppState::new();
+        app.tab = Tab::Containers;
+        app.apply_snapshot(make_snapshot_with_container("abc", "svc"));
+        app.handle_key_event(key(KeyCode::F(10)));
+        assert!(matches!(
+            app.confirm,
+            Some(ConfirmAction::KillContainer { .. })
+        ));
+    }
+
+    #[test]
+    fn test_container_restart_opens_confirm() {
+        let mut app = AppState::new();
+        app.tab = Tab::Containers;
+        app.apply_snapshot(make_snapshot_with_container("abc", "svc"));
+        app.handle_key_event(key(KeyCode::F(11)));
+        assert!(matches!(
+            app.confirm,
+            Some(ConfirmAction::RestartContainer { .. })
+        ));
+    }
+
+    #[test]
+    fn test_container_actions_disabled_in_remote_mode() {
+        let mut app = make_remote_app();
+        app.tab = Tab::Containers;
+        app.apply_snapshot(make_snapshot_with_container("abc", "svc"));
+        app.handle_key_event(key(KeyCode::F(9)));
+        assert!(app.confirm.is_none(), "confirm dialog should not open");
+        assert!(
+            app.active_status()
+                .is_some_and(|s| s.contains("disabled in remote")),
+            "expected remote-mode notice, got {:?}",
+            app.active_status()
+        );
+    }
+
+    #[test]
+    fn test_container_action_on_other_tabs_ignored() {
+        let mut app = AppState::new();
+        app.apply_snapshot(make_snapshot_with_container("abc", "svc"));
+        for tab in [Tab::General, Tab::Processes, Tab::Network] {
+            app.tab = tab;
+            app.confirm = None;
+            app.handle_key_event(key(KeyCode::F(11)));
+            assert!(
+                app.confirm.is_none(),
+                "F11 on {tab:?} must not open a container confirm"
+            );
+        }
+    }
+
+    #[test]
+    fn test_palette_excludes_container_actions_in_remote() {
+        let mut app = make_remote_app();
+        app.open_palette();
+        let cmds: Vec<Command> = app.palette.filtered.iter().map(|(c, _)| *c).collect();
+        assert!(!cmds.contains(&Command::StopContainer));
+        assert!(!cmds.contains(&Command::KillContainer));
+        assert!(!cmds.contains(&Command::RestartContainer));
+    }
+
+    #[test]
+    fn test_palette_includes_container_actions_in_local() {
+        let mut app = AppState::new();
+        app.open_palette();
+        let cmds: Vec<Command> = app.palette.filtered.iter().map(|(c, _)| *c).collect();
+        assert!(cmds.contains(&Command::StopContainer));
+        assert!(cmds.contains(&Command::KillContainer));
+        assert!(cmds.contains(&Command::RestartContainer));
+    }
+
+    #[tokio::test]
+    async fn test_execute_container_without_engine_sets_status() {
+        let mut app = AppState::new();
+        app.tab = Tab::Containers;
+        app.apply_snapshot(make_snapshot_with_container("abc", "svc"));
+        app.handle_key_event(key(KeyCode::F(9)));
+        app.handle_key_event(key(KeyCode::Char('y')));
+        assert!(app.confirm.is_none());
+        assert!(
+            app.active_status()
+                .is_some_and(|s| s.contains("not configured")),
+            "expected 'not configured' status, got {:?}",
+            app.active_status()
+        );
+    }
+
+    #[test]
+    fn test_confirm_action_prompt_mentions_container_name() {
+        let prompt = ConfirmAction::StopContainer {
+            id: "abcdef123456789".into(),
+            name: "nginx".into(),
+        }
+        .prompt();
+        assert!(prompt.contains("Stop"));
+        assert!(prompt.contains("nginx"));
+        assert!(prompt.contains("abcdef123456"));
+    }
+
+    // ─── Slice D perf coverage ────────────────────────────────────────────
+
+    /// PERF-H1 — `Event::Tick` must not invalidate the rendered frame.
+    /// `take_needs_redraw` is the single source of truth used by the main
+    /// loop to decide whether to call `terminal.draw`. After a fresh
+    /// snapshot the flag is set; once the loop drains it, an `Event::Tick`
+    /// alone (mirrored here as zero state mutation) keeps the flag clear.
+    #[test]
+    fn test_tick_does_not_request_redraw() {
+        let mut app = AppState::new();
+        // First flag is the "paint the initial frame" hint set in `new()`.
+        assert!(app.take_needs_redraw());
+        // Drain again — no further redraws scheduled.
+        assert!(!app.take_needs_redraw());
+
+        // A snapshot SHOULD schedule a redraw (mirrors the main loop's
+        // Snapshot arm).
+        app.apply_snapshot(make_snapshot(vec![]));
+        assert!(app.take_needs_redraw());
+
+        // Without any further events, the equivalent of an `Event::Tick`
+        // (no state mutation) leaves the flag clear — the main loop will
+        // skip `terminal.draw` for that iteration.
+        assert!(!app.take_needs_redraw());
+    }
+
+    /// PERF-H1 — async container action completion arms a redraw via
+    /// `pump_action_results` so the bottom-bar status surfaces without
+    /// waiting for the next key press.
+    #[test]
+    fn test_pump_action_results_marks_dirty() {
+        let mut app = AppState::new();
+        let _ = app.take_needs_redraw(); // drain seed flag
+        // Inject a synthetic action outcome.
+        app.action_tx.send("kill ok".into()).unwrap();
+        app.pump_action_results();
+        assert!(app.take_needs_redraw(), "action outcome must arm redraw");
+        assert_eq!(app.active_status(), Some("kill ok"));
+    }
+
+    /// PERF-H1 — when the status message expires, the main loop schedules
+    /// one final repaint via `status_message_just_expired`.
+    #[test]
+    fn test_status_message_just_expired_returns_true_and_clears() {
+        let mut app = AppState::new();
+        // Seed an artificially-old status message.
+        app.status_message = Some(("old".into(), Instant::now() - Duration::from_secs(60)));
+        assert!(app.status_message_just_expired());
+        assert!(app.status_message.is_none());
+        // Subsequent calls return false so the main loop doesn't loop-paint.
+        assert!(!app.status_message_just_expired());
+    }
+
+    /// PERF-H4 — `apply_snapshot` populates the cached projection and
+    /// `selected_container` reads from that cache.
+    #[test]
+    fn test_apply_snapshot_populates_container_cache() {
+        let mut app = AppState::new();
+        assert!(app.sorted_filtered_containers().is_empty());
+        app.apply_snapshot(make_snapshot_with_container("abc", "svc"));
+        let rows = app.sorted_filtered_containers();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "svc");
+        // selected_container reads from the cache.
+        assert_eq!(app.selected_container().unwrap().name, "svc");
+    }
+
+    /// PERF-H4 — switching sort field eagerly refreshes the cache so the
+    /// next render sees the new ordering with no extra projection cost.
+    #[test]
+    fn test_sort_change_refreshes_container_cache() {
+        let mut app = AppState::new();
+        app.tab = Tab::Containers;
+        // Two containers with different CPU values so Cpu desc and Mem desc
+        // produce opposite orderings.
+        let mut snap = make_snapshot_with_container("a-id", "alpha");
+        if let Some(cs) = snap.containers.as_mut() {
+            cs.containers[0].cpu_pct = 1.0;
+            cs.containers[0].mem_used_bytes = 9_000;
+            cs.containers
+                .push(muxtop_core::containers::ContainerSnapshot {
+                    id: "b-id".into(),
+                    id_full: "b-id".into(),
+                    name: "bravo".into(),
+                    image: "img".into(),
+                    state: muxtop_core::containers::ContainerState::Running,
+                    status_text: "Up".into(),
+                    cpu_pct: 99.0,
+                    mem_used_bytes: 1_000,
+                    mem_limit_bytes: 0,
+                    net_rx_bytes: 0,
+                    net_tx_bytes: 0,
+                    block_read_bytes: 0,
+                    block_write_bytes: 0,
+                    started_at_ms: 0,
+                });
+        }
+        app.apply_snapshot(snap);
+        // Default sort is Cpu desc → bravo (cpu=99) first.
+        assert_eq!(app.sorted_filtered_containers()[0].name, "bravo");
+        // Cycle 's' once → Mem desc, where alpha (mem=9000) leads.
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(app.sorted_filtered_containers()[0].name, "alpha");
+    }
+
+    /// PERF-L3 — `quit()` cancels the shared shutdown token so spawned
+    /// container action tasks unwind via their `tokio::select!` arm.
+    #[test]
+    fn test_quit_cancels_shutdown_token() {
+        let mut app = AppState::new();
+        let token = app.shutdown_token();
+        assert!(!token.is_cancelled());
+        app.quit();
+        assert!(token.is_cancelled());
+    }
+
+    /// PERF-M3 — palette filtering reuses its `Matcher`. After the first
+    /// non-empty `refilter`, the matcher slot must be `Some(_)`.
+    #[test]
+    fn test_palette_matcher_is_cached() {
+        let mut ps = PaletteState::new();
+        assert!(ps.matcher.is_none());
+        ps.input = "sort".into();
+        ps.refilter();
+        assert!(
+            ps.matcher.is_some(),
+            "matcher should be cached after first use"
+        );
+        // Subsequent refilters reuse the same instance — assert no panic and
+        // results stay consistent.
+        ps.refilter();
+        assert!(!ps.filtered.is_empty());
+    }
+
+    /// PERF-H3 — `recompute_visible_debounced` collapses bursts of
+    /// keystrokes into a single recompute. Two back-to-back calls inside
+    /// the debounce window only trigger one pipeline run; the second
+    /// keystroke's filter change is therefore NOT yet visible until either
+    /// the debounce window elapses or the user commits via Enter.
+    #[test]
+    fn test_filter_debounce_coalesces_bursts() {
+        let mut app = AppState::new();
+        app.apply_snapshot(make_snapshot(vec![
+            make_process(1, "firefox", 10.0, 100),
+            make_process(2, "kitty", 20.0, 200),
+            make_process(3, "tmux", 5.0, 50),
+        ]));
+        // Type "f": "firefox" matches.
+        app.filter_input.push('f');
+        app.recompute_visible_debounced();
+        assert_eq!(app.visible_processes.len(), 1);
+        assert_eq!(app.visible_processes[0].name, "firefox");
+        // Immediately type "k": within the debounce window, the visible
+        // list does NOT yet reflect the new "fk" filter (which would match
+        // nothing) — debounce held off the work.
+        app.filter_input.push('k');
+        app.recompute_visible_debounced();
+        assert_eq!(
+            app.visible_processes.len(),
+            1,
+            "burst should be coalesced — the in-flight `fk` filter has NOT been applied yet"
+        );
+        // Synchronous recompute path (e.g. user hits Enter) commits the
+        // pending change.
+        app.last_filter_change = None;
+        app.recompute_visible();
+        assert_eq!(
+            app.visible_processes.len(),
+            0,
+            "after debounce flush the `fk` filter matches nothing"
         );
     }
 }

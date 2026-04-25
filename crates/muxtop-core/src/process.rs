@@ -84,8 +84,36 @@ pub fn sort_processes(procs: &mut [ProcessInfo], field: SortField, order: SortOr
     }
 }
 
+/// ASCII-fast case-insensitive substring test.
+///
+/// PERF-M2: when both `haystack` and `needle` are pure ASCII (the
+/// overwhelmingly common case for process / container / interface names) we
+/// can skip the per-call `String` allocation that `haystack.to_lowercase()`
+/// requires. Falls back to the allocating Unicode path only when at least
+/// one side carries non-ASCII bytes.
+fn contains_ignore_case(haystack: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    if needle_lower.is_ascii() && haystack.is_ascii() {
+        let needle = needle_lower.as_bytes();
+        let bytes = haystack.as_bytes();
+        if bytes.len() < needle.len() {
+            return false;
+        }
+        bytes
+            .windows(needle.len())
+            .any(|w| w.iter().zip(needle).all(|(a, b)| a.eq_ignore_ascii_case(b)))
+    } else {
+        haystack.to_lowercase().contains(needle_lower)
+    }
+}
+
 /// Returns a new `Vec` containing every process whose `name` or `command`
 /// contains `pattern` (case-insensitive). An empty pattern matches everything.
+///
+/// PERF-M2: filter pattern is lowercased once per call; per-process
+/// comparison uses an allocation-free ASCII fast path.
 pub fn filter_processes(procs: &[ProcessInfo], pattern: &str) -> Vec<ProcessInfo> {
     if pattern.is_empty() {
         return procs.to_vec();
@@ -94,7 +122,7 @@ pub fn filter_processes(procs: &[ProcessInfo], pattern: &str) -> Vec<ProcessInfo
     procs
         .iter()
         .filter(|p| {
-            p.name.to_lowercase().contains(&lower) || p.command.to_lowercase().contains(&lower)
+            contains_ignore_case(&p.name, &lower) || contains_ignore_case(&p.command, &lower)
         })
         .cloned()
         .collect()
@@ -324,6 +352,25 @@ mod tests {
         let procs = cpu_procs();
         let result = filter_processes(&procs, "zzznomatch");
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_contains_ignore_case_ascii() {
+        // PERF-M2: ASCII fast path matches mixed-case substrings without
+        // allocation.
+        assert!(contains_ignore_case("Firefox", "fire"));
+        assert!(contains_ignore_case("FIREFOX-esr", "fox"));
+        assert!(!contains_ignore_case("chrome", "edge"));
+        assert!(contains_ignore_case("anything", "")); // empty needle
+        assert!(!contains_ignore_case("ab", "abc")); // shorter haystack
+    }
+
+    #[test]
+    fn test_contains_ignore_case_unicode_falls_back() {
+        // Non-ASCII routes through the allocating Unicode path; result must
+        // still be correct (the needle is already lower-cased by callers).
+        assert!(contains_ignore_case("Café", "café"));
+        assert!(contains_ignore_case("Straße-svc", "straße"));
     }
 
     #[test]

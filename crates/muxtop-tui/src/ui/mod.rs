@@ -1,10 +1,12 @@
 // Layout & rendering for the TUI.
 
 mod confirm;
+mod containers;
 mod general;
 mod network;
 mod palette;
 mod processes;
+pub mod sanitize;
 pub mod theme;
 
 use ratatui::{
@@ -20,7 +22,7 @@ use crate::app::{AppState, Tab};
 use theme::Theme;
 
 /// Labels for future tabs (not yet implemented).
-const FUTURE_TABS: &[&str] = &["Containers [soon]", "GPU [soon]"];
+const FUTURE_TABS: &[&str] = &["GPU [soon]"];
 
 /// Render the full application layout: Header, TabBar, Content, Footer.
 pub fn draw_root(frame: &mut Frame, app: &AppState) {
@@ -118,6 +120,7 @@ fn draw_content(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
         Tab::General => general::draw_general_tab(frame, area, app, theme),
         Tab::Processes => processes::draw_processes_tab(frame, area, app, theme),
         Tab::Network => network::draw_network_tab(frame, area, app, theme),
+        Tab::Containers => containers::draw_containers_tab(frame, area, app, theme),
     }
 }
 
@@ -179,6 +182,28 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
             Span::raw(" "),
             key_hint("^P", "Palette", theme),
         ],
+        Tab::Containers => {
+            let mut hints = vec![
+                key_hint("q", "Quit", theme),
+                Span::raw(" "),
+                key_hint("j/k", "Select", theme),
+                Span::raw(" "),
+                key_hint("/", "Filter", theme),
+                Span::raw(" "),
+                key_hint("s", "Sort", theme),
+            ];
+            if !app.is_remote() {
+                hints.push(Span::raw(" "));
+                hints.push(key_hint("F9", "Stop", theme));
+                hints.push(Span::raw(" "));
+                hints.push(key_hint("F10", "Kill", theme));
+                hints.push(Span::raw(" "));
+                hints.push(key_hint("F11", "Restart", theme));
+            }
+            hints.push(Span::raw(" "));
+            hints.push(key_hint("^P", "Palette", theme));
+            hints
+        }
     };
     let footer = Paragraph::new(Line::from(shortcuts)).style(Style::default().bg(theme.header_bg));
     frame.render_widget(footer, area);
@@ -399,6 +424,7 @@ mod tests {
                 total_rx: 0,
                 total_tx: 0,
             },
+            containers: None,
             timestamp_ms: 0,
         };
 
@@ -540,6 +566,7 @@ mod tests {
                 total_rx: 1_000_100,
                 total_tx: 500_100,
             },
+            containers: None,
             timestamp_ms: 0,
         };
 
@@ -616,6 +643,7 @@ mod tests {
                 total_rx: 1000,
                 total_tx: 500,
             },
+            containers: None,
             timestamp_ms: 0,
         };
 
@@ -672,6 +700,7 @@ mod tests {
                 total_rx: 0,
                 total_tx: 0,
             },
+            containers: None,
             timestamp_ms: 0,
         };
 

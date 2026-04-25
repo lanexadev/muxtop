@@ -28,6 +28,11 @@ tokio-rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
 rcgen = { workspace = true }
 ring = { workspace = true }
+time = "0.3"
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+x509-parser = "0.18"

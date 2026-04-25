@@ -1,10 +1,41 @@
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
+use crate::containers::ContainersSnapshot;
 use crate::network::NetworkSnapshot;
 use crate::process::ProcessInfo;
+
+/// Interned per-core name table (PERF-L2).
+///
+/// `format!("cpu{i}")` previously ran on every collector tick for every core,
+/// burning a few hundred small allocations per second on multi-core hosts.
+/// The names never change for the lifetime of the process, so we mint them
+/// once and clone the cached `String` on each tick (a `String::clone` for a
+/// 4-6-byte payload reuses the small-string fast path on most allocators).
+fn core_name(i: usize) -> String {
+    static CORE_NAMES: OnceLock<std::sync::RwLock<Vec<String>>> = OnceLock::new();
+    let lock = CORE_NAMES.get_or_init(|| std::sync::RwLock::new(Vec::new()));
+
+    // Fast path: read lock + index lookup.
+    {
+        let table = lock.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(name) = table.get(i) {
+            return name.clone();
+        }
+    }
+
+    // Slow path: extend the table (rare — only on the first tick for that core
+    // count, and on the first run a single contiguous extend).
+    let mut table = lock.write().unwrap_or_else(|e| e.into_inner());
+    while table.len() <= i {
+        let idx = table.len();
+        table.push(format!("cpu{idx}"));
+    }
+    table[i].clone()
+}
 
 /// Per-core CPU snapshot.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
@@ -41,6 +72,11 @@ pub struct LoadSnapshot {
 }
 
 /// Full system snapshot aggregating all subsystems.
+///
+/// `containers` is `None` whenever the collector runs without a container
+/// engine attached, or before the first container tick has completed.
+/// Once set, it is `Some(ContainersSnapshot::unavailable())` to report
+/// engine failure or `Some(..)` with the current fleet.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct SystemSnapshot {
     pub cpu: CpuSnapshot,
@@ -48,13 +84,22 @@ pub struct SystemSnapshot {
     pub load: LoadSnapshot,
     pub processes: Vec<ProcessInfo>,
     pub networks: NetworkSnapshot,
+    pub containers: Option<ContainersSnapshot>,
     /// Milliseconds since Unix epoch.
     pub timestamp_ms: u64,
 }
 
 impl SystemSnapshot {
     /// Collect a full system snapshot from sysinfo.
-    pub fn collect(sys: &sysinfo::System, networks: &sysinfo::Networks) -> Self {
+    ///
+    /// `containers` is passed through verbatim: callers either supply the
+    /// latest snapshot from their container engine (via [`crate::Collector`])
+    /// or `None` when running without one.
+    pub fn collect(
+        sys: &sysinfo::System,
+        networks: &sysinfo::Networks,
+        containers: Option<ContainersSnapshot>,
+    ) -> Self {
         use sysinfo::System as SysSystem;
 
         let global_usage = sys.global_cpu_usage();
@@ -63,7 +108,7 @@ impl SystemSnapshot {
             .iter()
             .enumerate()
             .map(|(i, cpu)| CoreSnapshot {
-                name: format!("cpu{i}"),
+                name: core_name(i),
                 usage: cpu.cpu_usage(),
                 frequency: cpu.frequency(),
             })
@@ -144,6 +189,7 @@ impl SystemSnapshot {
             load,
             processes,
             networks,
+            containers,
             timestamp_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system clock before Unix epoch")
@@ -176,7 +222,7 @@ mod tests {
         sys.refresh_all();
 
         let networks = sysinfo::Networks::new_with_refreshed_list();
-        let snap = SystemSnapshot::collect(&sys, &networks);
+        let snap = SystemSnapshot::collect(&sys, &networks, None);
         assert!(!snap.cpu.cores.is_empty(), "should have CPU cores");
         assert!(snap.memory.total > 0, "should have total memory");
         assert!(!snap.processes.is_empty(), "should have processes");
@@ -190,7 +236,7 @@ mod tests {
         sys.refresh_all();
 
         let networks = sysinfo::Networks::new_with_refreshed_list();
-        let snap = SystemSnapshot::collect(&sys, &networks);
+        let snap = SystemSnapshot::collect(&sys, &networks, None);
         assert!(
             snap.cpu.global_usage >= 0.0 && snap.cpu.global_usage <= 100.0,
             "global CPU usage should be 0..=100, got {}",
@@ -212,7 +258,7 @@ mod tests {
         sys.refresh_all();
 
         let networks = sysinfo::Networks::new_with_refreshed_list();
-        let snap = SystemSnapshot::collect(&sys, &networks);
+        let snap = SystemSnapshot::collect(&sys, &networks, None);
         assert!(snap.memory.total > 0, "total memory should be positive");
         // used + available can slightly exceed total due to kernel accounting
         // but total should be >= used
@@ -232,7 +278,7 @@ mod tests {
         sys.refresh_all();
         let networks = sysinfo::Networks::new_with_refreshed_list();
 
-        let snap = SystemSnapshot::collect(&sys, &networks);
+        let snap = SystemSnapshot::collect(&sys, &networks, None);
         assert!(
             !snap.networks.interfaces.is_empty(),
             "should have network interfaces"
@@ -246,6 +292,18 @@ mod tests {
                 .sum::<u64>(),
             "total_rx should be consistent"
         );
+    }
+
+    #[test]
+    fn test_core_name_returns_stable_label() {
+        // PERF-L2: the interned table returns the canonical label and is
+        // stable across calls (we don't observe `Arc` identity since the
+        // interface returns owned `String`s, but the values must match the
+        // legacy `format!("cpu{i}")` exactly so wire-format consumers don't
+        // see a regression).
+        assert_eq!(core_name(0), "cpu0");
+        assert_eq!(core_name(7), "cpu7");
+        assert_eq!(core_name(0), "cpu0"); // hits the fast path
     }
 
     #[test]

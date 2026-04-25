@@ -94,10 +94,35 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         Self { reader }
     }
 
-    /// Read one complete frame from the stream.
+    /// Read one complete frame from the stream, applying the global
+    /// [`MAX_FRAME_SIZE`] cap (4 MiB).
     ///
     /// Returns `Ok(None)` on clean EOF (connection closed).
     pub async fn read_frame(&mut self) -> Result<Option<Frame>, ProtoError> {
+        // The global cap is on the *content* (type byte + payload). Subtract
+        // the type byte to obtain the equivalent payload-only cap.
+        self.read_frame_with_max_payload(MAX_FRAME_SIZE as usize - 1)
+            .await
+    }
+
+    /// Read one complete frame from the stream with a caller-supplied payload
+    /// cap (in bytes, **excluding** the 1-byte type discriminant).
+    ///
+    /// This is the security-hardened entry point used for pre-authentication
+    /// reads (per ADR-30-2): the server reads the `Hello` with `max_payload =
+    /// 4096` so an attacker cannot allocate up to 4 MiB before we have any
+    /// notion of who they are.
+    ///
+    /// On the wire the length-prefix counts the type byte too; this function
+    /// rejects frames where `payload_len = content_len - 1 > max_payload` and
+    /// returns
+    /// [`ProtoError::FrameTooLarge`] **before** allocating the payload buffer.
+    ///
+    /// Returns `Ok(None)` on clean EOF (connection closed).
+    pub async fn read_frame_with_max_payload(
+        &mut self,
+        max_payload: usize,
+    ) -> Result<Option<Frame>, ProtoError> {
         // Read 4-byte length header.
         let mut header = [0u8; HEADER_SIZE];
         match self.reader.read_exact(&mut header).await {
@@ -108,6 +133,8 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
 
         let content_len = u32::from_be_bytes(header);
 
+        // Hard ceiling: never honour a length above the global cap, regardless
+        // of the per-call `max_payload`.
         if content_len > MAX_FRAME_SIZE {
             return Err(ProtoError::FrameTooLarge {
                 size: content_len,
@@ -122,13 +149,24 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             });
         }
 
+        // Per-call cap on the payload (post-type-byte). Reject *before*
+        // allocating the payload buffer.
+        let payload_len = content_len as usize - 1;
+        if payload_len > max_payload {
+            return Err(ProtoError::FrameTooLarge {
+                size: content_len,
+                // Convert the payload cap back into the on-wire content size
+                // unit (payload + type byte) for a coherent error message.
+                max: max_payload.saturating_add(1).min(u32::MAX as usize) as u32,
+            });
+        }
+
         // Read type byte.
         let mut type_buf = [0u8; 1];
         self.reader.read_exact(&mut type_buf).await?;
         let msg_type = type_buf[0];
 
         // Read payload directly into final Vec (no intermediate copy).
-        let payload_len = content_len as usize - 1;
         let mut payload = vec![0u8; payload_len];
         if payload_len > 0 {
             self.reader.read_exact(&mut payload).await?;
@@ -337,5 +375,69 @@ mod tests {
         let mut reader = FrameReader::new(cursor);
         let result = reader.read_frame().await.unwrap();
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_read_frame_with_max_payload_rejects_oversize() {
+        // Hand-craft a frame that *claims* a 5 KiB payload (5 * 1024 = 5120
+        // payload bytes + 1 type byte = 5121 content_len), but supply only the
+        // header. The reader must reject on the length-prefix alone, BEFORE
+        // allocating the 5 KiB payload buffer.
+        let payload_len: u32 = 5 * 1024; // 5 KiB
+        let content_len: u32 = payload_len + 1;
+        let header = content_len.to_be_bytes();
+        let cursor = std::io::Cursor::new(header.to_vec());
+        let mut reader = FrameReader::new(cursor);
+
+        // 4 KiB payload cap (the value Slice A uses for the pre-auth Hello
+        // read).
+        let err = reader
+            .read_frame_with_max_payload(4096)
+            .await
+            .expect_err("frame claiming 5 KiB payload must be rejected with cap=4 KiB");
+        match err {
+            ProtoError::FrameTooLarge { size, max } => {
+                assert_eq!(size, content_len);
+                // The reported max (in content-len units) is the cap + 1 byte
+                // for the type discriminant.
+                assert_eq!(max, 4096 + 1);
+            }
+            other => panic!("expected FrameTooLarge, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_frame_with_max_payload_accepts_within_cap() {
+        // A normal small frame with a generous cap must round-trip fine.
+        let frame = Frame {
+            msg_type: MSG_HELLO,
+            payload: vec![0xAA; 64],
+        };
+        let bytes = encode_frame(&frame).unwrap();
+        let cursor = std::io::Cursor::new(bytes);
+        let mut reader = FrameReader::new(cursor);
+
+        let result = reader
+            .read_frame_with_max_payload(4096)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result, frame);
+    }
+
+    #[tokio::test]
+    async fn test_read_frame_default_path_still_works() {
+        // The original `read_frame()` is now a thin wrapper over the new API
+        // — make sure existing semantics (4 MiB content cap) are unchanged.
+        let frame = Frame {
+            msg_type: MSG_SNAPSHOT,
+            payload: vec![1, 2, 3, 4, 5, 6, 7, 8],
+        };
+        let bytes = encode_frame(&frame).unwrap();
+        let cursor = std::io::Cursor::new(bytes);
+        let mut reader = FrameReader::new(cursor);
+
+        let result = reader.read_frame().await.unwrap().unwrap();
+        assert_eq!(result, frame);
     }
 }

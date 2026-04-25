@@ -111,6 +111,7 @@ mod tests {
                 total_rx: 0,
                 total_tx: 0,
             },
+            containers: None,
             timestamp_ms: 0,
         };
         let snapshot_event = Event::Snapshot(snap);

@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use muxtop_core::system::SystemSnapshot;
 
 use crate::ProtoError;
-use crate::frame::{Frame, MSG_ERROR, MSG_HEARTBEAT, MSG_HELLO, MSG_SNAPSHOT, MSG_WELCOME};
+use crate::frame::{
+    Frame, MAX_FRAME_SIZE, MSG_ERROR, MSG_HEARTBEAT, MSG_HELLO, MSG_SNAPSHOT, MSG_WELCOME,
+};
 
 /// Wire protocol messages exchanged between muxtop client and server.
 ///
@@ -77,11 +79,37 @@ impl std::fmt::Debug for WireMessage {
     }
 }
 
+/// Bincode configuration shared by encode/decode paths.
+///
+/// `with_limit::<MAX_DECODE_BYTES>()` caps the total bytes the decoder is
+/// willing to allocate while reading a single value, regardless of the
+/// var-int length-prefixes embedded inside the payload (MED-S1, proto-side).
+/// Without this cap a malicious peer can claim a huge collection or `String`
+/// length and force the decoder to pre-allocate hundreds of MiB before the
+/// underlying buffer is exhausted.
+const MAX_DECODE_BYTES: usize = MAX_FRAME_SIZE as usize;
+
 fn bincode_config() -> impl bincode::config::Config {
-    config::standard()
+    config::standard().with_limit::<MAX_DECODE_BYTES>()
 }
 
 impl WireMessage {
+    /// Encode a `SystemSnapshot` into a `Snapshot` frame **without taking
+    /// ownership** of the snapshot.
+    ///
+    /// Per ADR-30-4 the relay path holds an `Arc<SystemSnapshot>` and needs to
+    /// produce a single encoded `Frame` that it can then broadcast as bytes to
+    /// every client task. Calling `to_frame()` would require constructing a
+    /// `WireMessage::Snapshot` variant that owns the `SystemSnapshot`, which
+    /// defeats the whole point of the `Arc`. This helper bypasses the wrapper
+    /// and encodes directly from a borrow.
+    pub fn encode_snapshot_ref(snap: &SystemSnapshot) -> Result<Frame, ProtoError> {
+        Ok(Frame {
+            msg_type: MSG_SNAPSHOT,
+            payload: encode_to_vec(snap, bincode_config())?,
+        })
+    }
+
     /// Serialize this message into a [`Frame`].
     pub fn to_frame(&self) -> Result<Frame, ProtoError> {
         let (msg_type, payload) = match self {
@@ -215,6 +243,7 @@ mod tests {
                 total_rx: 1000,
                 total_tx: 1000,
             },
+            containers: None,
             timestamp_ms: 1_713_200_000_000,
         }
     }
@@ -226,6 +255,21 @@ mod tests {
         assert_eq!(frame.msg_type, MSG_SNAPSHOT);
         let decoded = WireMessage::from_frame(&frame).unwrap();
         assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn test_encode_snapshot_ref_matches_to_frame() {
+        // PERF-L1 / ADR-30-4: the borrow-only encode helper must produce
+        // the same wire bytes as the owning path so the server can hand
+        // out a single pre-encoded frame to every connected client.
+        let snap = make_test_snapshot();
+        let owning_frame = WireMessage::Snapshot(snap.clone()).to_frame().unwrap();
+        let borrow_frame = WireMessage::encode_snapshot_ref(&snap).unwrap();
+        assert_eq!(owning_frame.msg_type, borrow_frame.msg_type);
+        assert_eq!(owning_frame.payload, borrow_frame.payload);
+        // And the decoded value is bit-for-bit identical.
+        let decoded = WireMessage::from_frame(&borrow_frame).unwrap();
+        assert_eq!(decoded, WireMessage::Snapshot(snap));
     }
 
     #[test]
@@ -296,6 +340,47 @@ mod tests {
         };
         let err = WireMessage::from_frame(&frame).unwrap_err();
         assert!(matches!(err, ProtoError::UnknownMessageType(0xFF)));
+    }
+
+    #[test]
+    fn test_decode_limit_rejects_giant_string_claim() {
+        // MED-S1 (proto-side): a hand-crafted Hello payload that *claims* a
+        // 100 MiB `client_version` String must fail to decode without
+        // allocating that much memory. We bypass `to_frame()` entirely and
+        // build the bincode payload by hand.
+        //
+        // Wire layout for `Hello { client_version, auth_token }` =
+        //   tuple `(String, Option<String>)` (no tuple-length prefix in
+        //   bincode 2). The first bytes are therefore the String length
+        //   var-int directly.
+        //
+        // bincode 2 var-int format (little-endian, default `standard()`):
+        //   - 0..=250    : single byte
+        //   - 0xFB       : marker for u16, followed by 2 LE bytes
+        //   - 0xFC       : marker for u32, followed by 4 LE bytes
+        //   - 0xFD       : marker for u64, followed by 8 LE bytes
+        //   - 0xFE       : marker for u128, followed by 16 LE bytes
+        // 100 MiB fits in a u32 → 0xFC + 4 LE bytes.
+        let claimed_len: u32 = 100 * 1024 * 1024;
+        let mut payload = Vec::new();
+        payload.push(0xFC);
+        payload.extend_from_slice(&claimed_len.to_le_bytes());
+        // ...then NO actual bytes, deliberately. The decoder should refuse
+        // *before* attempting to read 100 MiB of UTF-8.
+
+        let frame = Frame {
+            msg_type: MSG_HELLO,
+            payload,
+        };
+        let err =
+            WireMessage::from_frame(&frame).expect_err("decoder must reject 100 MiB length claim");
+        // The `with_limit` config raises `LimitExceeded`; downstream we
+        // surface it as `ProtoError::Decode`. Either way, no panic and no
+        // 100 MiB allocation.
+        assert!(
+            matches!(err, ProtoError::Decode(_)),
+            "expected Decode error, got {err:?}"
+        );
     }
 
     #[test]

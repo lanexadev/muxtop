@@ -2,9 +2,15 @@
 members = ["crates/muxtop-core", "crates/muxtop-tui", "crates/muxtop-proto", "crates/muxtop-server"]
 resolver = "3"
 
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
 [workspace.package]
 edition = "2024"
-version = "0.2.3"
+version = "0.3.1"
 authors = ["Lucas Schimmel"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lanexadev/muxtop"
@@ -53,6 +59,13 @@ criterion = { version = "0.5", features = ["html_reports"] }
 serde = { version = "1", features = ["derive"] }
 bincode = "2"
 
+# Async trait (dyn-safe async fn in trait — see ADR-01 in forge/24)
+async-trait = "0.1"
+
+# Docker/Podman API client (v0.3 Containers, see ADR-01 in forge/25)
+bollard = "0.20"
+futures = "0.3"
+
 # TLS
 tokio-rustls = "0.26"
 rustls-pki-types = "1"
@@ -60,9 +73,9 @@ rcgen = "0.14"
 ring = "0.17"
 
 # Internal crates
-muxtop-core = { path = "crates/muxtop-core", version = "0.2.0" }
-muxtop-tui = { path = "crates/muxtop-tui", version = "0.2.0" }
-muxtop-proto = { path = "crates/muxtop-proto", version = "0.2.0" }
+muxtop-core = { path = "crates/muxtop-core", version = "0.3.1" }
+muxtop-tui = { path = "crates/muxtop-tui", version = "0.3.1" }
+muxtop-proto = { path = "crates/muxtop-proto", version = "0.3.1" }
 
 [package]
 name = "muxtop"
