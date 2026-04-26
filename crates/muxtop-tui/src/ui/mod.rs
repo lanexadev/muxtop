@@ -425,6 +425,7 @@ mod tests {
                 total_tx: 0,
             },
             containers: None,
+            kube: None,
             timestamp_ms: 0,
         };
 
@@ -567,6 +568,7 @@ mod tests {
                 total_tx: 500_100,
             },
             containers: None,
+            kube: None,
             timestamp_ms: 0,
         };
 
@@ -644,6 +646,7 @@ mod tests {
                 total_tx: 500,
             },
             containers: None,
+            kube: None,
             timestamp_ms: 0,
         };
 
@@ -701,6 +704,7 @@ mod tests {
                 total_tx: 0,
             },
             containers: None,
+            kube: None,
             timestamp_ms: 0,
         };
 

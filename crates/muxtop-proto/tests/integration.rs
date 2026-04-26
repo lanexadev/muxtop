@@ -63,6 +63,7 @@ fn make_test_snapshot() -> SystemSnapshot {
             total_tx: 5000,
         },
         containers: None,
+        kube: None,
         timestamp_ms: 1_713_200_000_000,
     }
 }

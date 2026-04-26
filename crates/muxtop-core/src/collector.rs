@@ -1,18 +1,21 @@
 // Async collection loop (tokio task).
 //
-// Two concurrent loops:
+// Three concurrent loops:
 //  - System loop (configurable tick, default 1 Hz) — produces `SystemSnapshot`s
-//    to the mpsc channel. Each tick reads the latest container snapshot (if
-//    any) and embeds it into the emitted `SystemSnapshot`.
+//    to the mpsc channel. Each tick reads the latest container + kube
+//    snapshots (if any) and embeds them into the emitted `SystemSnapshot`.
 //  - Container loop (0.5 Hz, only if an engine is provided) — calls
 //    `ContainerEngine::list_and_stats()` and writes the result into a shared
 //    `Arc<Mutex<Option<ContainersSnapshot>>>`. On error, publishes
 //    `ContainersSnapshot::unavailable()` so the UI can render the notice.
+//  - Cluster loop (0.2 Hz, only if a cluster engine is provided) — calls
+//    `ClusterEngine::snapshot()` and writes the result into a shared
+//    `Arc<Mutex<Option<KubeSnapshot>>>`. On error, publishes
+//    `KubeSnapshot::unavailable()`. Note that the engine's own internal
+//    poll task drives kube-rs LIST/metrics traffic; this collector loop
+//    just samples the engine's already-cached state every 5 s.
 //
-// Both loops share a single `CancellationToken`. Shutdown is cooperative: the
-// system loop exits as soon as the token fires; the container loop joins
-// within the next 2 s tick window or immediately if awaiting a Docker call
-// that itself respects the cancellation (via per-call timeouts in E2).
+// All loops share a single `CancellationToken`. Shutdown is cooperative.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,8 +25,10 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::cluster_engine::ClusterEngine;
 use crate::container_engine::ContainerEngine;
 use crate::containers::ContainersSnapshot;
+use crate::kube::KubeSnapshot;
 use crate::system::SystemSnapshot;
 
 /// Container stats refresh cadence — independent from the system tick.
@@ -32,17 +37,22 @@ use crate::system::SystemSnapshot;
 /// containers (see forge/23-epic-containers ADR-05).
 const CONTAINER_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Cluster snapshot sampling cadence — matches the kube-rs internal poll
+/// task interval (see ADR-05 v0.4 in `forge/32-v04-kubernetes-epics/`).
+const CLUSTER_INTERVAL: Duration = Duration::from_secs(5);
+
 pub struct Collector {
     sys: sysinfo::System,
     networks: sysinfo::Networks,
     interval: Duration,
     container_engine: Option<Arc<dyn ContainerEngine + Send + Sync>>,
+    cluster_engine: Option<Arc<dyn ClusterEngine + Send + Sync>>,
 }
 
 impl Collector {
     /// Create a collector that only gathers system snapshots.
     pub fn new(interval: Duration) -> Self {
-        Self::with_container_engine(interval, None)
+        Self::with_engines(interval, None, None)
     }
 
     /// Create a collector that also polls a container engine.
@@ -53,11 +63,24 @@ impl Collector {
         interval: Duration,
         container_engine: Option<Arc<dyn ContainerEngine + Send + Sync>>,
     ) -> Self {
+        Self::with_engines(interval, container_engine, None)
+    }
+
+    /// Create a collector with both container and cluster engines.
+    ///
+    /// Either side can be `None` independently. The emitted snapshot's
+    /// `containers` / `kube` fields stay `None` for the disabled side.
+    pub fn with_engines(
+        interval: Duration,
+        container_engine: Option<Arc<dyn ContainerEngine + Send + Sync>>,
+        cluster_engine: Option<Arc<dyn ClusterEngine + Send + Sync>>,
+    ) -> Self {
         Self {
             sys: sysinfo::System::new_all(),
             networks: sysinfo::Networks::new_with_refreshed_list(),
             interval,
             container_engine,
+            cluster_engine,
         }
     }
 
@@ -84,14 +107,20 @@ impl Collector {
         self.sys.refresh_all();
         self.networks.refresh(true);
 
-        // Shared container snapshot slot — written by the container task,
-        // read by the system loop on every emit.
+        // Shared container + kube snapshot slots — written by their
+        // respective polling tasks, read by the system loop on every emit.
         let last_containers: Arc<Mutex<Option<ContainersSnapshot>>> = Arc::new(Mutex::new(None));
+        let last_kube: Arc<Mutex<Option<KubeSnapshot>>> = Arc::new(Mutex::new(None));
 
         // Spawn the container polling loop if an engine is configured.
         let container_task = self.container_engine.take().map(|engine| {
             spawn_container_loop(engine, Arc::clone(&last_containers), token.clone())
         });
+        // Spawn the cluster polling loop if a kube engine is configured.
+        let cluster_task = self
+            .cluster_engine
+            .take()
+            .map(|engine| spawn_cluster_loop(engine, Arc::clone(&last_kube), token.clone()));
 
         loop {
             tokio::select! {
@@ -111,8 +140,9 @@ impl Collector {
                     self.networks.refresh(false);
 
                     let containers = last_containers.lock().await.clone();
+                    let kube = last_kube.lock().await.clone();
                     let snapshot =
-                        SystemSnapshot::collect(&self.sys, &self.networks, containers);
+                        SystemSnapshot::collect(&self.sys, &self.networks, containers, kube);
 
                     match tx.try_send(snapshot) {
                         Ok(()) => {}
@@ -132,12 +162,53 @@ impl Collector {
             }
         }
 
-        // Wait for the container task to wind down so the JoinHandle reflects
-        // total shutdown.
+        // Wait for the container + cluster tasks to wind down so the
+        // JoinHandle reflects total shutdown.
         if let Some(handle) = container_task {
             let _ = handle.await;
         }
+        if let Some(handle) = cluster_task {
+            let _ = handle.await;
+        }
     }
+}
+
+/// Background loop polling the cluster engine at 0.2 Hz (5 s). Writes into
+/// the shared slot; publishes `KubeSnapshot::unavailable()` on failure so
+/// the UI can render the "no cluster" state.
+///
+/// Note the engine's own kube-rs poll task drives the actual LIST + metrics
+/// traffic; this loop just samples the engine's cached state and forwards
+/// it through the snapshot pipeline.
+fn spawn_cluster_loop(
+    engine: Arc<dyn ClusterEngine + Send + Sync>,
+    slot: Arc<Mutex<Option<KubeSnapshot>>>,
+    token: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(CLUSTER_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    match engine.snapshot().await {
+                        Ok(snapshot) => {
+                            *slot.lock().await = Some(snapshot);
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, "cluster engine failed");
+                            *slot.lock().await = Some(KubeSnapshot::unavailable());
+                        }
+                    }
+                }
+                _ = token.cancelled() => {
+                    tracing::debug!("cluster loop shutting down");
+                    break;
+                }
+            }
+        }
+    })
 }
 
 /// Background loop polling the container engine at 0.5 Hz. Writes into the

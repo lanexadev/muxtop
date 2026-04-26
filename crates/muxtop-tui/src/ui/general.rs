@@ -409,6 +409,7 @@ mod tests {
                 total_tx: 0,
             },
             containers: None,
+            kube: None,
             timestamp_ms: 0,
         }
     }

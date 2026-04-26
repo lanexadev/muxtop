@@ -1758,6 +1758,7 @@ mod tests {
                 total_tx: 0,
             },
             containers: None,
+            kube: None,
             timestamp_ms: 0,
         }
     }
@@ -3156,6 +3157,7 @@ mod tests {
                     started_at_ms: 1_700_000_000_000,
                 }],
             }),
+            kube: None,
             timestamp_ms: 1_700_000_000_000,
         }
     }

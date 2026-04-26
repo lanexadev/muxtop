@@ -5,6 +5,7 @@ use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
 use crate::containers::ContainersSnapshot;
+use crate::kube::KubeSnapshot;
 use crate::network::NetworkSnapshot;
 use crate::process::ProcessInfo;
 
@@ -77,6 +78,12 @@ pub struct LoadSnapshot {
 /// engine attached, or before the first container tick has completed.
 /// Once set, it is `Some(ContainersSnapshot::unavailable())` to report
 /// engine failure or `Some(..)` with the current fleet.
+///
+/// `kube` follows the exact same convention for the v0.4 cluster engine.
+///
+/// **Wire-protocol break (v0.4):** the `kube` field is appended to the
+/// struct after `containers`, before `timestamp_ms`. bincode is order-
+/// sensitive, so this is incompatible with v0.3.x clients.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct SystemSnapshot {
     pub cpu: CpuSnapshot,
@@ -85,6 +92,7 @@ pub struct SystemSnapshot {
     pub processes: Vec<ProcessInfo>,
     pub networks: NetworkSnapshot,
     pub containers: Option<ContainersSnapshot>,
+    pub kube: Option<KubeSnapshot>,
     /// Milliseconds since Unix epoch.
     pub timestamp_ms: u64,
 }
@@ -92,13 +100,14 @@ pub struct SystemSnapshot {
 impl SystemSnapshot {
     /// Collect a full system snapshot from sysinfo.
     ///
-    /// `containers` is passed through verbatim: callers either supply the
-    /// latest snapshot from their container engine (via [`crate::Collector`])
+    /// `containers` and `kube` are passed through verbatim: callers either
+    /// supply the latest snapshot from their engines (via [`crate::Collector`])
     /// or `None` when running without one.
     pub fn collect(
         sys: &sysinfo::System,
         networks: &sysinfo::Networks,
         containers: Option<ContainersSnapshot>,
+        kube: Option<KubeSnapshot>,
     ) -> Self {
         use sysinfo::System as SysSystem;
 
@@ -190,6 +199,7 @@ impl SystemSnapshot {
             processes,
             networks,
             containers,
+            kube,
             timestamp_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system clock before Unix epoch")
@@ -222,7 +232,7 @@ mod tests {
         sys.refresh_all();
 
         let networks = sysinfo::Networks::new_with_refreshed_list();
-        let snap = SystemSnapshot::collect(&sys, &networks, None);
+        let snap = SystemSnapshot::collect(&sys, &networks, None, None);
         assert!(!snap.cpu.cores.is_empty(), "should have CPU cores");
         assert!(snap.memory.total > 0, "should have total memory");
         assert!(!snap.processes.is_empty(), "should have processes");
@@ -236,7 +246,7 @@ mod tests {
         sys.refresh_all();
 
         let networks = sysinfo::Networks::new_with_refreshed_list();
-        let snap = SystemSnapshot::collect(&sys, &networks, None);
+        let snap = SystemSnapshot::collect(&sys, &networks, None, None);
         assert!(
             snap.cpu.global_usage >= 0.0 && snap.cpu.global_usage <= 100.0,
             "global CPU usage should be 0..=100, got {}",
@@ -258,7 +268,7 @@ mod tests {
         sys.refresh_all();
 
         let networks = sysinfo::Networks::new_with_refreshed_list();
-        let snap = SystemSnapshot::collect(&sys, &networks, None);
+        let snap = SystemSnapshot::collect(&sys, &networks, None, None);
         assert!(snap.memory.total > 0, "total memory should be positive");
         // used + available can slightly exceed total due to kernel accounting
         // but total should be >= used
@@ -278,7 +288,7 @@ mod tests {
         sys.refresh_all();
         let networks = sysinfo::Networks::new_with_refreshed_list();
 
-        let snap = SystemSnapshot::collect(&sys, &networks, None);
+        let snap = SystemSnapshot::collect(&sys, &networks, None, None);
         assert!(
             !snap.networks.interfaces.is_empty(),
             "should have network interfaces"
