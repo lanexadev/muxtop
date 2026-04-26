@@ -3,6 +3,7 @@
 mod confirm;
 mod containers;
 mod general;
+mod kube;
 mod network;
 mod palette;
 mod processes;
@@ -121,6 +122,7 @@ fn draw_content(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
         Tab::Processes => processes::draw_processes_tab(frame, area, app, theme),
         Tab::Network => network::draw_network_tab(frame, area, app, theme),
         Tab::Containers => containers::draw_containers_tab(frame, area, app, theme),
+        Tab::Kube => kube::draw_kube_tab(frame, area, app, theme),
     }
 }
 
@@ -204,6 +206,13 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
             hints.push(key_hint("^P", "Palette", theme));
             hints
         }
+        Tab::Kube => vec![
+            key_hint("q", "Quit", theme),
+            Span::raw(" "),
+            key_hint("Tab", "Switch", theme),
+            Span::raw(" "),
+            key_hint("^P", "Palette", theme),
+        ],
     };
     let footer = Paragraph::new(Line::from(shortcuts)).style(Style::default().bg(theme.header_bg));
     frame.render_widget(footer, area);

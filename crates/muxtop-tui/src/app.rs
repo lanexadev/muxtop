@@ -355,6 +355,7 @@ pub enum Tab {
     Processes,
     Network,
     Containers,
+    Kube,
 }
 
 impl std::fmt::Display for Tab {
@@ -364,7 +365,13 @@ impl std::fmt::Display for Tab {
 }
 
 impl Tab {
-    pub const ALL: &[Tab] = &[Tab::General, Tab::Processes, Tab::Network, Tab::Containers];
+    pub const ALL: &[Tab] = &[
+        Tab::General,
+        Tab::Processes,
+        Tab::Network,
+        Tab::Containers,
+        Tab::Kube,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -372,6 +379,7 @@ impl Tab {
             Tab::Processes => "Processes",
             Tab::Network => "Network",
             Tab::Containers => "Containers",
+            Tab::Kube => "Kube",
         }
     }
 
@@ -1775,15 +1783,17 @@ mod tests {
         assert_eq!(Tab::General.next(), Tab::Processes);
         assert_eq!(Tab::Processes.next(), Tab::Network);
         assert_eq!(Tab::Network.next(), Tab::Containers);
-        assert_eq!(Tab::Containers.next(), Tab::General);
+        assert_eq!(Tab::Containers.next(), Tab::Kube);
+        assert_eq!(Tab::Kube.next(), Tab::General);
     }
 
     #[test]
     fn test_tab_prev_cycles() {
+        assert_eq!(Tab::Kube.prev(), Tab::Containers);
         assert_eq!(Tab::Containers.prev(), Tab::Network);
         assert_eq!(Tab::Network.prev(), Tab::Processes);
         assert_eq!(Tab::Processes.prev(), Tab::General);
-        assert_eq!(Tab::General.prev(), Tab::Containers);
+        assert_eq!(Tab::General.prev(), Tab::Kube);
     }
 
     #[test]
@@ -1792,6 +1802,7 @@ mod tests {
         assert_eq!(Tab::Processes.label(), "Processes");
         assert_eq!(Tab::Network.label(), "Network");
         assert_eq!(Tab::Containers.label(), "Containers");
+        assert_eq!(Tab::Kube.label(), "Kube");
     }
 
     #[test]
@@ -1800,6 +1811,7 @@ mod tests {
         assert_eq!(format!("{}", Tab::Processes), "Processes");
         assert_eq!(format!("{}", Tab::Network), "Network");
         assert_eq!(format!("{}", Tab::Containers), "Containers");
+        assert_eq!(format!("{}", Tab::Kube), "Kube");
     }
 
     #[test]
@@ -1808,7 +1820,8 @@ mod tests {
         assert!(Tab::ALL.contains(&Tab::Processes));
         assert!(Tab::ALL.contains(&Tab::Network));
         assert!(Tab::ALL.contains(&Tab::Containers));
-        assert_eq!(Tab::ALL.len(), 4);
+        assert!(Tab::ALL.contains(&Tab::Kube));
+        assert_eq!(Tab::ALL.len(), 5);
     }
 
     // -- AppState defaults (STORY-02) --
@@ -2055,6 +2068,8 @@ mod tests {
         app.handle_key_event(key(KeyCode::Tab));
         assert_eq!(app.tab, Tab::Containers);
         app.handle_key_event(key(KeyCode::Tab));
+        assert_eq!(app.tab, Tab::Kube);
+        app.handle_key_event(key(KeyCode::Tab));
         assert_eq!(app.tab, Tab::General);
     }
 
@@ -2062,7 +2077,7 @@ mod tests {
     fn test_backtab_switch() {
         let mut app = AppState::new();
         app.handle_key_event(key(KeyCode::BackTab));
-        assert_eq!(app.tab, Tab::Containers);
+        assert_eq!(app.tab, Tab::Kube);
     }
 
     #[test]
@@ -2220,13 +2235,13 @@ mod tests {
         let mut app = AppState::new();
         assert_eq!(app.tab, Tab::General);
         app.handle_key_event(key(KeyCode::Left));
-        assert_eq!(app.tab, Tab::Containers);
+        assert_eq!(app.tab, Tab::Kube);
     }
 
     #[test]
     fn test_tab_right_arrow_wraps() {
         let mut app = AppState::new();
-        app.tab = Tab::Containers;
+        app.tab = Tab::Kube;
         app.handle_key_event(key(KeyCode::Right));
         assert_eq!(app.tab, Tab::General);
     }
