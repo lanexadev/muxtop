@@ -177,8 +177,7 @@ pub fn detect_kubeconfig() -> KubeconfigSource {
 
     let env = StdEnv;
     let home_kubeconfig: Option<PathBuf> = dirs::home_dir().map(|h| h.join(".kube/config"));
-    let in_cluster_token =
-        Path::new("/var/run/secrets/kubernetes.io/serviceaccount/token");
+    let in_cluster_token = Path::new("/var/run/secrets/kubernetes.io/serviceaccount/token");
 
     detect_kubeconfig_with(&env, home_kubeconfig.as_deref(), in_cluster_token)
 }

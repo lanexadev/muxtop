@@ -337,7 +337,11 @@ mod tests {
 
     #[test]
     fn qos_class_is_exhaustive() {
-        for q in [QosClass::Guaranteed, QosClass::Burstable, QosClass::BestEffort] {
+        for q in [
+            QosClass::Guaranteed,
+            QosClass::Burstable,
+            QosClass::BestEffort,
+        ] {
             let _label: &'static str = match q {
                 QosClass::Guaranteed => "guaranteed",
                 QosClass::Burstable => "burstable",
@@ -348,7 +352,10 @@ mod tests {
 
     #[test]
     fn deployment_strategy_is_exhaustive() {
-        for s in [DeploymentStrategy::RollingUpdate, DeploymentStrategy::Recreate] {
+        for s in [
+            DeploymentStrategy::RollingUpdate,
+            DeploymentStrategy::Recreate,
+        ] {
             let _label: &'static str = match s {
                 DeploymentStrategy::RollingUpdate => "rolling",
                 DeploymentStrategy::Recreate => "recreate",
