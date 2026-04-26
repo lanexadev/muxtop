@@ -7,6 +7,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-04-26
+
+Major feature release: the **Kubernetes** tab (replaces `k9s`-light) with read-only Pod / Node / Deployment monitoring via [kube-rs](https://github.com/kube-rs/kube). Auto-detection at startup means `muxtop` gains a fifth tab on any host with a reachable kubeconfig.
+
+### Added
+
+#### Kubernetes (`muxtop-core`, `muxtop-tui`, `muxtop`)
+- New `Tab::Kube` (keybind `Alt+5`) with a Pod table in `muxtop-tui/src/ui/kube.rs`: 9 columns NAMESPACE / NAME / READY / STATUS / RESTARTS / AGE / CPU / MEM / NODE, color-coded by phase (Running=success, Pending=warning, Succeeded=accent, Failed/CrashLoop=danger, Terminating/Unknown=dim), with a 1-line cluster summary header (cluster_kind / namespace / counts / metrics-server badge).
+- Three render fallbacks: `kube = None` → "Waiting for cluster data…", `reachable = false` → "No cluster data" with a kubectl hint, empty pod list → "No pods in this cluster.".
+- `metrics-server` graceful degradation: when `/apis/metrics.k8s.io/v1beta1` is unavailable, the CPU and MEM columns render `—` and the summary shows "metrics-server: off" in yellow. The badge logic is bool-driven by `KubeSnapshot::metrics_available`.
+- ANSI / control-char sanitizer (`scrub_ctrl` from v0.3.1) applied to `namespace`, `name` and `node` rendering — closes the terminal-escape spoofing surface for attacker-controlled pod names.
+
+#### Cluster engine (`muxtop-core`)
+- `ClusterEngine` async trait (see ADR-04 in `forge/32-v04-kubernetes-epics`) with methods `snapshot`, `metrics_available`, `kind`, `server_version`. `#[async_trait]` for dyn-safety, mirroring v0.3 `ContainerEngine`.
+- `KubeconfigSource` enum (`Env`/`Home`/`InCluster`/`None`) plus `detect_kubeconfig_with(env, home_kubeconfig, in_cluster_token)` and the production wrapper `detect_kubeconfig()`. Reuses the existing `EnvLookup` trait from `container_engine.rs` (ADR-03 v0.3) — no duplicated env-injection layer.
+- `ClusterError` enum: `KubeconfigNotFound`, `Unreachable(String)`, `Forbidden { resource: &'static str, namespace: Option<String> }`, `MetricsUnavailable`, `Stale { since_secs }`, `Other(String)`. Bridges to `CoreError` via `#[from]`.
+- `KubeEngine` concrete impl on top of `kube 0.99` + `k8s-openapi 0.24` (features `client`, `rustls-tls`, `runtime`; `default-features = false`). Two background tokio tasks on a 5 s tick race the engine's `CancellationToken`:
+  - **Resource poll** — `Api::<Pod>::all().list(limit=5_000)` + `Api::<Node>::all` + `Api::<Deployment>::all` via `kube::api::ListParams`. Per-resource timeout 3 s; per-resource RBAC degradation (`Forbidden` on one resource preserves the rest of the cache).
+  - **Metrics poll** — `Client::request_text("/apis/metrics.k8s.io/v1beta1/{pods,nodes}")`. Both 404 → `available = false` and caches cleared. Otherwise sums per-pod CPU + MEM across containers and parses Quantity strings (nanocores / millicores / cores).
+- See ADR-05 in `forge/32-v04-kubernetes-epics` for the full poll-vs-reflectors trade-off (poll-based MVP; reflector switch is internal-only if perf measurements warrant).
+- ClusterKind heuristic from `serverVersion.gitVersion` substring: `kind` / `k3s` / `k3d` / `eks` / `gke` / `aks` / `openshift`. Fallback `Generic`.
+- Conversion logic (`pod_to_snapshot`, `node_to_snapshot`, `deployment_to_snapshot`):
+  - Pod synthetic phases — `CrashLoop` (any container in `CrashLoopBackOff`), `Terminating` (`metadata.deletionTimestamp` set).
+  - Node status — `status.conditions[type=Ready]`, plus `spec.unschedulable == true` → `SchedulingDisabled`. Roles from `node-role.kubernetes.io/*` labels.
+  - Deployment strategy — `RollingUpdate` (default) vs `Recreate`.
+  - Quantity parsing — `parse_quantity_to_millis` ("4" / "2000m" / "100m" / "0.5" / "1.5") + `parse_quantity_to_bytes` (Ki/Mi/Gi/Ti binary + K/M/G/T decimal).
+  - Metrics injection — when `MetricsCache.{pods,nodes}` carries a `(cpu_millis, mem_bytes)` for the row, populate `cpu_millis` / `mem_bytes`; otherwise leave `None` (UI renders `—`).
+
+#### CLI (`muxtop`, `muxtop-server`)
+- `--kube-context <NAME>` flag on both binaries to override the kubeconfig context (default = current-context).
+- `--kube-namespace <NS>` flag to override the default namespace from the kubeconfig context.
+- `--no-kube` flag to disable the cluster engine entirely (mutually exclusive with `--kube-context`).
+- Local mode: `muxtop` runs `detect_kubeconfig()` + `KubeEngine::connect`; failure is non-fatal — the engine becomes `None` and the Kube tab renders the unreachable state.
+- Remote mode: the **server** is the only side that opens the kubeconfig. The kubeconfig content (paths, bearer tokens, client certs, exec-auth blocks) **never crosses the wire** — only the digested `KubeSnapshot` does. Anti-leak guards in `muxtop-core/src/kube.rs` and `muxtop-proto/tests/integration.rs` regex-scan every encoded frame for `BEGIN PRIVATE KEY` / `Bearer ` / `client-key-data:` / etc., failing the test if any match.
+
+#### Wire protocol (`muxtop-proto`)
+- `PodSnapshot`, `NodeSnapshot`, `DeploymentSnapshot`, `KubeSnapshot`, `PodPhase` (7 variants incl. synthetic `CrashLoop`/`Terminating`), `NodeStatus`, `QosClass`, `DeploymentStrategy`, `ClusterKind` (8 variants) all derive `Serialize`, `Deserialize`, `Encode`, `Decode`, `PartialEq`, `Clone`, `Debug` so they cross the wire via `WireMessage::Snapshot(SystemSnapshot)` unchanged.
+- Integration tests: round-trip on populated `KubeSnapshot` (50 pods + 5 nodes + 10 deployments), `unavailable()` sentinel round-trip, frame-size sanity check (1000 pods + 50 nodes + 100 deployments encoded < 1 MiB, well under `MAX_FRAME_SIZE` 4 MiB), anti-leak guard.
+
+### Wire protocol break
+
+- `SystemSnapshot` gains `kube: Option<KubeSnapshot>` between `containers` and `timestamp_ms`. **bincode is order-sensitive — pre-v0.4 clients cannot decode v0.4 snapshots and vice versa.** The new field is `Option`, so the schema mirrors how `containers` was added in v0.3.0.
+
+### Binary size
+
+| | v0.3.1 baseline | v0.4.0 | Delta |
+|---|---|---|---|
+| `muxtop` (release stripped) | 5,542,560 B (5.29 MiB) | **5,988,560 B (5.71 MiB)** | **+0.43 MiB** |
+| `muxtop-server` | 5,226,144 B (4.98 MiB) | **5,672,176 B (5.41 MiB)** | **+0.43 MiB** |
+| `cargo build --release` from-scratch | 2:01.99 (224s user) | **2:22.79 (324s user)** | **+21 s wall (+17 %)** |
+
+Net binary delta is much smaller than the original v0.4 plan budgeted (≤ +5 MiB) thanks to `lto=fat` + `strip=symbols` aggressively dead-code-eliminating the `k8s-openapi` types we don't reference from the typed-API path. ADR-04 preserved the engagement to revisit if the delta crossed +5 MiB; that threshold is unmet, no remediation required.
+
+### Dependencies (workspace)
+- `kube = "0.99"` (default-features = false; features `client` + `rustls-tls` + `runtime` only) — Kubernetes client + watchers.
+- `k8s-openapi = "0.24"` (workspace declares no version feature; binary leaves `muxtop` and `muxtop-server` plus muxtop-core dev-deps each enable `v1_31`, per the k8s-openapi library guideline).
+- `http = "1"` — needed by `kube::Client::request_text` for the metrics-server raw HTTP path.
+- `serde_json = "1"` — metrics-server response parsing without a typed metrics crate.
+- `dirs = "6"` — moved from binary-only to a `muxtop-core` library dep so `detect_kubeconfig` can resolve `~/.kube/config`.
+
+CI implication: `cargo check --workspace` no longer suffices because `k8s-openapi` forbids enabling `v1_*` features in non-binary crates' `[dependencies]`. Use `cargo check --workspace --all-targets` (which activates dev-deps) or build leaf binaries directly.
+
+### Changed
+- `Collector::with_engines(interval, container, cluster)` — superset constructor; `Collector::new` and `Collector::with_container_engine` preserved as wrappers for backward compatibility within the library.
+- `SystemSnapshot::collect` signature gained a fourth argument `kube: Option<KubeSnapshot>`. All internal call sites (collector + 4 sysinfo tests + 2 benches + alloc_profile example + the wire-module stub) updated; consumers outside the workspace do not need to change because the only production caller is the Collector.
+- `Tab::ALL` now has 5 variants; `Tab::next()` / `Tab::prev()` cycle General → Processes → Network → Containers → **Kube** → General. Arrow / Tab / BackTab navigation updated accordingly.
+- `WireMessage` and `Event` enums get `#[allow(clippy::large_enum_variant)]` with rationale comments — boxing the `Snapshot` variant would impose a heap allocation on every collector tick, which v0.3.1's perf sweep specifically eliminated. The variant size difference is an accepted trade-off.
+
+### Tests
+- Workspace test count: 560 (v0.3.1) → **612** (v0.4.0). New tests by area:
+  - `muxtop-core` cluster_engine (15: kubeconfig detection priority, ClusterError variants, trait dyn-safety + stub, …) + kube data model (15: clone/eq, exhaustive enum matches, round-trip per-type, anti-leak guard) + kube_engine (21: connect rejection paths, Pod/Node/Deployment conversion green + edge cases, metrics injection, quantity parsing, cluster-kind heuristic, end-to-end populated snapshot).
+  - `muxtop-tui` ui::kube (8: format buckets, exhaustive label paths, smoke-render unreachable + populated paths through `ratatui::backend::TestBackend`).
+  - `muxtop-proto` integration (4: KubeSnapshot round-trip, unavailable sentinel, frame-size guard, anti-leak guard).
+  - `muxtop-tui` Tab navigation tests updated to cover the new 5-entry cycle.
+- All `cargo check --workspace --all-targets` / `clippy --workspace --all-targets -- -D warnings` / `fmt --check` / `test --workspace` green on macOS Darwin 25 / Rust 2024 stable.
+
+### Out of scope (deferred to v0.4.x)
+- Sub-view switching `P` / `N` / `D` for Nodes and Deployments tables (the wire data is already there; the UI is mechanical).
+- Sort cycling (`s`) + column-arrow indicators for the Kube tab.
+- Filter (`/`) + namespace toggle (`A`) for Pod / Deployment lists.
+- Per-row sparklines (CPU + MEM) with a 60-entry `VecDeque` per `(namespace, name)`.
+- Write actions (Delete pod, Scale deployment, Rollout restart) — read-only by design in v0.4.0.
+- `kubectl exec` interactive PTY — non-goal for the Kube tab; same call as the deferred `docker exec` PTY (also v0.5+).
+- Log streaming — non-goal (`stern` / `k9s` territory).
+- `#[ignore]` E2E test against a `kind` cluster (T-818) — needs a CI runner with kind preinstalled.
+- ADR-04 follow-up: re-evaluate kube-rs vs `k8s-openapi` direct if a future delta exceeds +5 MiB binary or > +90 s compile wall.
+
 ## [0.3.1] - 2026-04-25
 
 Hardening + performance follow-up to the v0.3.0 Containers release. Closes every finding from the 2026-04-25 security & performance audit, plus a build-profile sweep that almost halves the binary size.

@@ -192,7 +192,7 @@ just dev      # continuous check with bacon
 | **v0.2** ✓ | Network tab (replaces iftop) + client/server architecture (`muxtop-server`, `--remote`) |
 | **v0.3** ✓ | Docker / Podman Containers tab (via [bollard](https://github.com/fussybeaver/bollard)) + Stop/Kill/Restart actions |
 | **v0.3.1** ✓ | TLS 1.3 hardening, per-IP rate limit, ANSI sanitizer, event-driven render, `lto=fat` build sweep |
-| v0.4 | Kubernetes support (via [kube-rs](https://github.com/kube-rs/kube)) |
+| **v0.4** ✓ | Kubernetes Pod tab (read-only) via [kube-rs](https://github.com/kube-rs/kube), kubeconfig auto-detection, metrics-server graceful degradation |
 | v0.5 | GPU monitoring (NVIDIA / AMD / Apple Silicon) + interactive `docker exec` (PTY) |
 | v1.0 | WASM plugin system + themes + configuration file |
 
