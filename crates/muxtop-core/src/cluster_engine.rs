@@ -26,9 +26,11 @@
 
 use std::path::{Path, PathBuf};
 
+use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::container_engine::EnvLookup;
+use crate::kube::{ClusterKind, KubeSnapshot};
 
 /// Errors raised by a [`ClusterEngine`] implementation.
 ///
@@ -96,6 +98,43 @@ pub enum KubeconfigSource {
     InCluster,
     /// No kubeconfig found anywhere.
     None,
+}
+
+/// Abstraction over a running Kubernetes cluster (Docker Desktop, kind,
+/// k3s, EKS, GKE, AKS, OpenShift, plain kubeadm, …).
+///
+/// Implementations MUST be safe to share across tokio tasks
+/// (`Send + Sync + 'static`).
+///
+/// See ADR-04 (`kube-rs vs k8s-openapi direct`): the production implementation
+/// `KubeEngine` (E2) wraps `kube::Client` + `kube_runtime::reflector::Store`s
+/// for Pod / Node / Deployment, plus a 5 s polling loop against
+/// `metrics.k8s.io/v1beta1`. `snapshot()` reads from the in-memory stores
+/// and is therefore CPU-only — the network cost is borne by the watchers.
+///
+/// See ADR-01 (v0.3): `#[async_trait]` is used to keep the trait object-safe;
+/// the Collector holds `Option<Arc<dyn ClusterEngine + Send + Sync>>`.
+#[async_trait]
+pub trait ClusterEngine: Send + Sync {
+    /// Build a fresh snapshot of the cluster's pods, nodes and deployments
+    /// from the in-memory reflector caches.
+    ///
+    /// Implementations MUST NOT block on network I/O here — use the watcher
+    /// stream + metrics polling tasks for that. This call is on the hot
+    /// path of the collector tick and budgeted to < 50 ms even with 1000+
+    /// pods (cf. v0.4 plan T-816).
+    async fn snapshot(&self) -> Result<KubeSnapshot, ClusterError>;
+
+    /// Probe the API discovery for `metrics.k8s.io/v1beta1`. Result is cached
+    /// by the implementation (typically 60 s) since this drives a UI badge.
+    async fn metrics_available(&self) -> bool;
+
+    /// Reported cluster fingerprint, used to label the UI.
+    fn kind(&self) -> ClusterKind;
+
+    /// `serverVersion.gitVersion` from the discovery API. `None` until the
+    /// initial probe succeeds.
+    fn server_version(&self) -> Option<&str>;
 }
 
 /// Pure, injectable kubeconfig detection — the real [`detect_kubeconfig`] is
@@ -346,5 +385,51 @@ mod tests {
     fn cluster_error_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<ClusterError>();
+    }
+
+    // -------- ClusterEngine trait shape --------
+
+    /// Trivially-correct stub used only to assert the trait shape compiles
+    /// in a `Box<dyn ClusterEngine>` (object-safety regression guard).
+    /// The real impl lives in `kube_engine.rs` (E2).
+    struct StubCluster;
+
+    #[async_trait::async_trait]
+    impl ClusterEngine for StubCluster {
+        async fn snapshot(&self) -> Result<KubeSnapshot, ClusterError> {
+            Ok(KubeSnapshot::unavailable())
+        }
+
+        async fn metrics_available(&self) -> bool {
+            false
+        }
+
+        fn kind(&self) -> ClusterKind {
+            ClusterKind::Generic
+        }
+
+        fn server_version(&self) -> Option<&str> {
+            None
+        }
+    }
+
+    #[test]
+    fn cluster_engine_is_object_safe() {
+        fn assert_send_sync<T: Send + Sync + ?Sized>() {}
+        assert_send_sync::<dyn ClusterEngine>();
+
+        // Build through the dyn pointer — proves dyn-safety end-to-end.
+        let _boxed: Box<dyn ClusterEngine + Send + Sync> = Box::new(StubCluster);
+    }
+
+    #[tokio::test]
+    async fn cluster_engine_stub_returns_unavailable() {
+        let stub: Box<dyn ClusterEngine + Send + Sync> = Box::new(StubCluster);
+        let snap = stub.snapshot().await.expect("stub never errors");
+        assert!(!snap.reachable);
+        assert!(snap.pods.is_empty());
+        assert_eq!(stub.kind(), ClusterKind::Generic);
+        assert!(stub.server_version().is_none());
+        assert!(!stub.metrics_available().await);
     }
 }
