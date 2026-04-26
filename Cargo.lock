@@ -2026,6 +2026,7 @@ version = "0.3.1"
 dependencies = [
  "bincode",
  "criterion",
+ "k8s-openapi",
  "muxtop-core",
  "rcgen",
  "rustls-pki-types",

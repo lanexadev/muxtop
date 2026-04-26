@@ -2,6 +2,10 @@ use bincode::config;
 use tokio::net::{TcpListener, TcpStream};
 
 use muxtop_core::containers::{ContainerSnapshot, ContainerState, ContainersSnapshot, EngineKind};
+use muxtop_core::kube::{
+    ClusterKind, DeploymentSnapshot, DeploymentStrategy, KubeSnapshot, NodeSnapshot, NodeStatus,
+    PodPhase, PodSnapshot, QosClass,
+};
 use muxtop_core::network::{NetworkInterfaceSnapshot, NetworkSnapshot};
 use muxtop_core::process::ProcessInfo;
 use muxtop_core::system::{
@@ -277,6 +281,164 @@ fn test_containers_snapshot_100_fits_under_frame_limit() {
         size < MAX_FRAME_SIZE as usize,
         "100 containers encoded to {size} bytes, exceeds MAX_FRAME_SIZE"
     );
+}
+
+// ---- v0.4 Kubernetes wire protocol tests (E3) ----
+
+fn sample_pod(i: usize) -> PodSnapshot {
+    PodSnapshot {
+        namespace: "default".into(),
+        name: format!("pod-{i:04}"),
+        phase: match i % 5 {
+            0 => PodPhase::Running,
+            1 => PodPhase::Pending,
+            2 => PodPhase::Succeeded,
+            3 => PodPhase::CrashLoop,
+            _ => PodPhase::Failed,
+        },
+        ready: ((i % 3) as u8, 3),
+        restarts: (i % 8) as u32,
+        age_seconds: 3600 + (i as u64 * 7),
+        node: format!("node-{}", i % 10),
+        cpu_millis: Some(((i * 13) % 2000) as u32),
+        mem_bytes: Some((128 + (i % 512) as u64) * 1024 * 1024),
+        qos: match i % 3 {
+            0 => QosClass::Guaranteed,
+            1 => QosClass::Burstable,
+            _ => QosClass::BestEffort,
+        },
+    }
+}
+
+fn sample_node(i: usize) -> NodeSnapshot {
+    NodeSnapshot {
+        name: format!("node-{i:02}"),
+        status: NodeStatus::Ready,
+        roles: vec!["worker".into()],
+        age_seconds: 86_400 * (1 + i as u64),
+        kubelet_version: "v1.31.0".into(),
+        cpu_capacity_millis: 4_000,
+        cpu_allocatable_millis: 3_800,
+        cpu_used_millis: Some((400 + i * 17) as u32),
+        mem_capacity_bytes: 8u64 * 1024 * 1024 * 1024,
+        mem_allocatable_bytes: 7_900u64 * 1024 * 1024,
+        mem_used_bytes: Some((2 + (i as u64 % 4)) * 1024 * 1024 * 1024),
+        pod_count: (10 + (i % 20)) as u32,
+        pod_capacity: 110,
+    }
+}
+
+fn sample_deployment(i: usize) -> DeploymentSnapshot {
+    DeploymentSnapshot {
+        namespace: "default".into(),
+        name: format!("deployment-{i:03}"),
+        replicas_desired: 3,
+        replicas_ready: 3,
+        replicas_uptodate: 3,
+        replicas_available: 3,
+        age_seconds: 3600 * (1 + i as u64),
+        strategy: if i.is_multiple_of(5) {
+            DeploymentStrategy::Recreate
+        } else {
+            DeploymentStrategy::RollingUpdate
+        },
+    }
+}
+
+fn sample_kube_snapshot(pods: usize, nodes: usize, deployments: usize) -> KubeSnapshot {
+    KubeSnapshot {
+        cluster_kind: ClusterKind::Kind,
+        server_version: Some("v1.31.0+kind".into()),
+        current_namespace: "default".into(),
+        reachable: true,
+        metrics_available: true,
+        pods: (0..pods).map(sample_pod).collect(),
+        nodes: (0..nodes).map(sample_node).collect(),
+        deployments: (0..deployments).map(sample_deployment).collect(),
+    }
+}
+
+/// Encode + decode a populated `KubeSnapshot` and assert equality byte-for-byte.
+#[test]
+fn test_kube_snapshot_roundtrip() {
+    let original = sample_kube_snapshot(50, 5, 10);
+    let cfg = config::standard();
+    let bytes = bincode::encode_to_vec(&original, cfg).expect("encode");
+    let (decoded, _): (KubeSnapshot, usize) =
+        bincode::decode_from_slice(&bytes, cfg).expect("decode");
+    assert_eq!(original, decoded);
+}
+
+/// `KubeSnapshot::unavailable()` must round-trip unchanged — `reachable=false`,
+/// empty vecs, `cluster_kind=Generic`. Canonical "no kubeconfig found" sentinel.
+#[test]
+fn test_kube_snapshot_unavailable_roundtrip() {
+    let original = KubeSnapshot::unavailable();
+    let cfg = config::standard();
+    let bytes = bincode::encode_to_vec(&original, cfg).expect("encode");
+    let (decoded, _): (KubeSnapshot, usize) =
+        bincode::decode_from_slice(&bytes, cfg).expect("decode");
+    assert_eq!(original, decoded);
+    assert!(!decoded.reachable);
+    assert!(decoded.pods.is_empty());
+}
+
+/// Stress: 1000 pods + 50 nodes + 100 deployments must fit under 1 MiB and
+/// well under the 4 MiB `MAX_FRAME_SIZE`. If this ever fails, either the
+/// frame cap needs a bump, or the kube model is leaking per-row payload.
+#[test]
+fn test_kube_snapshot_large_fits_under_frame_limit() {
+    let snapshot = sample_kube_snapshot(1000, 50, 100);
+    let cfg = config::standard();
+    let bytes = bincode::encode_to_vec(&snapshot, cfg).expect("encode");
+
+    let size = bytes.len();
+    assert!(
+        size < 1024 * 1024,
+        "1000 pods + 50 nodes + 100 deployments encoded to {size} bytes, exceeds 1 MiB budget"
+    );
+    assert!(
+        size < MAX_FRAME_SIZE as usize,
+        "encoded to {size} bytes, exceeds MAX_FRAME_SIZE"
+    );
+}
+
+// Note: `SystemSnapshot` must carry a `KubeSnapshot` (when E4 wires the field)
+// across the wire. For now we exercise the orthogonal path: encode a
+// `KubeSnapshot` directly and confirm the bincode + serde derive set is stable.
+// Once E4 lands `kube: Option<KubeSnapshot>` in `SystemSnapshot`, add a
+// `test_system_snapshot_with_kube_field_roundtrip` next to the containers analogue.
+
+/// Anti-leak guard — a `KubeSnapshot` serialized through the wire must not
+/// contain any credential-shaped substring (token, kubeconfig, certificate).
+/// Belt-and-suspenders: the struct shape doesn't carry these by design;
+/// this test fires if a future commit adds a leaky field.
+#[test]
+fn test_kube_snapshot_wire_does_not_carry_credentials() {
+    let snap = sample_kube_snapshot(5, 1, 2);
+    let cfg = config::standard();
+    let bytes = bincode::encode_to_vec(&snap, cfg).expect("encode");
+    let haystack = String::from_utf8_lossy(&bytes).to_string();
+
+    let forbidden = [
+        "BEGIN PRIVATE KEY",
+        "BEGIN RSA PRIVATE KEY",
+        "BEGIN EC PRIVATE KEY",
+        "BEGIN CERTIFICATE",
+        "Bearer ",
+        "client-certificate-data:",
+        "client-key-data:",
+        "certificate-authority-data:",
+        "exec:",
+        "kind: Config",
+        "apiVersion: v1",
+    ];
+    for needle in forbidden {
+        assert!(
+            !haystack.contains(needle),
+            "wire-encoded KubeSnapshot leaked credential token `{needle}`"
+        );
+    }
 }
 
 /// Verify the `WireMessage::Error` channel is orthogonal to container data —

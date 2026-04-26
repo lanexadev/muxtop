@@ -5,26 +5,22 @@
 //! logic lives in `cluster_engine.rs` (trait) and `kube_engine.rs` (concrete
 //! kube-rs impl, E2); this module is data-only.
 //!
-//! ## Wire-protocol note
-//!
-//! Per the v0.4 plan E3 (T-821..T-824), the `Encode/Decode/Serialize/Deserialize`
-//! derives will be added in a follow-up commit. They are intentionally absent
-//! here so that the type shape is validated independently of the wire format
-//! (cf. `forge/32-v04-kubernetes-epics/02-orchestrate-E1.md` story S1.5).
-//!
 //! ## Field ordering is contractual
 //!
-//! Once E3 lands the bincode derives, **field order becomes part of the wire
-//! protocol**. Adding fields at the end is a wire-format break (clients must
-//! match the same minor version). This was the lesson from v0.3.1
-//! (`ContainerSnapshot` gaining `id_full` mid-release). Keep new fields at
-//! the bottom of the struct and document the break in `CHANGELOG.md` under
-//! `### Wire protocol break`.
+//! Field order is part of the wire protocol since E3 landed the
+//! `Encode`/`Decode` derives. Adding fields at the end is a wire-format
+//! break (clients must match the same minor version). This was the lesson
+//! from v0.3.1 (`ContainerSnapshot` gaining `id_full` mid-release). Keep
+//! new fields at the bottom of the struct and document the break in
+//! `CHANGELOG.md` under `### Wire protocol break`.
+
+use bincode::{Decode, Encode};
+use serde::{Deserialize, Serialize};
 
 /// Lifecycle phase of a Pod, mirroring the Kubernetes core PodPhase enum
 /// with two synthetic states (`CrashLoop`, `Terminating`) computed from
 /// `containerStatuses[].state` and `metadata.deletionTimestamp` respectively.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
 pub enum PodPhase {
     Pending,
     Running,
@@ -39,7 +35,7 @@ pub enum PodPhase {
 
 /// QoS class assigned by the kube-scheduler. Derived from container
 /// `resources.requests` / `resources.limits`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
 pub enum QosClass {
     Guaranteed,
     Burstable,
@@ -48,7 +44,7 @@ pub enum QosClass {
 
 /// Aggregated readiness of a Node, derived from
 /// `status.conditions[type=Ready]` plus `spec.unschedulable`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
 pub enum NodeStatus {
     Ready,
     NotReady,
@@ -57,7 +53,7 @@ pub enum NodeStatus {
 }
 
 /// Update strategy of a Deployment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
 pub enum DeploymentStrategy {
     RollingUpdate,
     Recreate,
@@ -71,7 +67,7 @@ pub enum DeploymentStrategy {
 /// * Server URL ending in `eks.amazonaws.com` → `Eks`.
 /// * `*.gke.goog` → `Gke`. `*.azmk8s.io` → `Aks`. OpenShift annotation → `Openshift`.
 /// * Otherwise → `Generic`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
 pub enum ClusterKind {
     Generic,
     Kind,
@@ -87,7 +83,7 @@ pub enum ClusterKind {
 /// `metrics.k8s.io` to be served by the cluster (cf. `KubeSnapshot::metrics_available`).
 ///
 /// Wire ordering: see module doc — fields below are appended only.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct PodSnapshot {
     pub namespace: String,
     pub name: String,
@@ -109,7 +105,7 @@ pub struct PodSnapshot {
 
 /// Per-node snapshot. CPU/memory `*_used_*` are `Option` because they
 /// require `metrics.k8s.io` (NodeMetrics).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct NodeSnapshot {
     pub name: String,
     pub status: NodeStatus,
@@ -130,7 +126,7 @@ pub struct NodeSnapshot {
 }
 
 /// Per-deployment snapshot.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct DeploymentSnapshot {
     pub namespace: String,
     pub name: String,
@@ -149,7 +145,7 @@ pub struct DeploymentSnapshot {
 /// `metrics_available = false` is the orthogonal "cluster up but
 /// metrics-server missing" state — pod/node tables render with `—` in the
 /// CPU/MEM columns.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct KubeSnapshot {
     pub cluster_kind: ClusterKind,
     /// `Some(...)` when the API server `/version` endpoint responded; `None`
@@ -360,6 +356,108 @@ mod tests {
                 DeploymentStrategy::RollingUpdate => "rolling",
                 DeploymentStrategy::Recreate => "recreate",
             };
+        }
+    }
+
+    // ---- E3 wire-protocol round-trip + anti-leak guards ----
+
+    use bincode::config;
+
+    #[test]
+    fn pod_snapshot_round_trip() {
+        let original = sample_pod();
+        let cfg = config::standard();
+        let bytes = bincode::encode_to_vec(&original, cfg).expect("encode");
+        let (decoded, _len): (PodSnapshot, usize) =
+            bincode::decode_from_slice(&bytes, cfg).expect("decode");
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn node_snapshot_round_trip() {
+        let original = sample_node();
+        let cfg = config::standard();
+        let bytes = bincode::encode_to_vec(&original, cfg).expect("encode");
+        let (decoded, _len): (NodeSnapshot, usize) =
+            bincode::decode_from_slice(&bytes, cfg).expect("decode");
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn deployment_snapshot_round_trip() {
+        let original = sample_deployment();
+        let cfg = config::standard();
+        let bytes = bincode::encode_to_vec(&original, cfg).expect("encode");
+        let (decoded, _len): (DeploymentSnapshot, usize) =
+            bincode::decode_from_slice(&bytes, cfg).expect("decode");
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn kube_snapshot_round_trip_populated() {
+        let original = KubeSnapshot {
+            cluster_kind: ClusterKind::Kind,
+            server_version: Some("v1.31.0+kind".into()),
+            current_namespace: "default".into(),
+            reachable: true,
+            metrics_available: true,
+            pods: vec![sample_pod(); 25],
+            nodes: vec![sample_node(); 3],
+            deployments: vec![sample_deployment(); 5],
+        };
+        let cfg = config::standard();
+        let bytes = bincode::encode_to_vec(&original, cfg).expect("encode");
+        let (decoded, _len): (KubeSnapshot, usize) =
+            bincode::decode_from_slice(&bytes, cfg).expect("decode");
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn kube_snapshot_round_trip_unavailable() {
+        let original = KubeSnapshot::unavailable();
+        let cfg = config::standard();
+        let bytes = bincode::encode_to_vec(&original, cfg).expect("encode");
+        let (decoded, _len): (KubeSnapshot, usize) =
+            bincode::decode_from_slice(&bytes, cfg).expect("decode");
+        assert_eq!(original, decoded);
+    }
+
+    /// Anti-leak guard — belt-and-suspenders. The current `KubeSnapshot`
+    /// shape contains zero credential-shaped strings, so this test is a
+    /// regression tripwire: if a future commit adds a field that carries
+    /// a token, kubeconfig content, or any TLS material, this test fires.
+    #[test]
+    fn kube_snapshot_wire_does_not_carry_secrets() {
+        let snap = KubeSnapshot {
+            cluster_kind: ClusterKind::Generic,
+            server_version: Some("v1.31.0".into()),
+            current_namespace: "default".into(),
+            reachable: true,
+            metrics_available: true,
+            pods: vec![sample_pod()],
+            nodes: vec![sample_node()],
+            deployments: vec![sample_deployment()],
+        };
+        let cfg = config::standard();
+        let bytes = bincode::encode_to_vec(&snap, cfg).expect("encode");
+        let haystack = String::from_utf8_lossy(&bytes).to_string();
+
+        let forbidden = [
+            "BEGIN PRIVATE KEY",
+            "BEGIN RSA PRIVATE KEY",
+            "BEGIN EC PRIVATE KEY",
+            "BEGIN CERTIFICATE",
+            "Bearer ",
+            "client-certificate-data:",
+            "client-key-data:",
+            "certificate-authority-data:",
+            "exec:",
+        ];
+        for needle in forbidden {
+            assert!(
+                !haystack.contains(needle),
+                "wire-encoded KubeSnapshot leaked credential token `{needle}`"
+            );
         }
     }
 }
