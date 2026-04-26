@@ -26,7 +26,58 @@
 
 use std::path::{Path, PathBuf};
 
+use thiserror::Error;
+
 use crate::container_engine::EnvLookup;
+
+/// Errors raised by a [`ClusterEngine`] implementation.
+///
+/// Bridges into [`CoreError`](crate::error::CoreError) via `#[from]`.
+///
+/// Granularity matches the v0.3 `EngineError` (cf. ADR-01) but adds two
+/// Kubernetes-specific variants: per-resource RBAC ([`Self::Forbidden`]) and
+/// metrics-server absence ([`Self::MetricsUnavailable`]). [`Self::Stale`]
+/// captures the case where the watcher reflector lost its event stream and
+/// the cached state is older than the freshness contract.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ClusterError {
+    /// No kubeconfig source could be resolved (no `$KUBECONFIG`, no
+    /// `~/.kube/config`, no in-cluster ServiceAccount).
+    #[error("no kubeconfig found")]
+    KubeconfigNotFound,
+
+    /// The Kubernetes API server could not be reached (DNS, TCP, TLS, or
+    /// `/version` probe failed).
+    #[error("cluster unreachable: {0}")]
+    Unreachable(String),
+
+    /// RBAC denied a list/watch on a specific resource. `namespace` is
+    /// `None` for cluster-scoped resources (Nodes) or all-namespaces
+    /// queries.
+    #[error("forbidden: cannot access {resource}{}", match namespace {
+        Some(ns) => format!(" in namespace {ns}"),
+        None => String::new(),
+    })]
+    Forbidden {
+        resource: &'static str,
+        namespace: Option<String>,
+    },
+
+    /// `metrics.k8s.io/v1beta1` is not served by this cluster (metrics-server
+    /// missing or disabled). Renders CPU/MEM columns as `—` in the UI.
+    #[error("metrics-server unavailable on this cluster")]
+    MetricsUnavailable,
+
+    /// The cached snapshot is older than the freshness contract — the
+    /// watcher reflector likely lost its event stream and the relist hasn't
+    /// completed yet.
+    #[error("snapshot stale (last update {since_secs}s ago)")]
+    Stale { since_secs: u64 },
+
+    /// Generic engine-reported error carrying its message verbatim.
+    #[error("cluster engine error: {0}")]
+    Other(String),
+}
 
 /// A resolved source for the Kubernetes client configuration.
 ///
@@ -255,5 +306,45 @@ mod tests {
         // Just ensure the production wrapper is sound; result depends on the
         // host so we don't pin it.
         let _ = detect_kubeconfig();
+    }
+
+    // -------- ClusterError --------
+
+    #[test]
+    fn cluster_error_display_is_informative() {
+        let variants: Vec<ClusterError> = vec![
+            ClusterError::KubeconfigNotFound,
+            ClusterError::Unreachable("dns failed".into()),
+            ClusterError::Forbidden {
+                resource: "pods",
+                namespace: Some("kube-system".into()),
+            },
+            ClusterError::Forbidden {
+                resource: "nodes",
+                namespace: None,
+            },
+            ClusterError::MetricsUnavailable,
+            ClusterError::Stale { since_secs: 42 },
+            ClusterError::Other("kaboom".into()),
+        ];
+        for err in &variants {
+            let msg = format!("{err}");
+            assert!(!msg.is_empty(), "empty Display for {err:?}");
+        }
+        // Spot-check that contextual content is surfaced.
+        assert!(format!("{}", variants[1]).contains("dns failed"));
+        let scoped = format!("{}", variants[2]);
+        assert!(scoped.contains("pods"));
+        assert!(scoped.contains("kube-system"));
+        let cluster_scoped = format!("{}", variants[3]);
+        assert!(cluster_scoped.contains("nodes"));
+        assert!(!cluster_scoped.contains("namespace"));
+        assert!(format!("{}", variants[5]).contains("42"));
+    }
+
+    #[test]
+    fn cluster_error_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ClusterError>();
     }
 }
