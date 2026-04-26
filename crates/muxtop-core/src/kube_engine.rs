@@ -24,12 +24,16 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Node, Pod};
+use kube::api::ListParams;
+use kube::config::{KubeConfigOptions, Kubeconfig};
+use kube::{Api, Client, Config};
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::cluster_engine::{ClusterEngine, ClusterError, KubeconfigSource};
@@ -84,26 +88,58 @@ pub struct KubeEngine {
     cancel: CancellationToken,
 }
 
+/// Poll cadence for both the resource list task and the metrics-server
+/// task. Matches the [`ClusterEngine::snapshot`] tick rate the collector
+/// uses (5 s — see ADR-05).
+const POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Per-list timeout — guards the snapshot freshness contract by bounding
+/// how long a single `Api::list` can hold up the loop.
+const LIST_TIMEOUT: Duration = Duration::from_secs(3);
+
 impl KubeEngine {
-    /// Production path — picks up the kubeconfig from `source`, builds a
-    /// `kube::Client`, and spawns the resource + metrics poll tasks.
-    ///
-    /// **Status (S2.3):** rejects [`KubeconfigSource::None`] up-front; all
-    /// other variants return [`ClusterError::Other`] until S2.6 lands the
-    /// real `Config` / `Client` wiring + task spawn. The `snapshot()`
-    /// pipeline below is fully implemented and can be exercised today via
-    /// [`KubeEngine::new_for_test`].
+    /// Production path — builds a `kube::Client` from `source`, probes
+    /// `/version` to fingerprint the cluster, and spawns the resource +
+    /// metrics poll tasks. The returned engine starts with empty caches;
+    /// the first useful [`ClusterEngine::snapshot`] arrives ~5 s later
+    /// once the poll loop has run.
     pub async fn connect(
         source: KubeconfigSource,
-        _context: Option<&str>,
-        _namespace: Option<&str>,
+        context: Option<&str>,
+        namespace: Option<&str>,
     ) -> Result<Self, ClusterError> {
-        if matches!(source, KubeconfigSource::None) {
-            return Err(ClusterError::KubeconfigNotFound);
-        }
-        Err(ClusterError::Other(
-            "KubeEngine::connect is scaffolded only; real wiring lands in v0.4 E2 S2.6".into(),
-        ))
+        let config = build_config(source, context, namespace).await?;
+        let resolved_namespace = config.default_namespace.clone();
+
+        let client = Client::try_from(config)
+            .map_err(|e| ClusterError::Unreachable(format!("client init failed: {e}")))?;
+
+        // Probe /version to fingerprint the cluster. We don't fail the
+        // connection on probe failure — the cluster may still be usable
+        // for list calls; the badge just falls back to `Generic`.
+        let (cluster_kind, server_version) = match probe_version(&client).await {
+            Ok((kind, version)) => (kind, Some(version)),
+            Err(_) => (ClusterKind::Generic, None),
+        };
+
+        let resources = Arc::new(RwLock::new(ResourceCache::default()));
+        let metrics = Arc::new(RwLock::new(MetricsCache::default()));
+        let cancel = CancellationToken::new();
+
+        // Resource poll task.
+        let _resource_handle =
+            spawn_resource_loop(client.clone(), resources.clone(), cancel.clone());
+        // Metrics poll task.
+        let _metrics_handle = spawn_metrics_loop(client.clone(), metrics.clone(), cancel.clone());
+
+        Ok(Self {
+            cluster_kind,
+            server_version,
+            current_namespace: resolved_namespace,
+            resources,
+            metrics,
+            cancel,
+        })
     }
 
     /// Test constructor that bypasses the network entirely. The caches are
@@ -529,6 +565,302 @@ fn creation_age_seconds(
     now_ms.saturating_sub(created_ms) / 1000
 }
 
+// ---- Connect helpers ----------------------------------------------------
+
+/// Build a [`kube::Config`] from a [`KubeconfigSource`] + optional context
+/// and namespace. Maps every kube error to a [`ClusterError::Unreachable`]
+/// (or [`ClusterError::KubeconfigNotFound`] for `Source::None`).
+async fn build_config(
+    source: KubeconfigSource,
+    context: Option<&str>,
+    namespace: Option<&str>,
+) -> Result<Config, ClusterError> {
+    match source {
+        KubeconfigSource::None => Err(ClusterError::KubeconfigNotFound),
+        KubeconfigSource::Env(path) | KubeconfigSource::Home(path) => {
+            let kc = Kubeconfig::read_from(&path).map_err(|e| {
+                ClusterError::Unreachable(format!("read kubeconfig {}: {e}", path.display()))
+            })?;
+            let opts = KubeConfigOptions {
+                context: context.map(String::from),
+                cluster: None,
+                user: None,
+            };
+            let mut cfg = Config::from_custom_kubeconfig(kc, &opts)
+                .await
+                .map_err(|e| ClusterError::Unreachable(format!("apply kubeconfig: {e}")))?;
+            if let Some(ns) = namespace {
+                cfg.default_namespace = ns.to_string();
+            }
+            Ok(cfg)
+        }
+        KubeconfigSource::InCluster => {
+            let mut cfg = Config::incluster()
+                .map_err(|e| ClusterError::Unreachable(format!("in-cluster config: {e}")))?;
+            if let Some(ns) = namespace {
+                cfg.default_namespace = ns.to_string();
+            }
+            Ok(cfg)
+        }
+    }
+}
+
+/// Probe the API server's `/version` endpoint and derive a [`ClusterKind`]
+/// plus version string from the response.
+///
+/// Returns `Err` on any transport or parse failure; callers fall back to
+/// [`ClusterKind::Generic`] and `None`.
+async fn probe_version(client: &Client) -> Result<(ClusterKind, String), ClusterError> {
+    let req = http::Request::builder()
+        .uri("/version")
+        .method("GET")
+        .body(Vec::new())
+        .map_err(|e| ClusterError::Other(format!("/version build: {e}")))?;
+    let body = tokio::time::timeout(LIST_TIMEOUT, client.request_text(req))
+        .await
+        .map_err(|_| {
+            ClusterError::Unreachable(format!("/version timed out after {LIST_TIMEOUT:?}"))
+        })?
+        .map_err(|e| ClusterError::Unreachable(format!("/version: {e}")))?;
+    let v: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| ClusterError::Other(format!("/version parse: {e}")))?;
+    let git_version = v
+        .get("gitVersion")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let kind = cluster_kind_from_git_version(&git_version);
+    Ok((kind, git_version))
+}
+
+// ---- Resource poll loop -------------------------------------------------
+
+/// Spawn the 5 s loop that lists Pods / Nodes / Deployments. Per-resource
+/// failures are logged and the partial cache is preserved (RBAC graceful
+/// degradation — closes the v0.3 lesson on container_engine).
+fn spawn_resource_loop(
+    client: Client,
+    cache: Arc<RwLock<ResourceCache>>,
+    cancel: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let pod_api: Api<Pod> = Api::all(client.clone());
+        let node_api: Api<Node> = Api::all(client.clone());
+        let deployment_api: Api<Deployment> = Api::all(client.clone());
+        let lp = ListParams::default().limit(5_000);
+
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tick_resources(&pod_api, &node_api, &deployment_api, &lp, &cache) => {}
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tokio::time::sleep(POLL_INTERVAL) => {}
+            }
+        }
+    })
+}
+
+async fn tick_resources(
+    pod_api: &Api<Pod>,
+    node_api: &Api<Node>,
+    deployment_api: &Api<Deployment>,
+    lp: &ListParams,
+    cache: &Arc<RwLock<ResourceCache>>,
+) {
+    let pods = match tokio::time::timeout(LIST_TIMEOUT, pod_api.list(lp)).await {
+        Ok(Ok(list)) => Some(list.items),
+        Ok(Err(e)) => {
+            tracing::warn!(target: "muxtop::kube", error = %e, "pods list failed");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(target: "muxtop::kube", "pods list timed out");
+            None
+        }
+    };
+    let nodes = match tokio::time::timeout(LIST_TIMEOUT, node_api.list(lp)).await {
+        Ok(Ok(list)) => Some(list.items),
+        Ok(Err(e)) => {
+            tracing::warn!(target: "muxtop::kube", error = %e, "nodes list failed");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(target: "muxtop::kube", "nodes list timed out");
+            None
+        }
+    };
+    let deployments = match tokio::time::timeout(LIST_TIMEOUT, deployment_api.list(lp)).await {
+        Ok(Ok(list)) => Some(list.items),
+        Ok(Err(e)) => {
+            tracing::warn!(target: "muxtop::kube", error = %e, "deployments list failed");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(target: "muxtop::kube", "deployments list timed out");
+            None
+        }
+    };
+
+    let mut w = cache.write().await;
+    if let Some(p) = pods {
+        w.pods = p;
+    }
+    if let Some(n) = nodes {
+        w.nodes = n;
+    }
+    if let Some(d) = deployments {
+        w.deployments = d;
+    }
+    w.last_update_ms = unix_ms();
+}
+
+// ---- Metrics poll loop --------------------------------------------------
+
+/// Spawn the 5 s loop that polls `/apis/metrics.k8s.io/v1beta1/{pods,nodes}`.
+fn spawn_metrics_loop(
+    client: Client,
+    cache: Arc<RwLock<MetricsCache>>,
+    cancel: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tick_metrics(&client, &cache) => {}
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tokio::time::sleep(POLL_INTERVAL) => {}
+            }
+        }
+    })
+}
+
+async fn tick_metrics(client: &Client, cache: &Arc<RwLock<MetricsCache>>) {
+    let pod_metrics = fetch_metrics_text(client, "/apis/metrics.k8s.io/v1beta1/pods").await;
+    let node_metrics = fetch_metrics_text(client, "/apis/metrics.k8s.io/v1beta1/nodes").await;
+
+    // Treat any error on either path as "metrics-server unavailable". This
+    // matches what k9s does — the user just sees `—` in the CPU/MEM cols.
+    if pod_metrics.is_none() && node_metrics.is_none() {
+        let mut w = cache.write().await;
+        w.available = false;
+        w.pods.clear();
+        w.nodes.clear();
+        return;
+    }
+
+    let mut new_pods: HashMap<(String, String), (u32, u64)> = HashMap::new();
+    if let Some(text) = &pod_metrics
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(text)
+        && let Some(items) = v.get("items").and_then(|x| x.as_array())
+    {
+        for item in items {
+            let ns = item
+                .pointer("/metadata/namespace")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let name = item
+                .pointer("/metadata/name")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            // Sum cpu + mem across containers for the pod.
+            let mut cpu_total: u32 = 0;
+            let mut mem_total: u64 = 0;
+            if let Some(containers) = item.get("containers").and_then(|x| x.as_array()) {
+                for c in containers {
+                    if let Some(cpu) = c.pointer("/usage/cpu").and_then(|x| x.as_str()) {
+                        cpu_total = cpu_total.saturating_add(parse_metrics_cpu_to_millis(cpu));
+                    }
+                    if let Some(mem) = c.pointer("/usage/memory").and_then(|x| x.as_str()) {
+                        mem_total = mem_total.saturating_add(parse_quantity_to_bytes(mem));
+                    }
+                }
+            }
+            if !ns.is_empty() && !name.is_empty() {
+                new_pods.insert((ns, name), (cpu_total, mem_total));
+            }
+        }
+    }
+
+    let mut new_nodes: HashMap<String, (u32, u64)> = HashMap::new();
+    if let Some(text) = &node_metrics
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(text)
+        && let Some(items) = v.get("items").and_then(|x| x.as_array())
+    {
+        for item in items {
+            let name = item
+                .pointer("/metadata/name")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let cpu = item
+                .pointer("/usage/cpu")
+                .and_then(|x| x.as_str())
+                .map(parse_metrics_cpu_to_millis)
+                .unwrap_or(0);
+            let mem = item
+                .pointer("/usage/memory")
+                .and_then(|x| x.as_str())
+                .map(parse_quantity_to_bytes)
+                .unwrap_or(0);
+            if !name.is_empty() {
+                new_nodes.insert(name, (cpu, mem));
+            }
+        }
+    }
+
+    let mut w = cache.write().await;
+    w.available = true;
+    w.pods = new_pods;
+    w.nodes = new_nodes;
+}
+
+async fn fetch_metrics_text(client: &Client, path: &str) -> Option<String> {
+    let req = http::Request::builder()
+        .uri(path)
+        .method("GET")
+        .body(Vec::new())
+        .ok()?;
+    match tokio::time::timeout(LIST_TIMEOUT, client.request_text(req)).await {
+        Ok(Ok(body)) => Some(body),
+        Ok(Err(e)) => {
+            tracing::debug!(target: "muxtop::kube", path, error = %e, "metrics fetch failed");
+            None
+        }
+        Err(_) => {
+            tracing::debug!(target: "muxtop::kube", path, "metrics fetch timed out");
+            None
+        }
+    }
+}
+
+/// metrics-server reports CPU usage in nanocores (`"123456789n"`) most of
+/// the time, but occasionally as plain milli (`"100m"`) or core (`"1"`)
+/// units depending on the source. Converge on millis.
+pub(crate) fn parse_metrics_cpu_to_millis(raw: &str) -> u32 {
+    let s = raw.trim();
+    if let Some(stripped) = s.strip_suffix('n') {
+        // nanocores → millicores: divide by 1_000_000, saturate.
+        return stripped
+            .parse::<u64>()
+            .map(|n| (n / 1_000_000) as u32)
+            .unwrap_or(0);
+    }
+    if let Some(stripped) = s.strip_suffix('u') {
+        // microcores → millicores: divide by 1_000.
+        return stripped
+            .parse::<u64>()
+            .map(|n| (n / 1_000) as u32)
+            .unwrap_or(0);
+    }
+    parse_quantity_to_millis(s)
+}
+
 // ---- Cluster kind heuristic ---------------------------------------------
 
 /// Derive a [`ClusterKind`] from the API server `gitVersion` string.
@@ -589,13 +921,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_returns_other_for_unimplemented_source() {
+    async fn connect_with_empty_kubeconfig_is_unreachable() {
+        // An empty file isn't valid YAML/kubeconfig — read or apply fails
+        // and surfaces as Unreachable (carries the kube-rs error verbatim).
         let dir = tempfile::tempdir().unwrap();
         let kc = dir.path().join("config");
         std::fs::File::create(&kc).unwrap();
 
         let res = KubeEngine::connect(KubeconfigSource::Home(kc), None, None).await;
-        assert!(matches!(res, Err(ClusterError::Other(_))));
+        assert!(matches!(res, Err(ClusterError::Unreachable(_))));
+    }
+
+    #[tokio::test]
+    async fn connect_with_missing_path_is_unreachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.yaml");
+        let res = KubeEngine::connect(KubeconfigSource::Env(missing), None, None).await;
+        assert!(matches!(res, Err(ClusterError::Unreachable(_))));
     }
 
     // ---- empty engine ----
@@ -877,6 +1219,18 @@ mod tests {
         assert_eq!(parse_quantity_to_millis("1.5"), 1_500);
         assert_eq!(parse_quantity_to_millis(""), 0);
         assert_eq!(parse_quantity_to_millis("garbage"), 0);
+    }
+
+    #[test]
+    fn parse_metrics_cpu_cases() {
+        // metrics-server reports nanocores most of the time.
+        assert_eq!(parse_metrics_cpu_to_millis("123456789n"), 123); // 123 ms
+        assert_eq!(parse_metrics_cpu_to_millis("1000000000n"), 1_000); // 1 core
+        assert_eq!(parse_metrics_cpu_to_millis("500u"), 0); // 0.5 ms rounded down
+        assert_eq!(parse_metrics_cpu_to_millis("100m"), 100); // already millis
+        assert_eq!(parse_metrics_cpu_to_millis("2"), 2_000); // 2 cores
+        assert_eq!(parse_metrics_cpu_to_millis(""), 0);
+        assert_eq!(parse_metrics_cpu_to_millis("garbage"), 0);
     }
 
     #[test]
