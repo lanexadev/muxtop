@@ -20,6 +20,7 @@ bincode = { workspace = true }
 async-trait = { workspace = true }
 bollard = { workspace = true }
 futures = { workspace = true }
+dirs = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

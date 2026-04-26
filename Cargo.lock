@@ -1591,6 +1591,7 @@ dependencies = [
  "bincode",
  "bollard",
  "criterion",
+ "dirs",
  "futures",
  "libc",
  "serde",

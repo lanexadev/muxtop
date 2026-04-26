@@ -1,4 +1,5 @@
 pub mod actions;
+pub mod cluster_engine;
 pub mod collector;
 pub mod container_engine;
 pub mod containers;
@@ -9,6 +10,7 @@ pub mod process;
 pub mod system;
 
 pub use actions::Signal;
+pub use cluster_engine::{KubeconfigSource, detect_kubeconfig, detect_kubeconfig_with};
 pub use container_engine::{
     ConnectionTarget, ContainerEngine, EngineError, EnvLookup, StdEnv, detect_socket,
 };
