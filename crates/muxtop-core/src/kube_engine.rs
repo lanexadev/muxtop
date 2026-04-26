@@ -27,8 +27,12 @@ use tokio_util::sync::CancellationToken;
 use crate::cluster_engine::{ClusterEngine, ClusterError, KubeconfigSource};
 use crate::kube::{ClusterKind, KubeSnapshot};
 
-/// Shared metrics-server cache (filled by a 5 s poll task in S2.5).
+/// Shared metrics-server cache (filled by the 5 s poll task in S2.5).
+///
+/// `pods` and `nodes` are exercised by the snapshot conversion path (S2.3 /
+/// S2.4) which injects `cpu_millis`/`mem_bytes` into each pod / node row.
 #[derive(Default)]
+#[allow(dead_code)] // pods/nodes wired in S2.3+
 pub(crate) struct MetricsCache {
     /// Whether `/apis/metrics.k8s.io/v1beta1` answered the last probe.
     pub available: bool,
@@ -187,8 +191,7 @@ mod tests {
         // metrics tasks — verify Drop fires the cancellation. We can't
         // observe the spawned tasks here (none in S2.2) so we exercise the
         // token directly via a clone.
-        let engine =
-            KubeEngine::new_for_test(ClusterKind::Generic, None, "default".into());
+        let engine = KubeEngine::new_for_test(ClusterKind::Generic, None, "default".into());
         let token = engine.cancel.clone();
         assert!(!token.is_cancelled());
         drop(engine);

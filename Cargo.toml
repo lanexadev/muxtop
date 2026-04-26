@@ -74,6 +74,13 @@ futures = "0.3"
 kube = { version = "0.99", default-features = false, features = ["client", "rustls-tls", "runtime"] }
 k8s-openapi = { version = "0.24" }
 
+# HTTP types — used by KubeEngine metrics polling (request_text); already a
+# transitive dep via kube-client, declared explicitly here for clarity.
+http = "1"
+
+# JSON parsing — used by KubeEngine metrics-server response parsing (S2.5).
+serde_json = "1"
+
 # TLS
 tokio-rustls = "0.26"
 rustls-pki-types = "1"
