@@ -5,6 +5,7 @@ pub mod container_engine;
 pub mod containers;
 pub mod docker_engine;
 pub mod error;
+pub mod kube;
 pub mod network;
 pub mod process;
 pub mod system;
@@ -19,4 +20,8 @@ pub use container_engine::{
 pub use containers::{ContainerSnapshot, ContainerState, ContainersSnapshot, EngineKind};
 pub use docker_engine::DockerEngine;
 pub use error::CoreError;
+pub use kube::{
+    ClusterKind, DeploymentSnapshot, DeploymentStrategy, KubeSnapshot, NodeSnapshot, NodeStatus,
+    PodPhase, PodSnapshot, QosClass,
+};
 pub use network::{NetworkHistory, NetworkInterfaceSnapshot, NetworkSnapshot};
