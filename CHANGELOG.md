@@ -75,7 +75,29 @@ Net binary delta is much smaller than the original v0.4 plan budgeted (≤ +5 Mi
 - `serde_json = "1"` — metrics-server response parsing without a typed metrics crate.
 - `dirs = "6"` — moved from binary-only to a `muxtop-core` library dep so `detect_kubeconfig` can resolve `~/.kube/config`.
 
-CI implication: `cargo check --workspace` no longer suffices because `k8s-openapi` forbids enabling `v1_*` features in non-binary crates' `[dependencies]`. Use `cargo check --workspace --all-targets` (which activates dev-deps) or build leaf binaries directly.
+CI implication: `cargo check --workspace` no longer suffices because `k8s-openapi` forbids enabling `v1_*` features in non-binary crates' `[dependencies]`. Use `cargo check --workspace --all-targets` (which activates dev-deps) or build leaf binaries directly. **Publishing muxtop-core to crates.io** runs a verification build of the lib alone — without dev-deps active — so the publish workflow now sets `K8S_OPENAPI_ENABLED_VERSION=1.31` (the documented k8s-openapi escape hatch) at job-level env in `.github/workflows/publish-manual.yml`.
+
+### Performance
+
+A new criterion benchmark in `crates/muxtop-core/benches/kube_bench.rs` measures the hot-path Pod-to-snapshot conversion. Three groups, all on the same synthesized 1000-pod fixture (varied phases / restart counts / namespaces):
+
+| Bench | Median |
+|---|---|
+| `kube_snapshot/100_pods/with_metrics`  | ~67 µs |
+| `kube_snapshot/1000_pods/with_metrics` | ~728 µs |
+| `kube_snapshot/1000_pods/no_metrics`   | ~720 µs |
+
+The original v0.4 plan budgeted < 50 ms at 1000 pods (T-816). Measured cost is **~68× under budget**, leaving substantial headroom for cache-and-reuse strategies later if event-driven render starts to bottleneck on the conversion. Metrics injection is a `HashMap::get` per pod — its cost is below noise vs no-metrics.
+
+Incremental compile time (release profile, after the kube-rs deps land):
+
+| Scenario | Wall |
+|---|---|
+| from-scratch (clean target) | ~2:04–2:22 (CPU-thermal variance) |
+| no-op rebuild               | **0.69 s** |
+| touch `kube_engine.rs` (cascade through LTO) | ~2:04 |
+
+The no-op number drives the daily-development feedback loop and is unchanged from v0.3.1. The touch-and-rebuild is essentially a full rebuild because `lto=fat` + `codegen-units=1` invalidates downstream LLVM artefacts on any input change in muxtop-core — accepted trade-off for the binary size win documented above.
 
 ### Changed
 - `Collector::with_engines(interval, container, cluster)` — superset constructor; `Collector::new` and `Collector::with_container_engine` preserved as wrappers for backward compatibility within the library.

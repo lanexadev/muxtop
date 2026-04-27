@@ -45,3 +45,7 @@ harness = false
 [[bench]]
 name = "network_bench"
 harness = false
+
+[[bench]]
+name = "kube_bench"
+harness = false

@@ -168,6 +168,41 @@ impl KubeEngine {
     }
 }
 
+/// Bench-only entry point: convert a flat list of typed Pods into a
+/// `KubeSnapshot` using the same conversion path that `KubeEngine::snapshot`
+/// uses internally. Exposed `pub` (with `#[doc(hidden)]`) so the
+/// `kube_bench` Criterion benchmark can drive the conversion without
+/// reaching into `pub(crate)` internals.
+///
+/// Not intended for production callers — the regular path is to attach a
+/// `KubeEngine` to the [`crate::collector::Collector`].
+#[doc(hidden)]
+pub fn build_kube_snapshot_for_bench(
+    pods: Vec<k8s_openapi::api::core::v1::Pod>,
+    pod_metrics: std::collections::HashMap<(String, String), (u32, u64)>,
+) -> KubeSnapshot {
+    let now_ms = unix_ms();
+    let metrics = MetricsCache {
+        available: !pod_metrics.is_empty(),
+        pods: pod_metrics,
+        nodes: std::collections::HashMap::new(),
+    };
+    let pod_snaps: Vec<PodSnapshot> = pods
+        .iter()
+        .map(|p| pod_to_snapshot(p, &metrics, now_ms))
+        .collect();
+    KubeSnapshot {
+        cluster_kind: ClusterKind::Generic,
+        server_version: None,
+        current_namespace: String::new(),
+        reachable: true,
+        metrics_available: metrics.available,
+        pods: pod_snaps,
+        nodes: Vec::new(),
+        deployments: Vec::new(),
+    }
+}
+
 impl Drop for KubeEngine {
     fn drop(&mut self) {
         self.cancel.cancel();
