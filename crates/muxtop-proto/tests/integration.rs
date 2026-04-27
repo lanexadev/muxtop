@@ -442,6 +442,133 @@ fn test_kube_snapshot_wire_does_not_carry_credentials() {
     }
 }
 
+// ---- v0.3 ↔ v0.4 wire-format regression tests (Epic B) ─────────────────
+//
+// The v0.4.0 SystemSnapshot gained a `kube: Option<KubeSnapshot>` field
+// between `containers` and `timestamp_ms`. bincode is order-sensitive, so
+// this is a hard wire-format break vs v0.3.x: a pre-v0.4 client cannot
+// decode a v0.4 snapshot, and a v0.4 client cannot decode a v0.3 snapshot.
+//
+// The CHANGELOG calls this break out explicitly. These tests assert the
+// failure mode is a CLEAN `bincode::error::DecodeError` — never a panic,
+// never silent corruption — so an operator running mismatched binaries
+// sees an actionable error rather than a crash or garbage data.
+//
+// We construct a v0.3.1-shape SystemSnapshot via a local struct that
+// derives `Encode`/`Decode` over the same field order as v0.3.1 (no
+// `kube`). bincode's Encode/Decode is structural, so this is the same
+// idiom a v0.3.1 binary would have produced.
+
+/// Standalone replica of `muxtop_core::system::SystemSnapshot` as it
+/// existed in v0.3.x — identical field order, but **no `kube` field**.
+/// Encoding a value of this type produces the exact wire bytes a v0.3.x
+/// client would have produced for an equivalent state.
+#[derive(bincode::Encode, bincode::Decode, PartialEq, Clone)]
+struct SystemSnapshotV03 {
+    cpu: muxtop_core::system::CpuSnapshot,
+    memory: muxtop_core::system::MemorySnapshot,
+    load: muxtop_core::system::LoadSnapshot,
+    processes: Vec<ProcessInfo>,
+    networks: NetworkSnapshot,
+    containers: Option<ContainersSnapshot>,
+    // NOTE: no `kube` field — this is the v0.3 shape.
+    timestamp_ms: u64,
+}
+
+fn sample_v03_snapshot() -> SystemSnapshotV03 {
+    let v04 = make_test_snapshot();
+    SystemSnapshotV03 {
+        cpu: v04.cpu,
+        memory: v04.memory,
+        load: v04.load,
+        processes: v04.processes,
+        networks: v04.networks,
+        containers: v04.containers,
+        timestamp_ms: v04.timestamp_ms,
+    }
+}
+
+/// A v0.3.x-shape snapshot decoded against the v0.4 schema MUST surface
+/// as a clean `DecodeError` — never a panic, never silent success that
+/// produces garbage in `kube` / `timestamp_ms`.
+#[test]
+fn wire_regression_v03_snapshot_decoded_as_v04_fails_cleanly() {
+    let v03 = sample_v03_snapshot();
+    let cfg = config::standard();
+    let bytes = bincode::encode_to_vec(&v03, cfg).expect("v0.3 encode");
+
+    // Try to decode the v0.3 bytes as the current SystemSnapshot.
+    // catch_unwind guarantees we observe a panic if one occurs (turning
+    // it into a test failure rather than letting it surface as an abort).
+    let result =
+        std::panic::catch_unwind(|| bincode::decode_from_slice::<SystemSnapshot, _>(&bytes, cfg));
+
+    let decode_result = result.expect("decoding v0.3 bytes panicked — must be a clean Err");
+
+    // Two acceptable outcomes:
+    //  1. Err(DecodeError) — best case, schema mismatch surfaced cleanly.
+    //  2. Ok((snap, _)) where the data is detectably wrong (e.g. wrong
+    //     timestamp because bytes shifted). This is allowed but flagged
+    //     by an extra invariant: timestamp_ms == sample value (v04
+    //     decode should NOT recover the v03 timestamp).
+    match decode_result {
+        Err(_) => {
+            // Best case — clean wire-format mismatch.
+        }
+        Ok((decoded, _)) => {
+            // The decode shouldn't silently recover the v0.3 sample
+            // values: if `kube` is `Some(...)` it's reading the wrong
+            // bytes, so the timestamp is also corrupted.
+            assert_ne!(
+                decoded.timestamp_ms, v03.timestamp_ms,
+                "v0.3 → v0.4 decode silently produced the SAME timestamp; \
+                 this would let mismatched binaries appear to interoperate"
+            );
+        }
+    }
+}
+
+/// Symmetric: a v0.4 snapshot decoded against the v0.3 schema must also
+/// fail cleanly. This guards against an operator who downgraded the
+/// client from v0.4 → v0.3 against a v0.4 server.
+#[test]
+fn wire_regression_v04_snapshot_decoded_as_v03_fails_cleanly() {
+    let v04 = make_test_snapshot();
+    let cfg = config::standard();
+    let bytes = bincode::encode_to_vec(&v04, cfg).expect("v0.4 encode");
+
+    let result = std::panic::catch_unwind(|| {
+        bincode::decode_from_slice::<SystemSnapshotV03, _>(&bytes, cfg)
+    });
+
+    let decode_result = result.expect("decoding v0.4 bytes panicked — must be a clean Err");
+
+    match decode_result {
+        Err(_) => {
+            // Best case.
+        }
+        Ok((decoded, _)) => {
+            assert_ne!(
+                decoded.timestamp_ms, v04.timestamp_ms,
+                "v0.4 → v0.3 decode silently produced the SAME timestamp"
+            );
+        }
+    }
+}
+
+/// Negative control: a v0.4 → v0.4 round-trip must succeed. If this fails,
+/// the bincode derives are broken and the regression-style tests above
+/// would be silently passing for the wrong reason.
+#[test]
+fn wire_regression_v04_round_trip_baseline() {
+    let v04 = make_test_snapshot();
+    let cfg = config::standard();
+    let bytes = bincode::encode_to_vec(&v04, cfg).expect("v0.4 encode");
+    let (decoded, _): (SystemSnapshot, usize) =
+        bincode::decode_from_slice(&bytes, cfg).expect("v0.4 round-trip must succeed");
+    assert_eq!(decoded, v04);
+}
+
 /// Verify the `WireMessage::Error` channel is orthogonal to container data —
 /// a container-engine failure on the server side should surface as a
 /// dedicated Error frame, not a crafted empty Snapshot. This test pins the

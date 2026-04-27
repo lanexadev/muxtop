@@ -1314,4 +1314,77 @@ mod tests {
         assert_eq!(snap.server_version.as_deref(), Some("v1.31.0"));
         assert_eq!(snap.current_namespace, "default");
     }
+
+    // ─── real cluster integration ────────────────────────────────────────
+    //
+    // These tests exercise the full `KubeEngine` boot path against whatever
+    // cluster is at `~/.kube/config` / `$KUBECONFIG`. They are `#[ignore]`d
+    // by default because muxtop's regular test suite must remain runnable
+    // on machines without a kubeconfig.
+    //
+    // Local recipe (kind):
+    //   $ kind create cluster
+    //   $ cargo test -p muxtop-core --lib kube_engine -- --ignored
+    //   $ kind delete cluster
+    //
+    // The first test waits up to 10 s after `connect()` to give the 5 s
+    // resource-poll loop a chance to populate the cache; without that
+    // wait the snapshot would always read `reachable = false` because
+    // `last_update_ms` is still 0. We poll snapshot() in a tight loop
+    // rather than `tokio::time::sleep(Duration::from_secs(10))` once so
+    // the test passes as soon as the data is ready.
+
+    /// Connect to the local cluster, wait for the resource-poll loop to
+    /// publish at least one snapshot, then assert basic invariants.
+    /// Requires a reachable kubeconfig context.
+    #[tokio::test]
+    #[ignore = "requires a reachable Kubernetes cluster (kind / k3d / EKS / etc.)"]
+    async fn integration_connect_and_snapshot() {
+        use crate::cluster_engine::{ClusterEngine, detect_kubeconfig};
+        use std::time::{Duration, Instant};
+
+        let source = detect_kubeconfig();
+        let engine = KubeEngine::connect(source, None, None)
+            .await
+            .expect("connect failed — set $KUBECONFIG to a reachable cluster");
+
+        // The engine boots with empty caches and sets reachable=true only
+        // after the first poll tick (5 s by default). Give it up to 10 s.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut snap = engine.snapshot().await.expect("snapshot");
+        while !snap.reachable && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            snap = engine.snapshot().await.expect("snapshot");
+        }
+        assert!(
+            snap.reachable,
+            "engine never became reachable within 10 s — is the poll loop wired?"
+        );
+
+        // Sanity invariants: a real cluster has at least one node and
+        // muxtop's connect-time `/version` probe populated server_version.
+        assert!(
+            !snap.nodes.is_empty(),
+            "expected at least one node in a real cluster"
+        );
+        // `server_version` is best-effort: the probe can fail without
+        // failing connect(). Don't assert it's Some.
+    }
+
+    /// `--no-kube` equivalent: confirm that omitting connect() leaves the
+    /// snapshot unreachable. This tests via `new_for_test` with an empty
+    /// `last_update_ms = 0`, which is the same state `connect()` produces
+    /// before the first poll.
+    #[tokio::test]
+    async fn empty_engine_snapshot_is_not_reachable() {
+        let engine = KubeEngine::new_for_test(
+            ClusterKind::Generic,
+            None,
+            String::new(),
+            ResourceCache::default(),
+            MetricsCache::default(),
+        );
+        let snap = engine.snapshot().await.unwrap();
+        assert!(!snap.reachable);
+    }
 }
