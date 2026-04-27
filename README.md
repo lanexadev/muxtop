@@ -61,9 +61,10 @@ cargo build --release
 
 | Feature | Detail |
 |---|---|
-| **Tabs** | General, Processes, Network and Containers — `Alt+1` / `Alt+2` / `Alt+3` / `Alt+4` |
+| **Tabs** | General, Processes, Network, Containers and Kubernetes — `Alt+1` / `Alt+2` / `Alt+3` / `Alt+4` / `Alt+5` |
 | **Network tab** | Interface table with RX/s, TX/s, totals, errors + real-time sparklines |
 | **Containers tab** | Docker/Podman via [bollard](https://github.com/fussybeaver/bollard) — CPU/memory/network/IO table, CPU+RX sparklines, `F9` stop / `F10` kill / `F11` restart actions, automatic socket detection |
+| **Kubernetes tab** | Read-only Pods / Nodes / Deployments via [kube-rs](https://github.com/kube-rs/kube) — switch sub-views with `P` / `N` / `D`, sort with `s`, filter with `/`. Auto-detects `$KUBECONFIG` / `~/.kube/config` / in-cluster ServiceAccount; graceful fallback when `metrics-server` is absent (CPU/MEM render `—`) |
 | **Command palette** | `Ctrl+P` — `kill firefox`, `sort memory`, `stop nginx`, `restart postgres`, etc. |
 | **htop shortcuts** | `F3` search, `F4` filter, `F5` tree, `F6` sort, `F9` kill, `F10` quit |
 | **Fuzzy search** | Powered by [nucleo](https://github.com/helix-editor/nucleo) (from the Helix editor) |
@@ -99,6 +100,12 @@ muxtop --about                      # version, license, privacy pledge
 muxtop --docker-socket /var/run/docker.sock   # socket override
 muxtop --no-containers                        # disable container collection
 
+# Kubernetes tab — by default muxtop reads $KUBECONFIG, then ~/.kube/config,
+# then falls back to in-cluster ServiceAccount credentials. Override or disable:
+muxtop --kube-context kind-kind               # use a specific kubeconfig context
+muxtop --kube-namespace kube-system           # override the default namespace
+muxtop --no-kube                              # disable cluster collection entirely
+
 # Run the server (TLS + auth required)
 muxtop-server --token "my-secret-16chars" --tls-generate
 muxtop-server --token "my-secret-16chars" --tls-cert cert.pem --tls-key key.pem
@@ -115,7 +122,7 @@ MUXTOP_TOKEN="my-secret-16chars" muxtop --remote host:port --tls-ca cert.pem
 | Key | Action |
 |--------|--------|
 | `Ctrl+P` | Command palette |
-| `Alt+1` / `Alt+2` / `Alt+3` / `Alt+4` | Switch tab (General / Processes / Network / Containers) |
+| `Alt+1` / `Alt+2` / `Alt+3` / `Alt+4` / `Alt+5` | Switch tab (General / Processes / Network / Containers / Kubernetes) |
 | `F1` | Help |
 | `F3` / `/` | Search |
 | `F4` | Process filter |
@@ -127,6 +134,9 @@ MUXTOP_TOKEN="my-secret-16chars" muxtop --remote host:port --tls-ca cert.pem
 | `q` | Quit |
 | `j` / `k` | Navigation (vim-style) |
 | `+` / `-` | Renice (priority) — Processes tab only |
+| `s` | Sort cycle (Network / Containers / Kubernetes tabs) |
+| `S` / `I` | Toggle sort direction (Network / Containers / Kubernetes) |
+| `P` / `N` / `D` | Switch Kube sub-view to **P**ods / **N**odes / **D**eployments (Kubernetes tab only) |
 
 ---
 
@@ -158,16 +168,19 @@ muxtop/
 ├── src/                         # Entry point (clap CLI + tokio bootstrap)
 └── crates/
     ├── muxtop-core/             # System collection, data models, actions
-    │   ├── src/collector.rs     # Async sysinfo loop (1 Hz) + container loop (0.5 Hz)
+    │   ├── src/collector.rs     # 3 async loops: sysinfo 1 Hz, containers 0.5 Hz, cluster 0.2 Hz
     │   ├── src/process.rs       # Sort, filter, process tree
     │   ├── src/system.rs        # CPU / memory / load snapshots
     │   ├── src/network.rs       # Network interfaces + history
     │   ├── src/containers.rs    # Container model (ContainerSnapshot, states, engine)
     │   ├── src/container_engine.rs # Async trait + Docker/Podman socket detection
-    │   └── src/docker_engine.rs # Concrete bollard-backed implementation
+    │   ├── src/docker_engine.rs # Concrete bollard-backed implementation
+    │   ├── src/kube.rs          # Pod / Node / Deployment / Cluster snapshots
+    │   ├── src/cluster_engine.rs # Async trait + kubeconfig detection
+    │   └── src/kube_engine.rs   # Concrete kube-rs-backed implementation
     ├── muxtop-tui/              # ratatui interface
     │   ├── src/app.rs           # State machine, event handling
-    │   └── src/ui/              # Tabs General, Processes, Network, Containers, palette, theme
+    │   └── src/ui/              # Tabs General/Processes/Network/Containers/Kube, palette, theme
     ├── muxtop-proto/            # Wire protocol and binary serialization
     └── muxtop-server/           # TCP daemon for remote monitoring
 ```
@@ -202,8 +215,18 @@ just dev      # continuous check with bacon
 
 muxtop collects **NO** telemetry, **NO** statistics and contacts **NO ONE**. Ever.
 
-It makes no network calls. It is designed for air-gapped production servers.
-If you observe outbound network activity from muxtop, that is a bug — please [report it](https://github.com/lanexadev/muxtop/issues).
+It makes no outbound network calls of its own. It is designed for air-gapped production servers.
+If you observe outbound activity from muxtop that isn't tied to a feature you've enabled, that is a bug — please [report it](https://github.com/lanexadev/muxtop/issues).
+
+### Read-only by design
+
+When the Kubernetes or Containers tab is active, muxtop only **reads** from the corresponding API:
+- Kubernetes : `LIST` on Pods / Nodes / Deployments + `GET` on `metrics.k8s.io/v1beta1`. No `CREATE` / `UPDATE` / `DELETE` / `PATCH` is ever issued. Write actions (Delete pod, Scale deployment, Rollout restart) are explicitly out of scope for v0.4.
+- Containers : `GET /containers/json` + `/stats?stream=false`. The Stop / Kill / Restart actions are gated behind a confirmation dialog and are local-only — disabled in `--remote` mode.
+
+### Remote mode and credentials
+
+In `--remote` mode, the **server** is the only side that opens kubeconfig or Docker socket files. Credentials never traverse the wire — only the digested snapshots do. Anti-leak guards in the test suite (`muxtop-proto/tests/integration.rs`) verify byte-for-byte that no `BEGIN PRIVATE KEY`, `Bearer ` token, or `client-key-data:` field appears in any encoded frame.
 
 ---
 
