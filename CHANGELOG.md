@@ -14,10 +14,18 @@ Major feature release: the **Kubernetes** tab (replaces `k9s`-light) with read-o
 ### Added
 
 #### Kubernetes (`muxtop-core`, `muxtop-tui`, `muxtop`)
-- New `Tab::Kube` (keybind `Alt+5`) with a Pod table in `muxtop-tui/src/ui/kube.rs`: 9 columns NAMESPACE / NAME / READY / STATUS / RESTARTS / AGE / CPU / MEM / NODE, color-coded by phase (Running=success, Pending=warning, Succeeded=accent, Failed/CrashLoop=danger, Terminating/Unknown=dim), with a 1-line cluster summary header (cluster_kind / namespace / counts / metrics-server badge).
-- Three render fallbacks: `kube = None` → "Waiting for cluster data…", `reachable = false` → "No cluster data" with a kubectl hint, empty pod list → "No pods in this cluster.".
-- `metrics-server` graceful degradation: when `/apis/metrics.k8s.io/v1beta1` is unavailable, the CPU and MEM columns render `—` and the summary shows "metrics-server: off" in yellow. The badge logic is bool-driven by `KubeSnapshot::metrics_available`.
-- ANSI / control-char sanitizer (`scrub_ctrl` from v0.3.1) applied to `namespace`, `name` and `node` rendering — closes the terminal-escape spoofing surface for attacker-controlled pod names.
+- New `Tab::Kube` (keybind `Alt+5`) with three sub-views switched by `P` / `N` / `D`:
+  - **Pods** (default) — 9 columns NAMESPACE / NAME / READY / STATUS / RESTARTS / AGE / CPU / MEM / NODE, color-coded by phase (Running=success, Pending=warning, Succeeded=accent, Failed/CrashLoop=danger, Terminating/Unknown=dim).
+  - **Nodes** — 8 columns NAME / STATUS / ROLES / AGE / VERSION / CPU% / MEM% / PODS, color-coded by status (Ready=success, NotReady=danger, SchedDisabled=warning).
+  - **Deployments** — 6 columns NAMESPACE / NAME / READY / UP-TO-DATE / AVAILABLE / AGE, READY column color-coded (green when ready==desired, red when available==0 && desired>0, yellow otherwise).
+- Visual sub-tab bar above the table shows `[P]ods [N]odes [D]eployments` with the active sub-view bold + underlined.
+- 1-line cluster summary header (cluster_kind / namespace / counts / metrics-server badge).
+- **Sort cycling** via `s` (per sub-view: Pods cycle Cpu→Mem→Name→Restarts→Age→Phase ; Nodes cycle CpuPct→MemPct→Name→PodCount→Age ; Deployments cycle Name→ReadyRatio→Namespace→Age). `S` / `I` toggles direction. Active column header shows `↓` / `↑` indicator. Switching sub-view resets sort, filter, and selection.
+- **Filter** via `/` opens an inline capture bar with cursor block; `Esc` clears the filter (when not in input mode); `Enter` commits and exits input mode. Filter applies on the active sub-view (name + namespace for Pods/Deployments, name for Nodes).
+- **Selection + scroll** via `j`/`k` or arrow keys, with bounds tracked through `kube_count()` (filter-aware). The selected row is bolded and highlighted via `theme.selection_bg`.
+- Four render fallbacks: `kube = None` → "Waiting for cluster data…", `reachable = false` → "No cluster data" with a kubectl hint, empty pod list → "No pods in this cluster.", filter shrinks list to zero → "No pods/nodes/deployments match the filter.".
+- `metrics-server` graceful degradation: when `/apis/metrics.k8s.io/v1beta1` is unavailable, the CPU/MEM columns (Pods + Nodes) render `—` and the summary shows "metrics-server: off" in yellow. The badge logic is bool-driven by `KubeSnapshot::metrics_available`.
+- ANSI / control-char sanitizer (`scrub_ctrl` from v0.3.1) applied to every attacker-controlled string in all three sub-views: pod namespace/name/node, node name/kubelet_version, deployment namespace/name, and the user's filter input echoed in the filter bar — closes the terminal-escape spoofing surface for these new render sites.
 
 #### Cluster engine (`muxtop-core`)
 - `ClusterEngine` async trait (see ADR-04 in `forge/32-v04-kubernetes-epics`) with methods `snapshot`, `metrics_available`, `kind`, `server_version`. `#[async_trait]` for dyn-safety, mirroring v0.3 `ContainerEngine`.
@@ -84,10 +92,8 @@ CI implication: `cargo check --workspace` no longer suffices because `k8s-openap
 - All `cargo check --workspace --all-targets` / `clippy --workspace --all-targets -- -D warnings` / `fmt --check` / `test --workspace` green on macOS Darwin 25 / Rust 2024 stable.
 
 ### Out of scope (deferred to v0.4.x)
-- Sub-view switching `P` / `N` / `D` for Nodes and Deployments tables (the wire data is already there; the UI is mechanical).
-- Sort cycling (`s`) + column-arrow indicators for the Kube tab.
-- Filter (`/`) + namespace toggle (`A`) for Pod / Deployment lists.
-- Per-row sparklines (CPU + MEM) with a 60-entry `VecDeque` per `(namespace, name)`.
+- Namespace toggle `A` (current-namespace ↔ all-namespaces) on Pods / Deployments — minor UX, defer to v0.4.x.
+- Per-row sparklines (CPU + MEM) with a 60-entry `VecDeque` per `(namespace, name)` for the selected pod / node / deployment — substantial sub-state that warrants its own pass.
 - Write actions (Delete pod, Scale deployment, Rollout restart) — read-only by design in v0.4.0.
 - `kubectl exec` interactive PTY — non-goal for the Kube tab; same call as the deferred `docker exec` PTY (also v0.5+).
 - Log streaming — non-goal (`stern` / `k9s` territory).
