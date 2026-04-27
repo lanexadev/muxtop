@@ -1,16 +1,23 @@
 //! Kubernetes tab UI (Alt+5) — v0.4.0.
 //!
-//! Renders a table of pods, nodes, or deployments depending on the active
-//! sub-view. The data comes from the latest `KubeSnapshot` carried by the
-//! `SystemSnapshot`. The kube-rs poll loop runs in `muxtop-core` and is
-//! invisible to this module; we just walk vecs.
+//! Renders one of three sub-views (Pods / Nodes / Deployments) selected by
+//! the `P` / `N` / `D` keys. The data comes from the latest `KubeSnapshot`
+//! carried by the `SystemSnapshot`. The kube-rs poll loop runs in
+//! `muxtop-core` and is invisible to this module; we just walk vecs.
 //!
-//! ## Status (E5 minimal)
+//! ## Sort + filter
 //!
-//! v0.4.0 ships the **Pods sub-view** with the table layout and degradation
-//! states (no-cluster / no-metrics / empty). Nodes and Deployments
-//! sub-views, sub-view switching (P/N/D), per-row sparklines, sort cycling
-//! and column-arrow indicators are reserved for v0.4.x — the public state
+//! Sort and filter are applied **at render time** via local helpers
+//! (`sort_pods` / `sort_nodes` / `sort_deployments`). For v0.4.0 cluster
+//! sizes (typical < 500 pods) the per-frame O(n log n) is microsecond-level
+//! and not worth caching. If a future profile shows it matters, the cache
+//! would live next to `sorted_filtered_containers_cache` in `AppState`.
+//!
+//! ## Status (v0.4.0)
+//!
+//! Sub-views, sort cycling, filter, selection scrolling and the ANSI
+//! sanitizer (`scrub_ctrl`) are wired here. **Per-row sparklines and the
+//! all-namespaces toggle (`A`) are deferred to v0.4.x** — the public state
 //! and data model are already in place so the wiring is mechanical.
 
 use ratatui::Frame;
@@ -19,9 +26,13 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table};
 
-use muxtop_core::kube::{ClusterKind, KubeSnapshot, PodPhase};
+use muxtop_core::kube::{
+    ClusterKind, DeploymentSnapshot, KubeSnapshot, NodeSnapshot, NodeStatus, PodPhase, PodSnapshot,
+};
 
-use crate::app::AppState;
+use muxtop_core::process::SortOrder;
+
+use crate::app::{AppState, KubeSortField, KubeSubview};
 use crate::ui::sanitize::scrub_ctrl;
 use crate::ui::theme::Theme;
 
@@ -30,7 +41,7 @@ pub fn draw_kube_tab(frame: &mut Frame, area: Rect, app: &AppState, theme: &Them
     match snap {
         None => draw_waiting(frame, area, theme),
         Some(s) if !s.reachable => draw_unreachable(frame, area, theme, s),
-        Some(s) => draw_pods(frame, area, theme, s),
+        Some(s) => draw_active(frame, area, app, theme, s),
     }
 }
 
@@ -64,13 +75,41 @@ fn draw_unreachable(frame: &mut Frame, area: Rect, theme: &Theme, snap: &KubeSna
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn draw_pods(frame: &mut Frame, area: Rect, theme: &Theme, snap: &KubeSnapshot) {
+/// Active path: summary line + sub-tab bar + (optional) filter line + table.
+fn draw_active(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme, snap: &KubeSnapshot) {
+    let show_filter = app.kube_filter_active || !app.kube_filter_input.is_empty();
+    let mut constraints = vec![
+        Constraint::Length(1), // summary
+        Constraint::Length(1), // sub-tab bar
+    ];
+    if show_filter {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.push(Constraint::Min(1));
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .constraints(constraints)
         .split(area);
 
-    // ---- Summary header ----
+    draw_summary(frame, chunks[0], theme, snap);
+    draw_subtab_bar(frame, chunks[1], theme, app);
+
+    let table_idx = if show_filter {
+        draw_filter_bar(frame, chunks[2], theme, app);
+        3
+    } else {
+        2
+    };
+
+    match app.kube_subview {
+        KubeSubview::Pods => draw_pods(frame, chunks[table_idx], app, theme, snap),
+        KubeSubview::Nodes => draw_nodes(frame, chunks[table_idx], app, theme, snap),
+        KubeSubview::Deployments => draw_deployments(frame, chunks[table_idx], app, theme, snap),
+    }
+}
+
+fn draw_summary(frame: &mut Frame, area: Rect, theme: &Theme, snap: &KubeSnapshot) {
     let kind_label = cluster_kind_label(snap.cluster_kind);
     let metrics_badge = if snap.metrics_available {
         Span::styled("metrics-server: on", Style::default().fg(theme.success))
@@ -91,38 +130,109 @@ fn draw_pods(frame: &mut Frame, area: Rect, theme: &Theme, snap: &KubeSnapshot) 
     ]);
     frame.render_widget(
         Paragraph::new(summary).style(Style::default().bg(theme.header_bg)),
-        chunks[0],
+        area,
     );
+}
 
-    // ---- Pod table ----
-    if snap.pods.is_empty() {
-        let line = Line::from(Span::styled(
-            "  No pods in this cluster.",
-            Style::default().fg(theme.text_dim),
-        ));
-        frame.render_widget(Paragraph::new(line), chunks[1]);
+fn draw_subtab_bar(frame: &mut Frame, area: Rect, theme: &Theme, app: &AppState) {
+    let mut spans = vec![Span::raw(" ")];
+    for (idx, sv) in [
+        KubeSubview::Pods,
+        KubeSubview::Nodes,
+        KubeSubview::Deployments,
+    ]
+    .iter()
+    .enumerate()
+    {
+        let (label_letter, rest) = match sv {
+            KubeSubview::Pods => ("P", "ods"),
+            KubeSubview::Nodes => ("N", "odes"),
+            KubeSubview::Deployments => ("D", "eployments"),
+        };
+        let active = app.kube_subview == *sv;
+        let style = if active {
+            Style::default()
+                .fg(theme.accent_primary)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(theme.text_dim)
+        };
+        spans.push(Span::styled(format!("[{label_letter}]"), style));
+        spans.push(Span::styled(rest, style));
+        if idx < 2 {
+            spans.push(Span::raw("  "));
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn draw_filter_bar(frame: &mut Frame, area: Rect, theme: &Theme, app: &AppState) {
+    let prompt = if app.kube_filter_active {
+        " filter (Esc/Enter to commit): "
+    } else {
+        " filter: "
+    };
+    let line = Line::from(vec![
+        Span::styled(prompt, Style::default().fg(theme.accent_secondary)),
+        Span::styled(
+            scrub_ctrl(&app.kube_filter_input).into_owned(),
+            Style::default().fg(theme.fg),
+        ),
+        if app.kube_filter_active {
+            Span::styled("█", Style::default().fg(theme.fg))
+        } else {
+            Span::raw("")
+        },
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+// ---- Pods sub-view ------------------------------------------------------
+
+fn draw_pods(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme, snap: &KubeSnapshot) {
+    let pods = sort_pods(filter_pods(&snap.pods, &app.kube_filter_input), app);
+
+    if pods.is_empty() {
+        let msg = if app.kube_filter_input.is_empty() {
+            "  No pods in this cluster."
+        } else {
+            "  No pods match the filter."
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                msg,
+                Style::default().fg(theme.text_dim),
+            ))),
+            area,
+        );
         return;
     }
 
-    let header = Row::new(vec![
-        Cell::from("NAMESPACE"),
-        Cell::from("NAME"),
-        Cell::from("READY"),
-        Cell::from("STATUS"),
-        Cell::from("RESTARTS"),
-        Cell::from("AGE"),
-        Cell::from("CPU"),
-        Cell::from("MEM"),
-        Cell::from("NODE"),
-    ])
-    .style(
-        Style::default()
-            .fg(theme.accent_primary)
-            .add_modifier(Modifier::BOLD),
+    let header = make_header(
+        &[
+            ("NAMESPACE", KubeSortField::PodName), // namespace + name share the Name sort
+            ("NAME", KubeSortField::PodName),
+            ("READY", KubeSortField::PodCpu), // no dedicated sort
+            ("STATUS", KubeSortField::PodPhase),
+            ("RESTARTS", KubeSortField::PodRestarts),
+            ("AGE", KubeSortField::PodAge),
+            ("CPU", KubeSortField::PodCpu),
+            ("MEM", KubeSortField::PodMem),
+            ("NODE", KubeSortField::PodCpu), // no dedicated sort
+        ],
+        app,
+        theme,
     );
 
-    let rows = snap.pods.iter().take(area.height as usize).map(|p| {
+    let visible = pods
+        .iter()
+        .skip(app.kube_scroll_offset)
+        .take(area.height.saturating_sub(1) as usize);
+
+    let rows = visible.enumerate().map(|(i, p)| {
         let phase_style = pod_phase_style(p.phase, theme);
+        let absolute_idx = app.kube_scroll_offset + i;
+        let row_style = row_selection_style(absolute_idx == app.kube_selected, theme);
         Row::new(vec![
             Cell::from(scrub_ctrl(&p.namespace).into_owned()),
             Cell::from(scrub_ctrl(&p.name).into_owned()),
@@ -134,6 +244,7 @@ fn draw_pods(frame: &mut Frame, area: Rect, theme: &Theme, snap: &KubeSnapshot) 
             Cell::from(format_mem(p.mem_bytes)),
             Cell::from(scrub_ctrl(&p.node).into_owned()),
         ])
+        .style(row_style)
     });
 
     let widths = [
@@ -149,7 +260,380 @@ fn draw_pods(frame: &mut Frame, area: Rect, theme: &Theme, snap: &KubeSnapshot) 
     ];
 
     let table = Table::new(rows, widths).header(header);
-    frame.render_widget(table, chunks[1]);
+    frame.render_widget(table, area);
+}
+
+fn filter_pods<'a>(pods: &'a [PodSnapshot], filter: &str) -> Vec<&'a PodSnapshot> {
+    if filter.is_empty() {
+        return pods.iter().collect();
+    }
+    let f = filter.to_lowercase();
+    pods.iter()
+        .filter(|p| p.name.to_lowercase().contains(&f) || p.namespace.to_lowercase().contains(&f))
+        .collect()
+}
+
+fn sort_pods<'a>(mut pods: Vec<&'a PodSnapshot>, app: &AppState) -> Vec<&'a PodSnapshot> {
+    use std::cmp::Ordering;
+    let asc = matches!(app.kube_sort_order, SortOrder::Asc);
+    pods.sort_by(|a, b| {
+        let ord = match app.kube_sort_field {
+            KubeSortField::PodName => a.name.cmp(&b.name),
+            KubeSortField::PodCpu => a
+                .cpu_millis
+                .unwrap_or(0)
+                .cmp(&b.cpu_millis.unwrap_or(0))
+                .reverse(),
+            KubeSortField::PodMem => a
+                .mem_bytes
+                .unwrap_or(0)
+                .cmp(&b.mem_bytes.unwrap_or(0))
+                .reverse(),
+            KubeSortField::PodRestarts => a.restarts.cmp(&b.restarts).reverse(),
+            KubeSortField::PodAge => a.age_seconds.cmp(&b.age_seconds).reverse(),
+            KubeSortField::PodPhase => pod_phase_rank(a.phase).cmp(&pod_phase_rank(b.phase)),
+            _ => Ordering::Equal, // Out-of-domain → render order = list order
+        };
+        if asc { ord.reverse() } else { ord }
+    });
+    pods
+}
+
+/// Phase ordering for sort: most-attention-grabbing first (CrashLoop on top).
+fn pod_phase_rank(p: PodPhase) -> u8 {
+    match p {
+        PodPhase::CrashLoop => 0,
+        PodPhase::Failed => 1,
+        PodPhase::Pending => 2,
+        PodPhase::Terminating => 3,
+        PodPhase::Running => 4,
+        PodPhase::Succeeded => 5,
+        PodPhase::Unknown => 6,
+    }
+}
+
+// ---- Nodes sub-view -----------------------------------------------------
+
+fn draw_nodes(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme, snap: &KubeSnapshot) {
+    let nodes = sort_nodes(filter_nodes(&snap.nodes, &app.kube_filter_input), app);
+
+    if nodes.is_empty() {
+        let msg = if app.kube_filter_input.is_empty() {
+            "  No nodes."
+        } else {
+            "  No nodes match the filter."
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                msg,
+                Style::default().fg(theme.text_dim),
+            ))),
+            area,
+        );
+        return;
+    }
+
+    let header = make_header(
+        &[
+            ("NAME", KubeSortField::NodeName),
+            ("STATUS", KubeSortField::NodeName), // status sort intentionally tied to name
+            ("ROLES", KubeSortField::NodeName),
+            ("AGE", KubeSortField::NodeAge),
+            ("VERSION", KubeSortField::NodeName),
+            ("CPU%", KubeSortField::NodeCpuPct),
+            ("MEM%", KubeSortField::NodeMemPct),
+            ("PODS", KubeSortField::NodePodCount),
+        ],
+        app,
+        theme,
+    );
+
+    let visible = nodes
+        .iter()
+        .skip(app.kube_scroll_offset)
+        .take(area.height.saturating_sub(1) as usize);
+
+    let rows = visible.enumerate().map(|(i, n)| {
+        let status_style = node_status_style(n.status, theme);
+        let absolute_idx = app.kube_scroll_offset + i;
+        let row_style = row_selection_style(absolute_idx == app.kube_selected, theme);
+        Row::new(vec![
+            Cell::from(scrub_ctrl(&n.name).into_owned()),
+            Cell::from(node_status_label(n.status)).style(status_style),
+            Cell::from(n.roles.join(",")),
+            Cell::from(format_age(n.age_seconds)),
+            Cell::from(scrub_ctrl(&n.kubelet_version).into_owned()),
+            Cell::from(format_pct(n.cpu_used_millis, n.cpu_allocatable_millis)),
+            Cell::from(format_pct_u64(n.mem_used_bytes, n.mem_allocatable_bytes)),
+            Cell::from(format!("{}/{}", n.pod_count, n.pod_capacity)),
+        ])
+        .style(row_style)
+    });
+
+    let widths = [
+        Constraint::Length(30),
+        Constraint::Length(20),
+        Constraint::Length(20),
+        Constraint::Length(8),
+        Constraint::Length(15),
+        Constraint::Length(8),
+        Constraint::Length(8),
+        Constraint::Length(10),
+    ];
+
+    let table = Table::new(rows, widths).header(header);
+    frame.render_widget(table, area);
+}
+
+fn filter_nodes<'a>(nodes: &'a [NodeSnapshot], filter: &str) -> Vec<&'a NodeSnapshot> {
+    if filter.is_empty() {
+        return nodes.iter().collect();
+    }
+    let f = filter.to_lowercase();
+    nodes
+        .iter()
+        .filter(|n| n.name.to_lowercase().contains(&f))
+        .collect()
+}
+
+fn sort_nodes<'a>(mut nodes: Vec<&'a NodeSnapshot>, app: &AppState) -> Vec<&'a NodeSnapshot> {
+    use std::cmp::Ordering;
+    let asc = matches!(app.kube_sort_order, SortOrder::Asc);
+    nodes.sort_by(|a, b| {
+        let ord = match app.kube_sort_field {
+            KubeSortField::NodeName => a.name.cmp(&b.name),
+            KubeSortField::NodeAge => a.age_seconds.cmp(&b.age_seconds).reverse(),
+            KubeSortField::NodePodCount => a.pod_count.cmp(&b.pod_count).reverse(),
+            KubeSortField::NodeCpuPct => pct_for(a.cpu_used_millis, a.cpu_allocatable_millis)
+                .partial_cmp(&pct_for(b.cpu_used_millis, b.cpu_allocatable_millis))
+                .unwrap_or(Ordering::Equal)
+                .reverse(),
+            KubeSortField::NodeMemPct => pct_for_u64(a.mem_used_bytes, a.mem_allocatable_bytes)
+                .partial_cmp(&pct_for_u64(b.mem_used_bytes, b.mem_allocatable_bytes))
+                .unwrap_or(Ordering::Equal)
+                .reverse(),
+            _ => Ordering::Equal,
+        };
+        if asc { ord.reverse() } else { ord }
+    });
+    nodes
+}
+
+fn pct_for(used: Option<u32>, total: u32) -> f32 {
+    let Some(u) = used else { return 0.0 };
+    if total == 0 {
+        0.0
+    } else {
+        (u as f32 / total as f32) * 100.0
+    }
+}
+
+fn pct_for_u64(used: Option<u64>, total: u64) -> f32 {
+    let Some(u) = used else { return 0.0 };
+    if total == 0 {
+        0.0
+    } else {
+        (u as f64 / total as f64 * 100.0) as f32
+    }
+}
+
+fn format_pct(used: Option<u32>, total: u32) -> String {
+    let Some(_) = used else { return "—".into() };
+    let pct = pct_for(used, total);
+    format!("{pct:.0}%")
+}
+
+fn format_pct_u64(used: Option<u64>, total: u64) -> String {
+    let Some(_) = used else { return "—".into() };
+    let pct = pct_for_u64(used, total);
+    format!("{pct:.0}%")
+}
+
+fn node_status_label(s: NodeStatus) -> &'static str {
+    match s {
+        NodeStatus::Ready => "Ready",
+        NodeStatus::NotReady => "NotReady",
+        NodeStatus::SchedulingDisabled => "SchedDisabled",
+        NodeStatus::Unknown => "Unknown",
+    }
+}
+
+fn node_status_style(s: NodeStatus, theme: &Theme) -> Style {
+    match s {
+        NodeStatus::Ready => Style::default().fg(theme.success),
+        NodeStatus::NotReady => Style::default().fg(theme.danger),
+        NodeStatus::SchedulingDisabled => Style::default().fg(theme.warning),
+        NodeStatus::Unknown => Style::default().fg(theme.text_dim),
+    }
+}
+
+// ---- Deployments sub-view ----------------------------------------------
+
+fn draw_deployments(
+    frame: &mut Frame,
+    area: Rect,
+    app: &AppState,
+    theme: &Theme,
+    snap: &KubeSnapshot,
+) {
+    let deployments = sort_deployments(
+        filter_deployments(&snap.deployments, &app.kube_filter_input),
+        app,
+    );
+
+    if deployments.is_empty() {
+        let msg = if app.kube_filter_input.is_empty() {
+            "  No deployments."
+        } else {
+            "  No deployments match the filter."
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                msg,
+                Style::default().fg(theme.text_dim),
+            ))),
+            area,
+        );
+        return;
+    }
+
+    let header = make_header(
+        &[
+            ("NAMESPACE", KubeSortField::DeployNamespace),
+            ("NAME", KubeSortField::DeployName),
+            ("READY", KubeSortField::DeployReadyRatio),
+            ("UP-TO-DATE", KubeSortField::DeployReadyRatio),
+            ("AVAILABLE", KubeSortField::DeployReadyRatio),
+            ("AGE", KubeSortField::DeployAge),
+        ],
+        app,
+        theme,
+    );
+
+    let visible = deployments
+        .iter()
+        .skip(app.kube_scroll_offset)
+        .take(area.height.saturating_sub(1) as usize);
+
+    let rows = visible.enumerate().map(|(i, d)| {
+        let ready_style = deployment_ready_style(d, theme);
+        let absolute_idx = app.kube_scroll_offset + i;
+        let row_style = row_selection_style(absolute_idx == app.kube_selected, theme);
+        Row::new(vec![
+            Cell::from(scrub_ctrl(&d.namespace).into_owned()),
+            Cell::from(scrub_ctrl(&d.name).into_owned()),
+            Cell::from(format!("{}/{}", d.replicas_ready, d.replicas_desired)).style(ready_style),
+            Cell::from(d.replicas_uptodate.to_string()),
+            Cell::from(d.replicas_available.to_string()),
+            Cell::from(format_age(d.age_seconds)),
+        ])
+        .style(row_style)
+    });
+
+    let widths = [
+        Constraint::Length(20),
+        Constraint::Length(40),
+        Constraint::Length(8),
+        Constraint::Length(12),
+        Constraint::Length(12),
+        Constraint::Length(8),
+    ];
+
+    let table = Table::new(rows, widths).header(header);
+    frame.render_widget(table, area);
+}
+
+fn filter_deployments<'a>(
+    deployments: &'a [DeploymentSnapshot],
+    filter: &str,
+) -> Vec<&'a DeploymentSnapshot> {
+    if filter.is_empty() {
+        return deployments.iter().collect();
+    }
+    let f = filter.to_lowercase();
+    deployments
+        .iter()
+        .filter(|d| d.name.to_lowercase().contains(&f) || d.namespace.to_lowercase().contains(&f))
+        .collect()
+}
+
+fn sort_deployments<'a>(
+    mut deployments: Vec<&'a DeploymentSnapshot>,
+    app: &AppState,
+) -> Vec<&'a DeploymentSnapshot> {
+    use std::cmp::Ordering;
+    let asc = matches!(app.kube_sort_order, SortOrder::Asc);
+    deployments.sort_by(|a, b| {
+        let ord = match app.kube_sort_field {
+            KubeSortField::DeployName => a.name.cmp(&b.name),
+            KubeSortField::DeployNamespace => a
+                .namespace
+                .cmp(&b.namespace)
+                .then_with(|| a.name.cmp(&b.name)),
+            KubeSortField::DeployAge => a.age_seconds.cmp(&b.age_seconds).reverse(),
+            KubeSortField::DeployReadyRatio => {
+                let ratio = |x: &DeploymentSnapshot| -> f32 {
+                    if x.replicas_desired == 0 {
+                        1.0
+                    } else {
+                        x.replicas_ready as f32 / x.replicas_desired as f32
+                    }
+                };
+                ratio(a).partial_cmp(&ratio(b)).unwrap_or(Ordering::Equal)
+            }
+            _ => Ordering::Equal,
+        };
+        if asc { ord.reverse() } else { ord }
+    });
+    deployments
+}
+
+fn deployment_ready_style(d: &DeploymentSnapshot, theme: &Theme) -> Style {
+    if d.replicas_desired == 0 {
+        return Style::default().fg(theme.text_dim);
+    }
+    if d.replicas_available == 0 {
+        Style::default().fg(theme.danger)
+    } else if d.replicas_ready == d.replicas_desired {
+        Style::default().fg(theme.success)
+    } else {
+        Style::default().fg(theme.warning)
+    }
+}
+
+// ---- Shared helpers -----------------------------------------------------
+
+fn make_header<'a>(cols: &'a [(&'a str, KubeSortField)], app: &AppState, theme: &Theme) -> Row<'a> {
+    let cells: Vec<Cell<'a>> = cols
+        .iter()
+        .map(|(label, field)| {
+            let mut text = (*label).to_string();
+            if app.kube_sort_field == *field {
+                text.push(' ');
+                text.push(match app.kube_sort_order {
+                    SortOrder::Asc => '↑',
+                    SortOrder::Desc => '↓',
+                });
+            }
+            Cell::from(text)
+        })
+        .collect();
+    Row::new(cells).style(
+        Style::default()
+            .fg(theme.accent_primary)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+fn row_selection_style(selected: bool, theme: &Theme) -> Style {
+    if selected {
+        Style::default()
+            .bg(theme.selection_bg)
+            .fg(theme.selection_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    }
 }
 
 fn cluster_kind_label(k: ClusterKind) -> &'static str {
@@ -225,6 +709,9 @@ fn format_mem(bytes: Option<u64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use muxtop_core::kube::{DeploymentStrategy, KubeSnapshot, NodeStatus, PodSnapshot, QosClass};
+
+    // ---- format helpers ----
 
     #[test]
     fn format_age_buckets() {
@@ -245,12 +732,33 @@ mod tests {
     #[test]
     fn format_mem_buckets() {
         assert_eq!(format_mem(None), "—");
-        // 512 bytes is below 1 KiB → rounds to "0K"
         assert_eq!(format_mem(Some(512)), "0K");
         assert_eq!(format_mem(Some(2048)), "2K");
         assert_eq!(format_mem(Some(1024 * 1024)), "1.0M");
         assert_eq!(format_mem(Some(2 * 1024 * 1024 * 1024)), "2.0G");
     }
+
+    #[test]
+    fn format_pct_zero_total_is_zero() {
+        assert_eq!(format_pct(Some(100), 0), "0%");
+    }
+
+    #[test]
+    fn format_pct_none_used_is_dash() {
+        assert_eq!(format_pct(None, 1000), "—");
+        assert_eq!(format_pct_u64(None, 1024), "—");
+    }
+
+    #[test]
+    fn format_pct_typical() {
+        assert_eq!(format_pct(Some(500), 1000), "50%");
+        assert_eq!(
+            format_pct_u64(Some(2 * 1024 * 1024 * 1024), 8 * 1024 * 1024 * 1024),
+            "25%"
+        );
+    }
+
+    // ---- exhaustive label paths ----
 
     #[test]
     fn pod_phase_label_is_exhaustive() {
@@ -264,6 +772,20 @@ mod tests {
             PodPhase::Unknown,
         ] {
             let _ = pod_phase_label(p);
+            let _ = pod_phase_rank(p);
+        }
+    }
+
+    #[test]
+    fn node_status_label_is_exhaustive() {
+        for s in [
+            NodeStatus::Ready,
+            NodeStatus::NotReady,
+            NodeStatus::SchedulingDisabled,
+            NodeStatus::Unknown,
+        ] {
+            let _ = node_status_label(s);
+            let _ = node_status_style(s, &Theme::default());
         }
     }
 
@@ -283,72 +805,194 @@ mod tests {
         }
     }
 
-    #[test]
-    fn pod_to_snapshot_label_paths_compile() {
-        // Ensures we render every PodPhase variant's style without panic.
-        let theme = crate::ui::theme::Theme::default();
-        for p in [
-            PodPhase::Pending,
-            PodPhase::Running,
-            PodPhase::Succeeded,
-            PodPhase::Failed,
-            PodPhase::CrashLoop,
-            PodPhase::Terminating,
-            PodPhase::Unknown,
-        ] {
-            let _style = pod_phase_style(p, &theme);
-        }
+    // ---- filter ----
+
+    fn make_pods() -> Vec<PodSnapshot> {
+        vec![
+            sample_pod("default", "nginx-1", PodPhase::Running, 100, 64),
+            sample_pod("kube-system", "coredns", PodPhase::Running, 50, 32),
+            sample_pod("default", "redis-0", PodPhase::CrashLoop, 0, 16),
+        ]
     }
 
-    /// Smoke test: the unreachable / waiting / empty paths render without
-    /// panic on a minimal terminal buffer.
-    #[test]
-    fn smoke_render_unreachable_does_not_panic() {
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-
-        let backend = TestBackend::new(80, 20);
-        let mut term = Terminal::new(backend).unwrap();
-        let theme = crate::ui::theme::Theme::default();
-        term.draw(|f| {
-            let area = f.area();
-            let snap = KubeSnapshot::unavailable();
-            draw_unreachable(f, area, &theme, &snap);
-        })
-        .unwrap();
-    }
-
-    #[test]
-    fn smoke_render_pods_table_does_not_panic() {
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-
-        let backend = TestBackend::new(120, 30);
-        let mut term = Terminal::new(backend).unwrap();
-        let theme = crate::ui::theme::Theme::default();
-        let pod = muxtop_core::kube::PodSnapshot {
-            namespace: "default".into(),
-            name: "nginx".into(),
-            phase: PodPhase::Running,
+    fn sample_pod(ns: &str, name: &str, phase: PodPhase, cpu: u32, mem_mib: u64) -> PodSnapshot {
+        PodSnapshot {
+            namespace: ns.into(),
+            name: name.into(),
+            phase,
             ready: (1, 1),
             restarts: 0,
             age_seconds: 3600,
             node: "node-1".into(),
-            cpu_millis: Some(15),
-            mem_bytes: Some(64 * 1024 * 1024),
-            qos: muxtop_core::kube::QosClass::Burstable,
-        };
-        let snap = KubeSnapshot {
+            cpu_millis: Some(cpu),
+            mem_bytes: Some(mem_mib * 1024 * 1024),
+            qos: QosClass::Burstable,
+        }
+    }
+
+    #[test]
+    fn filter_pods_by_name() {
+        let pods = make_pods();
+        let filtered = filter_pods(&pods, "nginx");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "nginx-1");
+    }
+
+    #[test]
+    fn filter_pods_by_namespace() {
+        let pods = make_pods();
+        let filtered = filter_pods(&pods, "kube-system");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "coredns");
+    }
+
+    #[test]
+    fn filter_pods_empty_returns_all() {
+        let pods = make_pods();
+        assert_eq!(filter_pods(&pods, "").len(), 3);
+    }
+
+    #[test]
+    fn filter_pods_no_match() {
+        let pods = make_pods();
+        assert_eq!(filter_pods(&pods, "zzz").len(), 0);
+    }
+
+    // ---- sort ----
+
+    fn make_app_with_kube(field: KubeSortField, order: SortOrder) -> AppState {
+        let mut app = AppState::new();
+        app.kube_sort_field = field;
+        app.kube_sort_order = order;
+        app
+    }
+
+    #[test]
+    fn sort_pods_by_cpu_desc() {
+        let pods = make_pods();
+        let app = make_app_with_kube(KubeSortField::PodCpu, SortOrder::Desc);
+        let refs: Vec<&PodSnapshot> = pods.iter().collect();
+        let sorted = sort_pods(refs, &app);
+        // CPU values: nginx=100, coredns=50, redis=0
+        assert_eq!(sorted[0].name, "nginx-1");
+        assert_eq!(sorted[1].name, "coredns");
+        assert_eq!(sorted[2].name, "redis-0");
+    }
+
+    #[test]
+    fn sort_pods_by_phase_puts_crashloop_first() {
+        let pods = make_pods();
+        let app = make_app_with_kube(KubeSortField::PodPhase, SortOrder::Desc);
+        let refs: Vec<&PodSnapshot> = pods.iter().collect();
+        let sorted = sort_pods(refs, &app);
+        assert_eq!(sorted[0].phase, PodPhase::CrashLoop);
+    }
+
+    #[test]
+    fn sort_pods_asc_inverts_desc() {
+        let pods = make_pods();
+        let app_desc = make_app_with_kube(KubeSortField::PodCpu, SortOrder::Desc);
+        let app_asc = make_app_with_kube(KubeSortField::PodCpu, SortOrder::Asc);
+        let refs_desc: Vec<&PodSnapshot> = pods.iter().collect();
+        let refs_asc: Vec<&PodSnapshot> = pods.iter().collect();
+        let desc = sort_pods(refs_desc, &app_desc);
+        let asc = sort_pods(refs_asc, &app_asc);
+        assert_eq!(desc[0].name, asc[2].name);
+        assert_eq!(desc[2].name, asc[0].name);
+    }
+
+    // ---- smoke renders ----
+
+    fn populated_snapshot() -> KubeSnapshot {
+        KubeSnapshot {
             cluster_kind: ClusterKind::Kind,
             server_version: Some("v1.31.0".into()),
             current_namespace: "default".into(),
             reachable: true,
             metrics_available: true,
-            pods: vec![pod],
-            nodes: vec![],
-            deployments: vec![],
-        };
-        term.draw(|f| draw_pods(f, f.area(), &theme, &snap))
+            pods: make_pods(),
+            nodes: vec![NodeSnapshot {
+                name: "node-1".into(),
+                status: NodeStatus::Ready,
+                roles: vec!["control-plane".into()],
+                age_seconds: 86_400,
+                kubelet_version: "v1.31.0".into(),
+                cpu_capacity_millis: 4_000,
+                cpu_allocatable_millis: 3_800,
+                cpu_used_millis: Some(1_900),
+                mem_capacity_bytes: 8 * 1024 * 1024 * 1024,
+                mem_allocatable_bytes: 7_900 * 1024 * 1024,
+                mem_used_bytes: Some(2 * 1024 * 1024 * 1024),
+                pod_count: 12,
+                pod_capacity: 110,
+            }],
+            deployments: vec![DeploymentSnapshot {
+                namespace: "default".into(),
+                name: "nginx".into(),
+                replicas_desired: 3,
+                replicas_ready: 3,
+                replicas_uptodate: 3,
+                replicas_available: 3,
+                age_seconds: 3600,
+                strategy: DeploymentStrategy::RollingUpdate,
+            }],
+        }
+    }
+
+    #[test]
+    fn smoke_render_unreachable_does_not_panic() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let backend = TestBackend::new(80, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = Theme::default();
+        term.draw(|f| {
+            let snap = KubeSnapshot::unavailable();
+            draw_unreachable(f, f.area(), &theme, &snap);
+        })
+        .unwrap();
+    }
+
+    fn render_subview(sv: KubeSubview) {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let backend = TestBackend::new(140, 30);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = Theme::default();
+        let mut app = AppState::new();
+        app.switch_kube_subview(sv);
+        let snap = populated_snapshot();
+        term.draw(|f| draw_active(f, f.area(), &app, &theme, &snap))
+            .unwrap();
+    }
+
+    #[test]
+    fn smoke_render_pods_subview() {
+        render_subview(KubeSubview::Pods);
+    }
+
+    #[test]
+    fn smoke_render_nodes_subview() {
+        render_subview(KubeSubview::Nodes);
+    }
+
+    #[test]
+    fn smoke_render_deployments_subview() {
+        render_subview(KubeSubview::Deployments);
+    }
+
+    #[test]
+    fn smoke_render_with_filter_active() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let backend = TestBackend::new(140, 30);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = Theme::default();
+        let mut app = AppState::new();
+        app.kube_filter_active = true;
+        app.kube_filter_input = "nginx".into();
+        let snap = populated_snapshot();
+        term.draw(|f| draw_active(f, f.area(), &app, &theme, &snap))
             .unwrap();
     }
 }
