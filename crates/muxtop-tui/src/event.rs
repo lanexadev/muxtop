@@ -10,6 +10,11 @@ use muxtop_core::system::SystemSnapshot;
 pub const TICK_RATE: Duration = Duration::from_millis(16);
 
 /// Application events.
+//
+// `large_enum_variant`: same trade-off as `WireMessage::Snapshot` — the hot
+// path emits a snapshot 1 Hz; boxing would mean a heap allocation per
+// emit and per consumer poll, which v0.3.1 perf work showed as material.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Event {
     /// No input event within the tick window.
@@ -112,6 +117,7 @@ mod tests {
                 total_tx: 0,
             },
             containers: None,
+            kube: None,
             timestamp_ms: 0,
         };
         let snapshot_event = Event::Snapshot(snap);

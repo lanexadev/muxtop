@@ -12,6 +12,13 @@ use crate::frame::{
 ///
 /// Uses a custom `Debug` impl to redact `auth_token` in `Hello` messages,
 /// preventing accidental token leakage in logs or panic messages.
+//
+// `large_enum_variant`: Snapshot is intentionally heavier than the control
+// frames — boxing it would force a heap alloc on every tick of the
+// collector → wire pipeline, which is the hot path. The allocation cost
+// of `Box::new` per tick measurably regresses idle CPU. The variant size
+// difference is therefore an accepted trade-off.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub enum WireMessage {
     /// Full system snapshot (server → client).
@@ -244,6 +251,7 @@ mod tests {
                 total_tx: 1000,
             },
             containers: None,
+            kube: None,
             timestamp_ms: 1_713_200_000_000,
         }
     }

@@ -10,7 +10,7 @@ panic = "abort"
 
 [workspace.package]
 edition = "2024"
-version = "0.3.1"
+version = "0.4.0"
 authors = ["Lucas Schimmel"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lanexadev/muxtop"
@@ -66,6 +66,21 @@ async-trait = "0.1"
 bollard = "0.20"
 futures = "0.3"
 
+# Kubernetes API client (v0.4 Kube tab, see ADR-04 in forge/32) — features
+# trimmed to keep binary footprint controlled (see plan T-810/T-820).
+# k8s-openapi forbids library crates from enabling its v1_* features; only
+# the leaf binaries (muxtop, muxtop-server) and the muxtop-core dev-deps
+# enable `v1_31`. The library lines below intentionally carry no features.
+kube = { version = "0.99", default-features = false, features = ["client", "rustls-tls", "runtime"] }
+k8s-openapi = { version = "0.24" }
+
+# HTTP types — used by KubeEngine metrics polling (request_text); already a
+# transitive dep via kube-client, declared explicitly here for clarity.
+http = "1"
+
+# JSON parsing — used by KubeEngine metrics-server response parsing (S2.5).
+serde_json = "1"
+
 # TLS
 tokio-rustls = "0.26"
 rustls-pki-types = "1"
@@ -73,9 +88,9 @@ rcgen = "0.14"
 ring = "0.17"
 
 # Internal crates
-muxtop-core = { path = "crates/muxtop-core", version = "0.3.1" }
-muxtop-tui = { path = "crates/muxtop-tui", version = "0.3.1" }
-muxtop-proto = { path = "crates/muxtop-proto", version = "0.3.1" }
+muxtop-core = { path = "crates/muxtop-core", version = "0.4.0" }
+muxtop-tui = { path = "crates/muxtop-tui", version = "0.4.0" }
+muxtop-proto = { path = "crates/muxtop-proto", version = "0.4.0" }
 
 [package]
 name = "muxtop"
@@ -117,3 +132,6 @@ tracing-appender = { workspace = true }
 dirs = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
+# k8s-openapi v1_31 feature is enabled here (binary leaf) so muxtop-core's
+# typed Pod/Node/Deployment imports resolve. See workspace dep.
+k8s-openapi = { workspace = true, features = ["v1_31"] }
