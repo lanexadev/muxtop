@@ -109,8 +109,27 @@ impl Collector {
 
         // Shared container + kube snapshot slots — written by their
         // respective polling tasks, read by the system loop on every emit.
+        //
+        // Semantic for the kube slot:
+        //   - `None`              → engine attached, first poll has not yet
+        //                           completed (transient, ≤ 5 s after boot).
+        //                           UI renders "Waiting for cluster data…".
+        //   - `Some(unavailable)` → engine attempt FAILED (no kubeconfig,
+        //                           cluster unreachable, etc.). Stable.
+        //                           UI renders "No cluster reachable…".
+        //   - `Some(ok)`          → engine returning live data.
+        //
+        // We seed the slot with `Some(unavailable)` when no engine is
+        // configured so the UI hits the actionable "no cluster" message
+        // immediately instead of "Waiting…" forever (otherwise
+        // indistinguishable from a slow first poll).
         let last_containers: Arc<Mutex<Option<ContainersSnapshot>>> = Arc::new(Mutex::new(None));
-        let last_kube: Arc<Mutex<Option<KubeSnapshot>>> = Arc::new(Mutex::new(None));
+        let initial_kube = if self.cluster_engine.is_some() {
+            None
+        } else {
+            Some(KubeSnapshot::unavailable())
+        };
+        let last_kube: Arc<Mutex<Option<KubeSnapshot>>> = Arc::new(Mutex::new(initial_kube));
 
         // Spawn the container polling loop if an engine is configured.
         let container_task = self.container_engine.take().map(|engine| {
