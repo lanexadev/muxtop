@@ -365,7 +365,7 @@ fn print_about() {
     println!("A modern, multiplexed system monitor for the terminal");
     println!();
     println!("License:     MIT OR Apache-2.0");
-    println!("Repository:  https://github.com/lanexadev/muxtop");
+    println!("Repository:  https://github.com/lucasschimmel/muxtop");
     println!("Authors:     Lucas Schimmel");
     println!();
     println!("Privacy:     muxtop collects NO telemetry, NO analytics,");

@@ -219,7 +219,7 @@ Major feature release: the **Containers** tab (replaces `ctop`) with full Docker
 
 #### Distribution
 - `.deb` package generation for Linux targets (x86_64 and aarch64) via `cargo-deb`, attached to GitHub Releases for Debian/Ubuntu installation.
-- Homebrew tap (`lanexadev/homebrew-tap`) with a formula supporting macOS (Intel + Apple Silicon) and Linux (x86_64 + aarch64).
+- Homebrew tap (`lucasschimmel/homebrew-tap`) with a formula supporting macOS (Intel + Apple Silicon) and Linux (x86_64 + aarch64).
 - Automatic Homebrew formula update in the release workflow on each new tag.
 
 ### Fixed
