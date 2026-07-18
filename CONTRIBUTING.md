@@ -42,7 +42,7 @@ cargo install just bacon cargo-deny
 ## Development Setup
 
 ```sh
-git clone https://github.com/lanexadev/muxtop.git
+git clone https://github.com/lucasschimmel/muxtop.git
 cd muxtop
 cargo build --workspace
 ```

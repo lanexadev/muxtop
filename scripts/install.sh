@@ -2,7 +2,7 @@
 # install.sh — Install muxtop from GitHub Releases
 #
 # Usage:
-#   curl -sSfL https://raw.githubusercontent.com/lanexadev/muxtop/main/scripts/install.sh | sh
+#   curl -sSfL https://raw.githubusercontent.com/lucasschimmel/muxtop/main/scripts/install.sh | sh
 #
 # Environment variables:
 #   MUXTOP_VERSION  — version to install (default: latest)
@@ -10,7 +10,7 @@
 
 set -eu
 
-REPO="lanexadev/muxtop"
+REPO="lucasschimmel/muxtop"
 BINARY="muxtop"
 
 # ---------------------------------------------------------------------------
