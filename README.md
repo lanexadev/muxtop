@@ -2,7 +2,7 @@
 
 **A modern, multiplexed system monitor for the terminal.**
 
-[![CI](https://github.com/lanexadev/muxtop/actions/workflows/ci.yml/badge.svg)](https://github.com/lanexadev/muxtop/actions/workflows/ci.yml)
+[![CI](https://github.com/lucasschimmel/muxtop/actions/workflows/ci.yml/badge.svg)](https://github.com/lucasschimmel/muxtop/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/muxtop.svg)](https://crates.io/crates/muxtop)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](LICENSE-MIT)
 
@@ -22,7 +22,7 @@ cargo install muxtop
 ### Via Homebrew (macOS / Linux)
 
 ```sh
-brew tap lanexadev/tap
+brew tap lucasschimmel/tap
 brew install muxtop
 ```
 
@@ -30,8 +30,8 @@ brew install muxtop
 
 ```sh
 # Add the repo (one time)
-curl -fsSL https://lanexadev.github.io/apt/gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/lanexadev.gpg
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/lanexadev.gpg] https://lanexadev.github.io/apt stable main" | sudo tee /etc/apt/sources.list.d/lanexadev.list
+curl -fsSL https://lucasschimmel.github.io/apt/gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/lucasschimmel.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/lucasschimmel.gpg] https://lucasschimmel.github.io/apt stable main" | sudo tee /etc/apt/sources.list.d/lucasschimmel.list
 
 # Install
 sudo apt update
@@ -41,13 +41,13 @@ sudo apt install muxtop
 ### Pre-built binary (Linux / macOS)
 
 ```sh
-curl -sSfL https://raw.githubusercontent.com/lanexadev/muxtop/main/scripts/install.sh | sh
+curl -sSfL https://raw.githubusercontent.com/lucasschimmel/muxtop/main/scripts/install.sh | sh
 ```
 
 ### From source
 
 ```sh
-git clone https://github.com/lanexadev/muxtop.git
+git clone https://github.com/lucasschimmel/muxtop.git
 cd muxtop
 cargo build --release
 # Binary available at target/release/muxtop
@@ -216,7 +216,7 @@ just dev      # continuous check with bacon
 muxtop collects **NO** telemetry, **NO** statistics and contacts **NO ONE**. Ever.
 
 It makes no outbound network calls of its own. It is designed for air-gapped production servers.
-If you observe outbound activity from muxtop that isn't tied to a feature you've enabled, that is a bug — please [report it](https://github.com/lanexadev/muxtop/issues).
+If you observe outbound activity from muxtop that isn't tied to a feature you've enabled, that is a bug — please [report it](https://github.com/lucasschimmel/muxtop/issues).
 
 ### Read-only by design
 

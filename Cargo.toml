@@ -13,7 +13,7 @@ edition = "2024"
 version = "0.4.0"
 authors = ["Lucas Schimmel"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/lanexadev/muxtop"
+repository = "https://github.com/lucasschimmel/muxtop"
 description = "A modern, multiplexed system monitor for the terminal"
 rust-version = "1.88"
 
