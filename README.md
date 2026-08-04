@@ -64,9 +64,9 @@ cargo build --release
 | **Tabs** | General, Processes, Network, Containers and Kubernetes — `Alt+1` / `Alt+2` / `Alt+3` / `Alt+4` / `Alt+5` |
 | **Network tab** | Interface table with RX/s, TX/s, totals, errors + real-time sparklines |
 | **Containers tab** | Docker/Podman via [bollard](https://github.com/fussybeaver/bollard) — CPU/memory/network/IO table, CPU+RX sparklines, `F9` stop / `F10` kill / `F11` restart actions, automatic socket detection |
-| **Kubernetes tab** | Read-only Pods / Nodes / Deployments via [kube-rs](https://github.com/kube-rs/kube) — switch sub-views with `P` / `N` / `D`, sort with `s`, filter with `/`. Auto-detects `$KUBECONFIG` / `~/.kube/config` / in-cluster ServiceAccount; graceful fallback when `metrics-server` is absent (CPU/MEM render `—`) |
+| **Kubernetes tab** | Read-only Pods / Nodes / Deployments via [kube-rs](https://github.com/kube-rs/kube) — switch sub-views with `P` / `N` / `D`, sort with `s`, filter with `/`. Auto-detects `$KUBECONFIG` / `~/.kube/config` / in-cluster ServiceAccount; graceful fallback when `metrics-server` is absent (CPU/MEM render `—`). Lists **cluster-wide** (requires cluster-scoped `list` on pods, nodes and deployments) |
 | **Command palette** | `Ctrl+P` — `kill firefox`, `sort memory`, `stop nginx`, `restart postgres`, etc. |
-| **htop shortcuts** | `F3` search, `F4` filter, `F5` tree, `F6` sort, `F9` kill, `F10` quit |
+| **htop shortcuts** | `F1`–`F5` sort columns, `F7`/`F8` renice, `F9` kill, `F10` force kill |
 | **Fuzzy search** | Powered by [nucleo](https://github.com/helix-editor/nucleo) (from the Helix editor) |
 | **Tree view** | `F5` toggles the parent/child hierarchical display |
 | **Renice** | `+` / `-` to adjust process priority |
@@ -103,7 +103,7 @@ muxtop --no-containers                        # disable container collection
 # Kubernetes tab — by default muxtop reads $KUBECONFIG, then ~/.kube/config,
 # then falls back to in-cluster ServiceAccount credentials. Override or disable:
 muxtop --kube-context kind-kind               # use a specific kubeconfig context
-muxtop --kube-namespace kube-system           # override the default namespace
+muxtop --kube-namespace kube-system           # set the displayed default namespace
 muxtop --no-kube                              # disable cluster collection entirely
 
 # Run the server (TLS + auth required)
@@ -122,21 +122,25 @@ MUXTOP_TOKEN="my-secret-16chars" muxtop --remote host:port --tls-ca cert.pem
 | Key | Action |
 |--------|--------|
 | `Ctrl+P` | Command palette |
-| `Alt+1` / `Alt+2` / `Alt+3` / `Alt+4` / `Alt+5` | Switch tab (General / Processes / Network / Containers / Kubernetes) |
-| `F1` | Help |
-| `F3` / `/` | Search |
-| `F4` | Process filter |
-| `F5` | Tree view |
-| `F6` | Sort menu |
-| `F9` | Kill process (Processes tab) · Stop container (Containers tab) |
-| `F10` | Force kill (SIGKILL) — process or container depending on the active tab |
-| `F11` | Restart container (Containers tab) |
-| `q` | Quit |
-| `j` / `k` | Navigation (vim-style) |
-| `+` / `-` | Renice (priority) — Processes tab only |
-| `s` | Sort cycle (Network / Containers / Kubernetes tabs) |
-| `S` / `I` | Toggle sort direction (Network / Containers / Kubernetes) |
+| `Alt+1` … `Alt+5` | Switch tab (General / Processes / Network / Containers / Kubernetes) |
+| `Tab` / `Shift+Tab` · `←` / `→` | Cycle to the next / previous tab |
+| `q` · `Ctrl+C` | Quit |
+| `j` / `k` · `↑` / `↓` | Navigation (vim-style) |
+| `g` / `G` · `Home` / `End` | Jump to first / last row |
+| `PageUp` / `PageDown` | Scroll by 20 rows |
+| `/` | Filter (applies to the active tab) |
+| `Esc` | Clear the active filter |
+| `t` | Tree view (Processes) |
+| `s` | Cycle sort field (active tab) |
+| `S` / `I` | Toggle sort direction (active tab) |
+| `F1` … `F5` | Sort processes by PID / name / CPU / memory / user |
+| `F7` / `F8` | Renice — lower (+1) / raise (−1) priority, Processes tab, local mode |
+| `F9` | Kill process, SIGTERM (Processes) · Stop container (Containers) |
+| `F10` | Force kill, SIGKILL (Processes) · Kill container (Containers) |
+| `F11` | Restart container (Containers) |
 | `P` / `N` / `D` | Switch Kube sub-view to **P**ods / **N**odes / **D**eployments (Kubernetes tab only) |
+
+> There is no built-in help screen yet — `Ctrl+P` lists every command with its shortcut.
 
 ---
 

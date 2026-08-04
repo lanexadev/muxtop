@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-08-05
+
+First published release carrying the Kubernetes tab. **0.4.0 was tagged in the changelog and merged to `develop` on 2026-04-26 but never released** — no git tag, no GitHub release, no crates.io publication. Users upgrading from 0.3.1 receive the entire 0.4.0 feature set (see below) plus the security and correctness fixes in this section. There is no 0.4.0 artifact on any distribution channel; the 0.4.0 changelog entry is retained as the record of when that work landed.
+
+### Security
+
+- **Sanitizer bypass on two render paths (`muxtop-tui`)** — the `scrub_ctrl` guard added in v0.3.1 (MED-S5) was applied by the table renderers but not by the confirmation dialog or the footer status bar, both of which interpolate attacker-controlled process `comm` / container names. A process named `bash\x1b]0;…\x07` fired its escape sequence as soon as the user pressed `F9`. `ConfirmAction::prompt()` now scrubs each name, and `AppState::set_status()` scrubs centrally so every current and future caller is covered.
+- **`event-listener` bumped to 5.4.2** — closes RUSTSEC-2026-0221 (unsound `Send`/`Sync` on `StackSlot`, pulled in transitively via `kube-runtime` → `async-broadcast`). `cargo deny check` is green again.
+
+### Fixed
+
+- **`Alt+5` now switches to the Kubernetes tab (`muxtop-tui`)** — the shortcut was documented in the v0.4.0 release notes and the README but never bound; only `Alt+1`–`Alt+4` existed, leaving the Kube tab reachable solely through `Tab` / arrow cycling. A regression test now asserts one `Alt+N` binding per entry in `Tab::ALL`.
+- **Command palette gains `Switch to Kubernetes tab`** — every other tab had a palette entry; the Kube tab did not.
+- **README keyboard reference corrected** — the shortcut table advertised bindings that do not exist (`F1` help, `F3` search, `F4` filter, `F5` tree, `F6` sort menu, `F10` quit, `+` / `-` renice). The real bindings are `F1`–`F5` for process sort columns, `F7` / `F8` for renice, `F10` for force kill, `/` for filter and `t` for tree view. Navigation keys that were implemented but undocumented (`g` / `G`, `Home` / `End`, `PageUp` / `PageDown`, `Esc`, `Tab` / `Shift+Tab`, arrow keys) are now listed.
+
+### Changed
+
+- **`--kube-namespace` documentation corrected (`muxtop`, `muxtop-server`)** — the flag sets the namespace displayed in the Kube header, but Pods / Nodes / Deployments are still listed cluster-wide via `Api::all`. The README and both `--help` texts said "override the default namespace", which read as a scoping filter. Actual namespace scoping remains to be implemented; the cluster-scoped RBAC requirement is now stated in the README feature table.
+
 ## [0.4.0] - 2026-04-26
 
 Major feature release: the **Kubernetes** tab (replaces `k9s`-light) with read-only Pod / Node / Deployment monitoring via [kube-rs](https://github.com/kube-rs/kube). Auto-detection at startup means `muxtop` gains a fifth tab on any host with a reachable kubeconfig.
