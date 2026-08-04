@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-08-05
+
+First published release carrying the Kubernetes tab. **0.4.0 was tagged in the changelog and merged to `develop` on 2026-04-26 but never released** — no git tag, no GitHub release, no crates.io publication. Users upgrading from 0.3.1 receive the entire 0.4.0 feature set (see below) plus the security and correctness fixes in this section. There is no 0.4.0 artifact on any distribution channel; the 0.4.0 changelog entry is retained as the record of when that work landed.
+
 ### Security
 
 - **Sanitizer bypass on two render paths (`muxtop-tui`)** — the `scrub_ctrl` guard added in v0.3.1 (MED-S5) was applied by the table renderers but not by the confirmation dialog or the footer status bar, both of which interpolate attacker-controlled process `comm` / container names. A process named `bash\x1b]0;…\x07` fired its escape sequence as soon as the user pressed `F9`. `ConfirmAction::prompt()` now scrubs each name, and `AppState::set_status()` scrubs centrally so every current and future caller is covered.
