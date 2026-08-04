@@ -14,7 +14,7 @@ fn bench_snapshot_collect(c: &mut Criterion) {
         b.iter(|| {
             sys.refresh_all();
             networks.refresh(true);
-            SystemSnapshot::collect(&sys, &networks, None)
+            SystemSnapshot::collect(&sys, &networks, None, None)
         });
     });
 }

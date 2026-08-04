@@ -156,6 +156,63 @@ just bench       # criterion benchmarks (compile + run)
 
 CI runs tests on **Ubuntu** and **macOS**. If your change is platform-specific, note it in the PR.
 
+### Workspace-wide checks and the `k8s-openapi` feature gate
+
+`k8s-openapi` (transitive via `kube`) refuses to compile a library crate that
+doesn't enable a `v1_*` feature, but it equally refuses to let library crates
+enable one in their `[dependencies]`. The workaround is simple but **the CI
+command must include `--all-targets`** so dev-deps activate:
+
+```sh
+cargo check --workspace --all-targets   # ✅ green — dev-deps enable v1_31
+cargo check --workspace                 # ❌ red on the muxtop-core lib build
+```
+
+`just check` already wraps the correct invocation.
+
+### Testing against Docker / Podman
+
+The Docker integration test in `muxtop-core/src/docker_engine.rs` is gated by
+`#[ignore]`. It needs a running Docker or Podman daemon. Run with:
+
+```sh
+cargo test -p muxtop-core --lib docker_engine -- --ignored
+```
+
+### Testing against Kubernetes
+
+The Kubernetes integration test in `muxtop-core/src/kube_engine.rs::tests::
+integration_connect_and_snapshot` is also gated by `#[ignore]`. It connects
+to whatever cluster `$KUBECONFIG` / `~/.kube/config` resolves to, waits up
+to 10 s for the resource-poll loop to publish the first snapshot, then
+asserts at least one node was returned.
+
+The shortest path is `kind`:
+
+```sh
+# 1. Spin up a local cluster (one-time install: brew install kind / scoop install kind)
+kind create cluster
+
+# 2. Run the ignored kube tests
+cargo test -p muxtop-core --lib kube_engine -- --ignored
+
+# 3. Tear it down
+kind delete cluster
+```
+
+Other targets work too — `k3d cluster create`, an `~/.kube/config` pointed
+at EKS / GKE / AKS, or any reachable kubeconfig context. The test reads
+the **active** context, so set it before running:
+
+```sh
+kubectl config use-context <name>
+cargo test -p muxtop-core --lib kube_engine -- --ignored
+```
+
+There are no live Kubernetes calls in the default test suite — the unit
+tests use `serde_json::from_value` to construct typed `Pod` / `Node` /
+`Deployment` objects directly, so they run on hosts with no cluster.
+
 ---
 
 ## Submitting a Pull Request

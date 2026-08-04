@@ -132,6 +132,21 @@ struct Cli {
     /// empty Containers tab.
     #[arg(long)]
     no_containers: bool,
+
+    /// Override the kubeconfig context the server uses to populate the Kube
+    /// tab for remote clients (default = current-context).
+    #[arg(long, value_name = "NAME")]
+    kube_context: Option<String>,
+
+    /// Override the default namespace the server uses for the Kube tab.
+    #[arg(long, value_name = "NS")]
+    kube_namespace: Option<String>,
+
+    /// Disable cluster engine autodetection entirely. Remote clients see an
+    /// empty Kube tab. The kubeconfig content never crosses the wire — this
+    /// flag is the only way for an operator to opt-out at the server.
+    #[arg(long, conflicts_with = "kube_context")]
+    no_kube: bool,
 }
 
 /// Create the data directory and harden it (Unix: chmod 0700) so other users
@@ -368,12 +383,46 @@ async fn main() -> Result<()> {
         tracing::info!("Containers tab unavailable (no engine detected)");
     }
 
+    // Auto-detect a cluster engine for the Kube tab. Same `None` semantics
+    // as the container engine. The kubeconfig content NEVER crosses the
+    // wire — only the digested KubeSnapshot does (see anti-leak guard
+    // tests in muxtop-proto/tests/integration.rs and crate kube_engine).
+    let cluster_engine: Option<
+        std::sync::Arc<dyn muxtop_core::cluster_engine::ClusterEngine + Send + Sync>,
+    > = if cli.no_kube {
+        None
+    } else {
+        let source = muxtop_core::cluster_engine::detect_kubeconfig();
+        match muxtop_core::kube_engine::KubeEngine::connect(
+            source,
+            cli.kube_context.as_deref(),
+            cli.kube_namespace.as_deref(),
+        )
+        .await
+        {
+            Ok(engine) => Some(std::sync::Arc::new(engine) as _),
+            Err(e) => {
+                tracing::warn!(target: "muxtop::kube", error = %e, "Kube tab unavailable for remote clients");
+                None
+            }
+        }
+    };
+
+    if cluster_engine.is_some() {
+        tracing::info!("Kube tab enabled for remote clients");
+    } else if !cli.no_kube {
+        tracing::info!("Kube tab unavailable (no kubeconfig / unreachable)");
+    }
+
     let token = CancellationToken::new();
 
-    // Spawn the system collector with optional container engine.
+    // Spawn the system collector with optional container + cluster engines.
     let (collector_tx, collector_rx) = mpsc::channel::<SystemSnapshot>(4);
-    let collector =
-        Collector::with_container_engine(Duration::from_secs(cli.refresh), container_engine);
+    let collector = Collector::with_engines(
+        Duration::from_secs(cli.refresh),
+        container_engine,
+        cluster_engine,
+    );
     let collector_handle = collector.spawn(collector_tx, token.clone());
 
     // Run the TCP+TLS server. The `Token` newtype is unwrapped here at the

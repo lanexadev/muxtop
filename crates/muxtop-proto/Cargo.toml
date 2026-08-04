@@ -24,6 +24,10 @@ criterion = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util"] }
 rcgen = { workspace = true }
 tempfile = "3"
+# k8s-openapi v1_31 needed by integration tests that round-trip KubeSnapshot
+# (transitively pulls in the typed Pod/Node/Deployment types). Per the
+# k8s-openapi guideline, libraries enable v1_* only in dev-dependencies.
+k8s-openapi = { workspace = true, features = ["v1_31"] }
 
 [[bench]]
 name = "proto_bench"

@@ -355,6 +355,7 @@ pub enum Tab {
     Processes,
     Network,
     Containers,
+    Kube,
 }
 
 impl std::fmt::Display for Tab {
@@ -364,7 +365,13 @@ impl std::fmt::Display for Tab {
 }
 
 impl Tab {
-    pub const ALL: &[Tab] = &[Tab::General, Tab::Processes, Tab::Network, Tab::Containers];
+    pub const ALL: &[Tab] = &[
+        Tab::General,
+        Tab::Processes,
+        Tab::Network,
+        Tab::Containers,
+        Tab::Kube,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -372,6 +379,7 @@ impl Tab {
             Tab::Processes => "Processes",
             Tab::Network => "Network",
             Tab::Containers => "Containers",
+            Tab::Kube => "Kube",
         }
     }
 
@@ -408,6 +416,64 @@ pub enum ContainerSortField {
     NetRx,
     NetTx,
     Uptime,
+}
+
+/// Active sub-view of the Kubernetes tab.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum KubeSubview {
+    #[default]
+    Pods,
+    Nodes,
+    Deployments,
+}
+
+impl KubeSubview {
+    pub fn label(self) -> &'static str {
+        match self {
+            KubeSubview::Pods => "Pods",
+            KubeSubview::Nodes => "Nodes",
+            KubeSubview::Deployments => "Deployments",
+        }
+    }
+}
+
+/// Single sort-field enum unioning the three Kube sub-views. Stored as one
+/// value on `AppState`; switching sub-view resets it to the sub-view's
+/// natural default. The cycling helper [`next_kube_sort_field`] only walks
+/// the variants that belong to the current sub-view, so an out-of-domain
+/// value (e.g. `PodCpu` while on the Nodes view) recovers to the default
+/// of the active sub-view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KubeSortField {
+    // Pods
+    PodName,
+    PodCpu,
+    PodMem,
+    PodRestarts,
+    PodAge,
+    PodPhase,
+    // Nodes
+    NodeName,
+    NodeCpuPct,
+    NodeMemPct,
+    NodePodCount,
+    NodeAge,
+    // Deployments
+    DeployNamespace,
+    DeployName,
+    DeployReadyRatio,
+    DeployAge,
+}
+
+impl KubeSortField {
+    /// Default sort field for each sub-view.
+    pub fn default_for(sv: KubeSubview) -> Self {
+        match sv {
+            KubeSubview::Pods => KubeSortField::PodCpu,
+            KubeSubview::Nodes => KubeSortField::NodeCpuPct,
+            KubeSubview::Deployments => KubeSortField::DeployName,
+        }
+    }
 }
 
 /// Duration before a status message auto-clears.
@@ -464,6 +530,13 @@ pub struct AppState {
     /// Scroll offset (Containers tab).
     pub containers_scroll_offset: usize,
     /// Sort field for the Containers tab.
+    pub kube_subview: KubeSubview,
+    pub kube_sort_field: KubeSortField,
+    pub kube_sort_order: SortOrder,
+    pub kube_filter_input: String,
+    pub kube_filter_active: bool,
+    pub kube_selected: usize,
+    pub kube_scroll_offset: usize,
     pub containers_sort_field: ContainerSortField,
     /// Sort order for the Containers tab.
     pub containers_sort_order: SortOrder,
@@ -548,6 +621,13 @@ impl AppState {
             net_filter_active: false,
             containers_selected: 0,
             containers_scroll_offset: 0,
+            kube_subview: KubeSubview::default(),
+            kube_sort_field: KubeSortField::default_for(KubeSubview::default()),
+            kube_sort_order: SortOrder::Desc,
+            kube_filter_input: String::new(),
+            kube_filter_active: false,
+            kube_selected: 0,
+            kube_scroll_offset: 0,
             containers_sort_field: ContainerSortField::default(),
             containers_sort_order: SortOrder::Desc,
             containers_filter_input: String::new(),
@@ -690,6 +770,7 @@ impl AppState {
         match self.tab {
             Tab::Network => self.net_interface_count(),
             Tab::Containers => self.containers_count(),
+            Tab::Kube => self.kube_count(),
             _ => self.process_count(),
         }
     }
@@ -702,8 +783,55 @@ impl AppState {
                 &mut self.containers_selected,
                 &mut self.containers_scroll_offset,
             ),
+            Tab::Kube => (&mut self.kube_selected, &mut self.kube_scroll_offset),
             _ => (&mut self.selected, &mut self.scroll_offset),
         }
+    }
+
+    /// Count of items rendered in the active Kube sub-view AFTER the filter
+    /// is applied. Used by the j/k / scroll bounds.
+    pub fn kube_count(&self) -> usize {
+        let Some(snap) = self.last_snapshot.as_ref().and_then(|s| s.kube.as_ref()) else {
+            return 0;
+        };
+        let f = self.kube_filter_input.to_lowercase();
+        match self.kube_subview {
+            KubeSubview::Pods => snap
+                .pods
+                .iter()
+                .filter(|p| {
+                    f.is_empty()
+                        || p.name.to_lowercase().contains(&f)
+                        || p.namespace.to_lowercase().contains(&f)
+                })
+                .count(),
+            KubeSubview::Nodes => snap
+                .nodes
+                .iter()
+                .filter(|n| f.is_empty() || n.name.to_lowercase().contains(&f))
+                .count(),
+            KubeSubview::Deployments => snap
+                .deployments
+                .iter()
+                .filter(|d| {
+                    f.is_empty()
+                        || d.name.to_lowercase().contains(&f)
+                        || d.namespace.to_lowercase().contains(&f)
+                })
+                .count(),
+        }
+    }
+
+    /// Switch the Kube tab's active sub-view, resetting sort + filter +
+    /// selection so the user starts fresh in the new view.
+    pub fn switch_kube_subview(&mut self, sv: KubeSubview) {
+        self.kube_subview = sv;
+        self.kube_sort_field = KubeSortField::default_for(sv);
+        self.kube_sort_order = SortOrder::Desc;
+        self.kube_filter_input.clear();
+        self.kube_filter_active = false;
+        self.kube_selected = 0;
+        self.kube_scroll_offset = 0;
     }
 
     /// Returns the currently selected process, if any.
@@ -1078,7 +1206,11 @@ impl AppState {
         }
 
         // Filter mode captures most keys as text input.
-        if self.filter_active || self.net_filter_active || self.containers_filter_active {
+        if self.filter_active
+            || self.net_filter_active
+            || self.containers_filter_active
+            || self.kube_filter_active
+        {
             self.handle_filter_key(key);
             return;
         }
@@ -1174,6 +1306,12 @@ impl AppState {
                         next_container_sort_field(self.containers_sort_field);
                     self.recompute_containers_view();
                 }
+                Tab::Kube => {
+                    self.kube_sort_field =
+                        next_kube_sort_field(self.kube_sort_field, self.kube_subview);
+                    self.kube_selected = 0;
+                    self.kube_scroll_offset = 0;
+                }
                 _ => {
                     self.sort_field = next_sort_field(self.sort_field);
                     self.recompute_visible();
@@ -1193,6 +1331,12 @@ impl AppState {
                     };
                     self.recompute_containers_view();
                 }
+                Tab::Kube => {
+                    self.kube_sort_order = match self.kube_sort_order {
+                        SortOrder::Asc => SortOrder::Desc,
+                        SortOrder::Desc => SortOrder::Asc,
+                    };
+                }
                 _ => {
                     self.sort_order = match self.sort_order {
                         SortOrder::Asc => SortOrder::Desc,
@@ -1201,6 +1345,17 @@ impl AppState {
                     self.recompute_visible();
                 }
             },
+
+            // Kube sub-view switching (only when the Kube tab is focused).
+            KeyCode::Char('P') if self.tab == Tab::Kube => {
+                self.switch_kube_subview(KubeSubview::Pods);
+            }
+            KeyCode::Char('N') if self.tab == Tab::Kube => {
+                self.switch_kube_subview(KubeSubview::Nodes);
+            }
+            KeyCode::Char('D') if self.tab == Tab::Kube => {
+                self.switch_kube_subview(KubeSubview::Deployments);
+            }
 
             // F-key sort shortcuts
             KeyCode::F(1) => {
@@ -1284,6 +1439,13 @@ impl AppState {
                         self.recompute_containers_view();
                     }
                 }
+                Tab::Kube => {
+                    if !self.kube_filter_input.is_empty() {
+                        self.kube_filter_input.clear();
+                        self.kube_selected = 0;
+                        self.kube_scroll_offset = 0;
+                    }
+                }
                 _ => {
                     if !self.filter_input.is_empty() {
                         self.filter_input.clear();
@@ -1296,6 +1458,7 @@ impl AppState {
             KeyCode::Char('/') => match self.tab {
                 Tab::Network => self.net_filter_active = true,
                 Tab::Containers => self.containers_filter_active = true,
+                Tab::Kube => self.kube_filter_active = true,
                 _ => self.filter_active = true,
             },
 
@@ -1639,6 +1802,26 @@ impl AppState {
             return;
         }
 
+        if self.kube_filter_active {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.kube_filter_active = false;
+                }
+                KeyCode::Backspace => {
+                    self.kube_filter_input.pop();
+                    self.kube_selected = 0;
+                    self.kube_scroll_offset = 0;
+                }
+                KeyCode::Char(c) if self.kube_filter_input.len() < Self::MAX_FILTER_LEN => {
+                    self.kube_filter_input.push(c);
+                    self.kube_selected = 0;
+                    self.kube_scroll_offset = 0;
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match key.code {
             KeyCode::Esc => {
                 self.filter_active = false;
@@ -1700,6 +1883,42 @@ fn next_net_sort_field(field: NetworkSortField) -> NetworkSortField {
     }
 }
 
+/// Cycle to the next Kube sort field, scoped to the active sub-view.
+///
+/// An out-of-domain `field` (e.g. holding `PodCpu` while the user just
+/// switched to the Nodes view) recovers to the default of the active
+/// sub-view rather than panicking — this matches the contract that
+/// `switch_kube_subview` resets sort_field, but defensive against future
+/// callers that mutate the field directly.
+fn next_kube_sort_field(field: KubeSortField, sv: KubeSubview) -> KubeSortField {
+    match sv {
+        KubeSubview::Pods => match field {
+            KubeSortField::PodCpu => KubeSortField::PodMem,
+            KubeSortField::PodMem => KubeSortField::PodName,
+            KubeSortField::PodName => KubeSortField::PodRestarts,
+            KubeSortField::PodRestarts => KubeSortField::PodAge,
+            KubeSortField::PodAge => KubeSortField::PodPhase,
+            KubeSortField::PodPhase => KubeSortField::PodCpu,
+            _ => KubeSortField::default_for(sv),
+        },
+        KubeSubview::Nodes => match field {
+            KubeSortField::NodeCpuPct => KubeSortField::NodeMemPct,
+            KubeSortField::NodeMemPct => KubeSortField::NodeName,
+            KubeSortField::NodeName => KubeSortField::NodePodCount,
+            KubeSortField::NodePodCount => KubeSortField::NodeAge,
+            KubeSortField::NodeAge => KubeSortField::NodeCpuPct,
+            _ => KubeSortField::default_for(sv),
+        },
+        KubeSubview::Deployments => match field {
+            KubeSortField::DeployName => KubeSortField::DeployReadyRatio,
+            KubeSortField::DeployReadyRatio => KubeSortField::DeployNamespace,
+            KubeSortField::DeployNamespace => KubeSortField::DeployAge,
+            KubeSortField::DeployAge => KubeSortField::DeployName,
+            _ => KubeSortField::default_for(sv),
+        },
+    }
+}
+
 /// Cycle to the next container sort field.
 fn next_container_sort_field(field: ContainerSortField) -> ContainerSortField {
     match field {
@@ -1758,6 +1977,7 @@ mod tests {
                 total_tx: 0,
             },
             containers: None,
+            kube: None,
             timestamp_ms: 0,
         }
     }
@@ -1774,15 +1994,17 @@ mod tests {
         assert_eq!(Tab::General.next(), Tab::Processes);
         assert_eq!(Tab::Processes.next(), Tab::Network);
         assert_eq!(Tab::Network.next(), Tab::Containers);
-        assert_eq!(Tab::Containers.next(), Tab::General);
+        assert_eq!(Tab::Containers.next(), Tab::Kube);
+        assert_eq!(Tab::Kube.next(), Tab::General);
     }
 
     #[test]
     fn test_tab_prev_cycles() {
+        assert_eq!(Tab::Kube.prev(), Tab::Containers);
         assert_eq!(Tab::Containers.prev(), Tab::Network);
         assert_eq!(Tab::Network.prev(), Tab::Processes);
         assert_eq!(Tab::Processes.prev(), Tab::General);
-        assert_eq!(Tab::General.prev(), Tab::Containers);
+        assert_eq!(Tab::General.prev(), Tab::Kube);
     }
 
     #[test]
@@ -1791,6 +2013,7 @@ mod tests {
         assert_eq!(Tab::Processes.label(), "Processes");
         assert_eq!(Tab::Network.label(), "Network");
         assert_eq!(Tab::Containers.label(), "Containers");
+        assert_eq!(Tab::Kube.label(), "Kube");
     }
 
     #[test]
@@ -1799,6 +2022,7 @@ mod tests {
         assert_eq!(format!("{}", Tab::Processes), "Processes");
         assert_eq!(format!("{}", Tab::Network), "Network");
         assert_eq!(format!("{}", Tab::Containers), "Containers");
+        assert_eq!(format!("{}", Tab::Kube), "Kube");
     }
 
     #[test]
@@ -1807,7 +2031,8 @@ mod tests {
         assert!(Tab::ALL.contains(&Tab::Processes));
         assert!(Tab::ALL.contains(&Tab::Network));
         assert!(Tab::ALL.contains(&Tab::Containers));
-        assert_eq!(Tab::ALL.len(), 4);
+        assert!(Tab::ALL.contains(&Tab::Kube));
+        assert_eq!(Tab::ALL.len(), 5);
     }
 
     // -- AppState defaults (STORY-02) --
@@ -2054,6 +2279,8 @@ mod tests {
         app.handle_key_event(key(KeyCode::Tab));
         assert_eq!(app.tab, Tab::Containers);
         app.handle_key_event(key(KeyCode::Tab));
+        assert_eq!(app.tab, Tab::Kube);
+        app.handle_key_event(key(KeyCode::Tab));
         assert_eq!(app.tab, Tab::General);
     }
 
@@ -2061,7 +2288,7 @@ mod tests {
     fn test_backtab_switch() {
         let mut app = AppState::new();
         app.handle_key_event(key(KeyCode::BackTab));
-        assert_eq!(app.tab, Tab::Containers);
+        assert_eq!(app.tab, Tab::Kube);
     }
 
     #[test]
@@ -2219,13 +2446,13 @@ mod tests {
         let mut app = AppState::new();
         assert_eq!(app.tab, Tab::General);
         app.handle_key_event(key(KeyCode::Left));
-        assert_eq!(app.tab, Tab::Containers);
+        assert_eq!(app.tab, Tab::Kube);
     }
 
     #[test]
     fn test_tab_right_arrow_wraps() {
         let mut app = AppState::new();
-        app.tab = Tab::Containers;
+        app.tab = Tab::Kube;
         app.handle_key_event(key(KeyCode::Right));
         assert_eq!(app.tab, Tab::General);
     }
@@ -3156,6 +3383,7 @@ mod tests {
                     started_at_ms: 1_700_000_000_000,
                 }],
             }),
+            kube: None,
             timestamp_ms: 1_700_000_000_000,
         }
     }

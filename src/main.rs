@@ -117,6 +117,20 @@ struct Cli {
     #[arg(long)]
     no_containers: bool,
 
+    /// Override the kubeconfig context to use (default = current-context from
+    /// $KUBECONFIG / ~/.kube/config).
+    #[arg(long, value_name = "NAME")]
+    kube_context: Option<String>,
+
+    /// Override the default namespace from the kubeconfig context.
+    #[arg(long, value_name = "NS")]
+    kube_namespace: Option<String>,
+
+    /// Disable cluster engine autodetection entirely (Kube tab stays in
+    /// "no kubeconfig" state).
+    #[arg(long, conflicts_with = "kube_context")]
+    no_kube: bool,
+
     /// [benchmark] Run the collector + apply snapshots through AppState for N
     /// seconds without rendering, then exit cleanly. Used by the macro
     /// benchmark to measure steady-state RSS without a TTY.
@@ -216,6 +230,29 @@ async fn run_app(cli: Cli) -> Result<()> {
             None
         };
 
+    // Build a cluster engine in local mode (opt-out via --no-kube). Same
+    // None semantics as the container engine — Kube tab renders the
+    // graceful fallback (KubeSnapshot::unavailable()) when this is None.
+    let cluster_engine: Option<Arc<dyn muxtop_core::cluster_engine::ClusterEngine + Send + Sync>> =
+        if cli.remote.is_none() && !cli.no_kube {
+            let source = muxtop_core::cluster_engine::detect_kubeconfig();
+            match muxtop_core::kube_engine::KubeEngine::connect(
+                source,
+                cli.kube_context.as_deref(),
+                cli.kube_namespace.as_deref(),
+            )
+            .await
+            {
+                Ok(engine) => Some(Arc::new(engine) as Arc<_>),
+                Err(e) => {
+                    tracing::warn!(target: "muxtop::kube", error = %e, "kube engine init failed; Kube tab will render the unreachable state");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
     // Determine connection mode and spawn appropriate collector.
     //
     // ADR-30-1: --remote accepts `host:port` where `host` may be an IP
@@ -274,9 +311,10 @@ async fn run_app(cli: Cli) -> Result<()> {
         );
         remote.spawn(tx, None, cancel.clone())
     } else {
-        let collector = Collector::with_container_engine(
+        let collector = Collector::with_engines(
             Duration::from_secs(cli.refresh),
             container_engine.clone(),
+            cluster_engine.clone(),
         );
         collector.spawn(tx, cancel.clone())
     };
