@@ -16,6 +16,7 @@ use muxtop_core::process::{
 use muxtop_core::system::SystemSnapshot;
 
 use crate::terminal::TermCaps;
+use crate::ui::sanitize::scrub_ctrl;
 use crate::{CliConfig, ConnectionMode};
 
 // ---------------------------------------------------------------------------
@@ -43,6 +44,11 @@ pub enum ConfirmAction {
 
 impl ConfirmAction {
     /// Human-readable description for the confirmation dialog.
+    ///
+    /// MED-S5: process `comm` and container names are attacker-controlled and
+    /// end up in a `Span` rendered verbatim by `ui::confirm`. They are scrubbed
+    /// here — the table renderers scrub at their own call sites, but this
+    /// prompt is built outside them.
     pub fn prompt(&self) -> String {
         match self {
             ConfirmAction::Kill { pid, name, signal } => {
@@ -50,6 +56,7 @@ impl ConfirmAction {
                     Signal::Kill => "SIGKILL",
                     Signal::Term => "SIGTERM",
                 };
+                let name = scrub_ctrl(name);
                 format!("Send {sig_name} to {name} (PID {pid})?  [y/n]")
             }
             ConfirmAction::Renice { pid, name, delta } => {
@@ -58,15 +65,19 @@ impl ConfirmAction {
                 } else {
                     "higher priority (-1)"
                 };
+                let name = scrub_ctrl(name);
                 format!("Renice {name} (PID {pid}) to {direction}?  [y/n]")
             }
             ConfirmAction::StopContainer { id, name } => {
+                let name = scrub_ctrl(name);
                 format!("Stop container {name} ({})?  [y/n]", short_id(id))
             }
             ConfirmAction::KillContainer { id, name } => {
+                let name = scrub_ctrl(name);
                 format!("Kill container {name} ({})?  [y/n]", short_id(id))
             }
             ConfirmAction::RestartContainer { id, name } => {
+                let name = scrub_ctrl(name);
                 format!("Restart container {name} ({})?  [y/n]", short_id(id))
             }
         }
@@ -116,6 +127,7 @@ pub enum Command {
     StopContainer,
     KillContainer,
     RestartContainer,
+    SwitchToKube,
 }
 
 impl Command {
@@ -152,6 +164,7 @@ impl Command {
         Command::StopContainer,
         Command::KillContainer,
         Command::RestartContainer,
+        Command::SwitchToKube,
     ];
 
     pub fn label(self) -> &'static str {
@@ -188,6 +201,7 @@ impl Command {
             Command::StopContainer => "Stop container (SIGTERM)",
             Command::KillContainer => "Kill container (SIGKILL)",
             Command::RestartContainer => "Restart container",
+            Command::SwitchToKube => "Switch to Kubernetes tab",
         }
     }
 
@@ -225,6 +239,7 @@ impl Command {
             Command::StopContainer => "F9",
             Command::KillContainer => "F10",
             Command::RestartContainer => "F11",
+            Command::SwitchToKube => "Alt+5",
         }
     }
 
@@ -677,7 +692,13 @@ impl AppState {
     }
 
     /// Set a status message (auto-expires after STATUS_TIMEOUT_SECS).
+    ///
+    /// MED-S5: several call sites interpolate a process or container name into
+    /// the message, and the footer renders it verbatim. Scrubbing happens here
+    /// — once, for every current and future caller — rather than at each
+    /// `format!`.
     fn set_status(&mut self, msg: String) {
+        let msg = scrub_ctrl(&msg).into_owned();
         self.status_message = Some((msg, Instant::now()));
         // A new status message changes what `draw_root` paints.
         self.needs_redraw = true;
@@ -1271,6 +1292,9 @@ impl AppState {
             KeyCode::Char('4') if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.tab = Tab::Containers;
             }
+            KeyCode::Char('5') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.tab = Tab::Kube;
+            }
 
             // Arrow tab navigation
             KeyCode::Right => {
@@ -1751,6 +1775,9 @@ impl AppState {
             Command::StopContainer => self.request_container_stop(),
             Command::KillContainer => self.request_container_kill(),
             Command::RestartContainer => self.request_container_restart(),
+            Command::SwitchToKube => {
+                self.tab = Tab::Kube;
+            }
         }
     }
 
@@ -2892,6 +2919,66 @@ mod tests {
         assert_eq!(app.active_status(), Some("Test message"));
     }
 
+    /// MED-S5: a process name carrying an OSC sequence must not reach the
+    /// footer verbatim — the terminal would interpret it.
+    #[test]
+    fn test_set_status_scrubs_control_chars() {
+        let mut app = AppState::new();
+        app.set_status("Sent SIGTERM to \x1b]0;pwn\x07evil (PID 42)".to_string());
+        let status = app.active_status().expect("status must be set");
+        assert!(
+            !status.contains('\x1b'),
+            "ESC must not survive set_status: {status:?}"
+        );
+        assert!(
+            !status.contains('\x07'),
+            "BEL must not survive set_status: {status:?}"
+        );
+        assert_eq!(status, "Sent SIGTERM to ?]0;pwn?evil (PID 42)");
+    }
+
+    /// MED-S5: same guarantee for the confirmation dialog, which builds its
+    /// own string outside the table renderers.
+    #[test]
+    fn test_confirm_prompt_scrubs_control_chars() {
+        let actions = [
+            ConfirmAction::Kill {
+                pid: 42,
+                name: "bash\x1b]0;pwn\x07".to_string(),
+                signal: Signal::Term,
+            },
+            ConfirmAction::Renice {
+                pid: 42,
+                name: "bash\x1b]0;pwn\x07".to_string(),
+                delta: 1,
+            },
+            ConfirmAction::StopContainer {
+                id: "abc123".to_string(),
+                name: "nginx\x1b[31m".to_string(),
+            },
+            ConfirmAction::KillContainer {
+                id: "abc123".to_string(),
+                name: "nginx\x1b[31m".to_string(),
+            },
+            ConfirmAction::RestartContainer {
+                id: "abc123".to_string(),
+                name: "nginx\x1b[31m".to_string(),
+            },
+        ];
+
+        for action in &actions {
+            let prompt = action.prompt();
+            assert!(
+                !prompt.contains('\x1b'),
+                "ESC must not survive prompt() for {action:?}: {prompt:?}"
+            );
+            assert!(
+                !prompt.contains('\x07'),
+                "BEL must not survive prompt() for {action:?}: {prompt:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_status_clears_on_key_press() {
         let mut app = app_with_processes();
@@ -3099,6 +3186,38 @@ mod tests {
         let mut app = AppState::new();
         app.handle_key_event(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::ALT));
         assert_eq!(app.tab, Tab::Network);
+    }
+
+    /// Every tab must be reachable by its documented `Alt+N` shortcut — the
+    /// Kube tab shipped in v0.4 without one.
+    #[test]
+    fn test_alt_n_reaches_every_tab() {
+        let expected = [
+            ('1', Tab::General),
+            ('2', Tab::Processes),
+            ('3', Tab::Network),
+            ('4', Tab::Containers),
+            ('5', Tab::Kube),
+        ];
+        assert_eq!(expected.len(), Tab::ALL.len(), "one Alt+N per tab");
+
+        for (digit, tab) in expected {
+            let mut app = AppState::new();
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(digit), KeyModifiers::ALT));
+            assert_eq!(app.tab, tab, "Alt+{digit} must select {tab:?}");
+        }
+    }
+
+    /// The palette must expose a switch command for the Kube tab, like every
+    /// other tab.
+    #[test]
+    fn test_palette_switches_to_kube() {
+        assert!(Command::ALL.contains(&Command::SwitchToKube));
+        assert_eq!(Command::SwitchToKube.shortcut(), "Alt+5");
+
+        let mut app = AppState::new();
+        app.execute_command(Command::SwitchToKube);
+        assert_eq!(app.tab, Tab::Kube);
     }
 
     #[test]

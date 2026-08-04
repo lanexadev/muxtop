@@ -122,7 +122,9 @@ struct Cli {
     #[arg(long, value_name = "NAME")]
     kube_context: Option<String>,
 
-    /// Override the default namespace from the kubeconfig context.
+    /// Override the default namespace from the kubeconfig context. This sets
+    /// the namespace shown in the Kube header; Pods/Nodes/Deployments are
+    /// still listed cluster-wide (namespace scoping is not implemented yet).
     #[arg(long, value_name = "NS")]
     kube_namespace: Option<String>,
 
