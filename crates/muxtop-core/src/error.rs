@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+use crate::cluster_engine::ClusterError;
 use crate::container_engine::EngineError;
 
 #[derive(Debug, Error)]
@@ -21,6 +22,9 @@ pub enum CoreError {
 
     #[error("container engine: {0}")]
     Engine(#[from] EngineError),
+
+    #[error("cluster engine: {0}")]
+    Cluster(#[from] ClusterError),
 }
 
 #[cfg(test)]
@@ -36,6 +40,7 @@ mod tests {
             CoreError::Io(std::io::Error::other("io err")),
             CoreError::ChannelClosed,
             CoreError::Engine(EngineError::ConnectFailed("refused".into())),
+            CoreError::Cluster(ClusterError::KubeconfigNotFound),
         ];
         for err in &variants {
             let msg = format!("{err}");
@@ -50,6 +55,16 @@ mod tests {
         assert!(matches!(
             core,
             CoreError::Engine(EngineError::ConnectFailed(_))
+        ));
+    }
+
+    #[test]
+    fn core_error_from_cluster_error() {
+        let cluster = ClusterError::Unreachable("dns failed".into());
+        let core: CoreError = cluster.into();
+        assert!(matches!(
+            core,
+            CoreError::Cluster(ClusterError::Unreachable(_))
         ));
     }
 

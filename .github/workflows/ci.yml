@@ -4,7 +4,12 @@ on:
   push:
     branches: [develop, main]
   pull_request:
-    branches: [develop]
+    # `main` is required here, not just `develop`. The branch protection on
+    # `main` requires all six checks below to pass on the release PR, but a
+    # `pull_request` trigger scoped to `develop` alone never produces them on
+    # a develop -> main PR — deadlocking every release behind checks that
+    # could not run. See PR #18.
+    branches: [develop, main]
 
 env:
   CARGO_TERM_COLOR: always

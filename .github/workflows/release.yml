@@ -112,14 +112,14 @@ jobs:
       - name: Checkout tap
         uses: actions/checkout@v4
         with:
-          repository: lanexadev/homebrew-tap
+          repository: lucasschimmel/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
 
       - name: Download release checksums
         run: |
           TAG="${{ github.ref_name }}"
           VERSION="${TAG#v}"
-          BASE_URL="https://github.com/lanexadev/muxtop/releases/download/${TAG}"
+          BASE_URL="https://github.com/lucasschimmel/muxtop/releases/download/${TAG}"
           for target in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
             curl -sL "${BASE_URL}/muxtop-${target}.tar.gz.sha256" -o "${target}.sha256"
           done
@@ -135,28 +135,28 @@ jobs:
           cat > Formula/muxtop.rb << RUBY
           class Muxtop < Formula
             desc "A modern, multiplexed system monitor for the terminal"
-            homepage "https://github.com/lanexadev/muxtop"
+            homepage "https://github.com/lucasschimmel/muxtop"
             version "${VERSION}"
             license any_of: ["MIT", "Apache-2.0"]
 
             on_macos do
               on_arm do
-                url "https://github.com/lanexadev/muxtop/releases/download/v#{version}/muxtop-aarch64-apple-darwin.tar.gz"
+                url "https://github.com/lucasschimmel/muxtop/releases/download/v#{version}/muxtop-aarch64-apple-darwin.tar.gz"
                 sha256 "${SHA_AARCH64_MACOS}"
               end
               on_intel do
-                url "https://github.com/lanexadev/muxtop/releases/download/v#{version}/muxtop-x86_64-apple-darwin.tar.gz"
+                url "https://github.com/lucasschimmel/muxtop/releases/download/v#{version}/muxtop-x86_64-apple-darwin.tar.gz"
                 sha256 "${SHA_X86_64_MACOS}"
               end
             end
 
             on_linux do
               on_arm do
-                url "https://github.com/lanexadev/muxtop/releases/download/v#{version}/muxtop-aarch64-unknown-linux-musl.tar.gz"
+                url "https://github.com/lucasschimmel/muxtop/releases/download/v#{version}/muxtop-aarch64-unknown-linux-musl.tar.gz"
                 sha256 "${SHA_AARCH64_LINUX}"
               end
               on_intel do
-                url "https://github.com/lanexadev/muxtop/releases/download/v#{version}/muxtop-x86_64-unknown-linux-musl.tar.gz"
+                url "https://github.com/lucasschimmel/muxtop/releases/download/v#{version}/muxtop-x86_64-unknown-linux-musl.tar.gz"
                 sha256 "${SHA_X86_64_LINUX}"
               end
             end
@@ -190,9 +190,9 @@ jobs:
           TAG="${{ github.ref_name }}"
           VERSION="${TAG#v}"
           gh workflow run update-repo.yml \
-            --repo lanexadev/apt \
+            --repo lucasschimmel/apt \
             --field version="${VERSION}" \
-            --field source_repo="lanexadev/muxtop"
+            --field source_repo="lucasschimmel/muxtop"
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
 
@@ -202,6 +202,21 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      # `k8s-openapi` (transitive via `kube`) refuses to compile a library
+      # crate without a v1_* feature, but equally refuses to let library
+      # crates enable one in their `[dependencies]`. The standard fix is
+      # dev-deps — but `cargo publish` does not activate dev-deps during its
+      # verification build, so `cargo publish --package muxtop-core` fails
+      # without this. The k8s-openapi build script honours
+      # K8S_OPENAPI_ENABLED_VERSION as the documented escape hatch for this
+      # exact case. Pin to the version the workspace targets (matches the
+      # v1_31 feature on dev-deps + leaf binaries, see Cargo.toml).
+      #
+      # Scoped to this job on purpose: the build jobs already get v1_31 from
+      # the leaf binaries' features and need no override. Where both apply
+      # (publishing `muxtop` itself) the build script de-duplicates the
+      # feature and the env var into one version, so matching values are safe.
+      K8S_OPENAPI_ENABLED_VERSION: "1.31"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

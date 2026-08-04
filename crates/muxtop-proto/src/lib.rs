@@ -91,6 +91,7 @@ mod tests {
                 total_tx: 78_901,
             },
             containers: None,
+            kube: None,
             timestamp_ms: 1_713_200_000_000,
         }
     }

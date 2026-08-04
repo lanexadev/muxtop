@@ -79,6 +79,7 @@ fn make_snapshot_3000() -> SystemSnapshot {
             total_tx,
         },
         containers: None,
+        kube: None,
         timestamp_ms: 1_713_200_000_000,
     }
 }

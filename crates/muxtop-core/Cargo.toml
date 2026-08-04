@@ -20,10 +20,19 @@ bincode = { workspace = true }
 async-trait = { workspace = true }
 bollard = { workspace = true }
 futures = { workspace = true }
+dirs = { workspace = true }
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+http = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
 tempfile = "3"
+# k8s-openapi v1_31 feature is enabled here so unit/integration tests have
+# the typed API objects available; the library itself (above) declares no
+# version feature per k8s-openapi's library guideline.
+k8s-openapi = { workspace = true, features = ["v1_31"] }
 
 [[bench]]
 name = "process_bench"
@@ -35,4 +44,8 @@ harness = false
 
 [[bench]]
 name = "network_bench"
+harness = false
+
+[[bench]]
+name = "kube_bench"
 harness = false
