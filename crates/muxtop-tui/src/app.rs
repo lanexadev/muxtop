@@ -128,6 +128,7 @@ pub enum Command {
     KillContainer,
     RestartContainer,
     SwitchToKube,
+    SwitchToGpu,
 }
 
 impl Command {
@@ -165,6 +166,7 @@ impl Command {
         Command::KillContainer,
         Command::RestartContainer,
         Command::SwitchToKube,
+        Command::SwitchToGpu,
     ];
 
     pub fn label(self) -> &'static str {
@@ -202,6 +204,7 @@ impl Command {
             Command::KillContainer => "Kill container (SIGKILL)",
             Command::RestartContainer => "Restart container",
             Command::SwitchToKube => "Switch to Kubernetes tab",
+            Command::SwitchToGpu => "Switch to GPU tab",
         }
     }
 
@@ -240,6 +243,7 @@ impl Command {
             Command::KillContainer => "F10",
             Command::RestartContainer => "F11",
             Command::SwitchToKube => "Alt+5",
+            Command::SwitchToGpu => "Alt+6",
         }
     }
 
@@ -371,6 +375,7 @@ pub enum Tab {
     Network,
     Containers,
     Kube,
+    Gpu,
 }
 
 impl std::fmt::Display for Tab {
@@ -386,6 +391,7 @@ impl Tab {
         Tab::Network,
         Tab::Containers,
         Tab::Kube,
+        Tab::Gpu,
     ];
 
     pub fn label(self) -> &'static str {
@@ -395,6 +401,7 @@ impl Tab {
             Tab::Network => "Network",
             Tab::Containers => "Containers",
             Tab::Kube => "Kube",
+            Tab::Gpu => "GPU",
         }
     }
 
@@ -491,6 +498,59 @@ impl KubeSortField {
     }
 }
 
+/// Active sub-view of the GPU tab.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum GpuSubview {
+    #[default]
+    Devices,
+    Procs,
+}
+
+impl GpuSubview {
+    pub fn label(self) -> &'static str {
+        match self {
+            GpuSubview::Devices => "Devices",
+            GpuSubview::Procs => "Procs",
+        }
+    }
+}
+
+/// Single sort-field enum unioning the two GPU sub-views, following the
+/// [`KubeSortField`] pattern: one value on `AppState`, reset to the
+/// sub-view's natural default on switch, and cycled only within the active
+/// sub-view's domain by [`next_gpu_sort_field`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuSortField {
+    // Devices
+    DeviceIndex,
+    DeviceName,
+    DeviceUtil,
+    DeviceMem,
+    DeviceTemp,
+    DevicePower,
+    // Procs
+    ProcPid,
+    ProcName,
+    ProcMem,
+    ProcDevice,
+}
+
+impl GpuSortField {
+    /// Default sort field for each sub-view.
+    ///
+    /// Devices default to **index** rather than utilisation: `nvidia-smi`
+    /// numbers GPUs and users refer to them that way ("GPU 1 is the busy
+    /// one"), so a list that reorders itself under load would break the
+    /// mental map. Procs default to memory, where the biggest consumer is
+    /// what the user came to find.
+    pub fn default_for(sv: GpuSubview) -> Self {
+        match sv {
+            GpuSubview::Devices => GpuSortField::DeviceIndex,
+            GpuSubview::Procs => GpuSortField::ProcMem,
+        }
+    }
+}
+
 /// Duration before a status message auto-clears.
 const STATUS_TIMEOUT_SECS: u64 = 5;
 
@@ -552,6 +612,17 @@ pub struct AppState {
     pub kube_filter_active: bool,
     pub kube_selected: usize,
     pub kube_scroll_offset: usize,
+    /// GPU tab state. Sorting and filtering are applied at render time, as on
+    /// the Kube tab — a host has single-digit GPUs and rarely more than a few
+    /// dozen GPU processes, so the per-frame projection is microseconds and
+    /// not worth a cache.
+    pub gpu_subview: GpuSubview,
+    pub gpu_sort_field: GpuSortField,
+    pub gpu_sort_order: SortOrder,
+    pub gpu_filter_input: String,
+    pub gpu_filter_active: bool,
+    pub gpu_selected: usize,
+    pub gpu_scroll_offset: usize,
     pub containers_sort_field: ContainerSortField,
     /// Sort order for the Containers tab.
     pub containers_sort_order: SortOrder,
@@ -648,6 +719,13 @@ impl AppState {
             kube_filter_active: false,
             kube_selected: 0,
             kube_scroll_offset: 0,
+            gpu_subview: GpuSubview::default(),
+            gpu_sort_field: GpuSortField::default_for(GpuSubview::default()),
+            gpu_sort_order: SortOrder::Desc,
+            gpu_filter_input: String::new(),
+            gpu_filter_active: false,
+            gpu_selected: 0,
+            gpu_scroll_offset: 0,
             containers_sort_field: ContainerSortField::default(),
             containers_sort_order: SortOrder::Desc,
             containers_filter_input: String::new(),
@@ -798,6 +876,7 @@ impl AppState {
             Tab::Network => self.net_interface_count(),
             Tab::Containers => self.containers_count(),
             Tab::Kube => self.kube_count(),
+            Tab::Gpu => self.gpu_count(),
             _ => self.process_count(),
         }
     }
@@ -811,6 +890,7 @@ impl AppState {
                 &mut self.containers_scroll_offset,
             ),
             Tab::Kube => (&mut self.kube_selected, &mut self.kube_scroll_offset),
+            Tab::Gpu => (&mut self.gpu_selected, &mut self.gpu_scroll_offset),
             _ => (&mut self.selected, &mut self.scroll_offset),
         }
     }
@@ -847,6 +927,53 @@ impl AppState {
                 })
                 .count(),
         }
+    }
+
+    /// Count of rows rendered in the active GPU sub-view AFTER the filter is
+    /// applied. Used by the j/k / scroll bounds.
+    ///
+    /// The filter matches the same fields the sub-view renders: device name
+    /// and vendor for Devices, process name and PID for Procs. Matching on
+    /// PID matters — a user hunting a runaway job usually has the PID from
+    /// the Processes tab, not the name.
+    pub fn gpu_count(&self) -> usize {
+        let Some(snap) = self.last_snapshot.as_ref().and_then(|s| s.gpu.as_ref()) else {
+            return 0;
+        };
+        let f = self.gpu_filter_input.to_lowercase();
+        match self.gpu_subview {
+            GpuSubview::Devices => snap
+                .devices
+                .iter()
+                .filter(|d| {
+                    f.is_empty()
+                        || d.name.to_lowercase().contains(&f)
+                        || d.vendor.label().contains(&f)
+                })
+                .count(),
+            GpuSubview::Procs => snap
+                .processes
+                .iter()
+                .filter(|p| {
+                    f.is_empty()
+                        || p.name.to_lowercase().contains(&f)
+                        || p.pid.to_string().contains(&f)
+                })
+                .count(),
+        }
+    }
+
+    /// Switch the GPU tab's active sub-view, resetting sort + filter +
+    /// selection so the user starts fresh in the new view. Mirrors
+    /// [`Self::switch_kube_subview`].
+    pub fn switch_gpu_subview(&mut self, sv: GpuSubview) {
+        self.gpu_subview = sv;
+        self.gpu_sort_field = GpuSortField::default_for(sv);
+        self.gpu_sort_order = SortOrder::Desc;
+        self.gpu_filter_input.clear();
+        self.gpu_filter_active = false;
+        self.gpu_selected = 0;
+        self.gpu_scroll_offset = 0;
     }
 
     /// Switch the Kube tab's active sub-view, resetting sort + filter +
@@ -1283,6 +1410,7 @@ impl AppState {
             || self.net_filter_active
             || self.containers_filter_active
             || self.kube_filter_active
+            || self.gpu_filter_active
         {
             self.handle_filter_key(key);
             return;
@@ -1347,6 +1475,9 @@ impl AppState {
             KeyCode::Char('5') if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.tab = Tab::Kube;
             }
+            KeyCode::Char('6') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.tab = Tab::Gpu;
+            }
 
             // Arrow tab navigation
             KeyCode::Right => {
@@ -1388,6 +1519,12 @@ impl AppState {
                     self.kube_selected = 0;
                     self.kube_scroll_offset = 0;
                 }
+                Tab::Gpu => {
+                    self.gpu_sort_field =
+                        next_gpu_sort_field(self.gpu_sort_field, self.gpu_subview);
+                    self.gpu_selected = 0;
+                    self.gpu_scroll_offset = 0;
+                }
                 _ => {
                     self.sort_field = next_sort_field(self.sort_field);
                     self.recompute_visible();
@@ -1409,6 +1546,12 @@ impl AppState {
                 }
                 Tab::Kube => {
                     self.kube_sort_order = match self.kube_sort_order {
+                        SortOrder::Asc => SortOrder::Desc,
+                        SortOrder::Desc => SortOrder::Asc,
+                    };
+                }
+                Tab::Gpu => {
+                    self.gpu_sort_order = match self.gpu_sort_order {
                         SortOrder::Asc => SortOrder::Desc,
                         SortOrder::Desc => SortOrder::Asc,
                     };
@@ -1435,6 +1578,15 @@ impl AppState {
             // Namespace scope toggle (Kube tab, local mode).
             KeyCode::Char('A') if self.tab == Tab::Kube => {
                 self.toggle_kube_scope();
+            }
+
+            // GPU sub-view switching. `D` and `P` are also Kube bindings, but
+            // both arms are tab-guarded so the two tabs never contend.
+            KeyCode::Char('D') if self.tab == Tab::Gpu => {
+                self.switch_gpu_subview(GpuSubview::Devices);
+            }
+            KeyCode::Char('P') if self.tab == Tab::Gpu => {
+                self.switch_gpu_subview(GpuSubview::Procs);
             }
 
             // F-key sort shortcuts
@@ -1526,6 +1678,13 @@ impl AppState {
                         self.kube_scroll_offset = 0;
                     }
                 }
+                Tab::Gpu => {
+                    if !self.gpu_filter_input.is_empty() {
+                        self.gpu_filter_input.clear();
+                        self.gpu_selected = 0;
+                        self.gpu_scroll_offset = 0;
+                    }
+                }
                 _ => {
                     if !self.filter_input.is_empty() {
                         self.filter_input.clear();
@@ -1539,6 +1698,7 @@ impl AppState {
                 Tab::Network => self.net_filter_active = true,
                 Tab::Containers => self.containers_filter_active = true,
                 Tab::Kube => self.kube_filter_active = true,
+                Tab::Gpu => self.gpu_filter_active = true,
                 _ => self.filter_active = true,
             },
 
@@ -1789,6 +1949,8 @@ impl AppState {
             Command::ClearFilter => match self.tab {
                 Tab::Network => self.net_filter_input.clear(),
                 Tab::Containers => self.containers_filter_input.clear(),
+                Tab::Kube => self.kube_filter_input.clear(),
+                Tab::Gpu => self.gpu_filter_input.clear(),
                 _ => {
                     self.filter_input.clear();
                     self.recompute_visible();
@@ -1833,6 +1995,9 @@ impl AppState {
             Command::RestartContainer => self.request_container_restart(),
             Command::SwitchToKube => {
                 self.tab = Tab::Kube;
+            }
+            Command::SwitchToGpu => {
+                self.tab = Tab::Gpu;
             }
         }
     }
@@ -1905,6 +2070,26 @@ impl AppState {
             return;
         }
 
+        if self.gpu_filter_active {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.gpu_filter_active = false;
+                }
+                KeyCode::Backspace => {
+                    self.gpu_filter_input.pop();
+                    self.gpu_selected = 0;
+                    self.gpu_scroll_offset = 0;
+                }
+                KeyCode::Char(c) if self.gpu_filter_input.len() < Self::MAX_FILTER_LEN => {
+                    self.gpu_filter_input.push(c);
+                    self.gpu_selected = 0;
+                    self.gpu_scroll_offset = 0;
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match key.code {
             KeyCode::Esc => {
                 self.filter_active = false;
@@ -1963,6 +2148,32 @@ fn next_net_sort_field(field: NetworkSortField) -> NetworkSortField {
         NetworkSortField::Errors => NetworkSortField::TotalRx,
         NetworkSortField::TotalRx => NetworkSortField::TotalTx,
         NetworkSortField::TotalTx => NetworkSortField::RxRate,
+    }
+}
+
+/// Cycle to the next GPU sort field, scoped to the active sub-view.
+///
+/// Like [`next_kube_sort_field`], an out-of-domain value (a Devices field
+/// while the Procs sub-view is active) recovers to the active sub-view's
+/// default rather than getting stuck.
+fn next_gpu_sort_field(field: GpuSortField, sv: GpuSubview) -> GpuSortField {
+    match sv {
+        GpuSubview::Devices => match field {
+            GpuSortField::DeviceIndex => GpuSortField::DeviceUtil,
+            GpuSortField::DeviceUtil => GpuSortField::DeviceMem,
+            GpuSortField::DeviceMem => GpuSortField::DeviceTemp,
+            GpuSortField::DeviceTemp => GpuSortField::DevicePower,
+            GpuSortField::DevicePower => GpuSortField::DeviceName,
+            GpuSortField::DeviceName => GpuSortField::DeviceIndex,
+            _ => GpuSortField::default_for(sv),
+        },
+        GpuSubview::Procs => match field {
+            GpuSortField::ProcMem => GpuSortField::ProcPid,
+            GpuSortField::ProcPid => GpuSortField::ProcName,
+            GpuSortField::ProcName => GpuSortField::ProcDevice,
+            GpuSortField::ProcDevice => GpuSortField::ProcMem,
+            _ => GpuSortField::default_for(sv),
+        },
     }
 }
 
@@ -2061,6 +2272,7 @@ mod tests {
             },
             containers: None,
             kube: None,
+            gpu: None,
             timestamp_ms: 0,
         }
     }
@@ -2072,22 +2284,29 @@ mod tests {
         assert_eq!(Tab::default(), Tab::General);
     }
 
+    /// Derived from `Tab::ALL` rather than hard-coded pairs: adding a tab
+    /// used to mean editing half a dozen tests that only cared about the
+    /// order being a closed cycle.
     #[test]
     fn test_tab_next_cycles() {
-        assert_eq!(Tab::General.next(), Tab::Processes);
-        assert_eq!(Tab::Processes.next(), Tab::Network);
-        assert_eq!(Tab::Network.next(), Tab::Containers);
-        assert_eq!(Tab::Containers.next(), Tab::Kube);
-        assert_eq!(Tab::Kube.next(), Tab::General);
+        for (i, tab) in Tab::ALL.iter().enumerate() {
+            let expected = Tab::ALL[(i + 1) % Tab::ALL.len()];
+            assert_eq!(tab.next(), expected, "next() from {tab}");
+        }
+        // The cycle is closed: walking ALL.len() steps returns to the start.
+        let mut tab = Tab::General;
+        for _ in 0..Tab::ALL.len() {
+            tab = tab.next();
+        }
+        assert_eq!(tab, Tab::General);
     }
 
     #[test]
     fn test_tab_prev_cycles() {
-        assert_eq!(Tab::Kube.prev(), Tab::Containers);
-        assert_eq!(Tab::Containers.prev(), Tab::Network);
-        assert_eq!(Tab::Network.prev(), Tab::Processes);
-        assert_eq!(Tab::Processes.prev(), Tab::General);
-        assert_eq!(Tab::General.prev(), Tab::Kube);
+        for (i, tab) in Tab::ALL.iter().enumerate() {
+            let expected = Tab::ALL[(i + Tab::ALL.len() - 1) % Tab::ALL.len()];
+            assert_eq!(tab.prev(), expected, "prev() from {tab}");
+        }
     }
 
     #[test]
@@ -2097,6 +2316,7 @@ mod tests {
         assert_eq!(Tab::Network.label(), "Network");
         assert_eq!(Tab::Containers.label(), "Containers");
         assert_eq!(Tab::Kube.label(), "Kube");
+        assert_eq!(Tab::Gpu.label(), "GPU");
     }
 
     #[test]
@@ -2106,6 +2326,7 @@ mod tests {
         assert_eq!(format!("{}", Tab::Network), "Network");
         assert_eq!(format!("{}", Tab::Containers), "Containers");
         assert_eq!(format!("{}", Tab::Kube), "Kube");
+        assert_eq!(format!("{}", Tab::Gpu), "GPU");
     }
 
     #[test]
@@ -2115,7 +2336,8 @@ mod tests {
         assert!(Tab::ALL.contains(&Tab::Network));
         assert!(Tab::ALL.contains(&Tab::Containers));
         assert!(Tab::ALL.contains(&Tab::Kube));
-        assert_eq!(Tab::ALL.len(), 5);
+        assert!(Tab::ALL.contains(&Tab::Gpu));
+        assert_eq!(Tab::ALL.len(), 6);
     }
 
     // -- AppState defaults (STORY-02) --
@@ -2397,6 +2619,8 @@ mod tests {
         app.handle_key_event(key(KeyCode::Tab));
         assert_eq!(app.tab, Tab::Kube);
         app.handle_key_event(key(KeyCode::Tab));
+        assert_eq!(app.tab, Tab::Gpu);
+        app.handle_key_event(key(KeyCode::Tab));
         assert_eq!(app.tab, Tab::General);
     }
 
@@ -2404,7 +2628,7 @@ mod tests {
     fn test_backtab_switch() {
         let mut app = AppState::new();
         app.handle_key_event(key(KeyCode::BackTab));
-        assert_eq!(app.tab, Tab::Kube);
+        assert_eq!(app.tab, *Tab::ALL.last().unwrap());
     }
 
     #[test]
@@ -2562,13 +2786,13 @@ mod tests {
         let mut app = AppState::new();
         assert_eq!(app.tab, Tab::General);
         app.handle_key_event(key(KeyCode::Left));
-        assert_eq!(app.tab, Tab::Kube);
+        assert_eq!(app.tab, *Tab::ALL.last().unwrap());
     }
 
     #[test]
     fn test_tab_right_arrow_wraps() {
         let mut app = AppState::new();
-        app.tab = Tab::Kube;
+        app.tab = *Tab::ALL.last().unwrap();
         app.handle_key_event(key(KeyCode::Right));
         assert_eq!(app.tab, Tab::General);
     }
@@ -3287,6 +3511,7 @@ mod tests {
             ('3', Tab::Network),
             ('4', Tab::Containers),
             ('5', Tab::Kube),
+            ('6', Tab::Gpu),
         ];
         assert_eq!(expected.len(), Tab::ALL.len(), "one Alt+N per tab");
 
@@ -3592,6 +3817,7 @@ mod tests {
                 }],
             }),
             kube: None,
+            gpu: None,
             timestamp_ms: 1_700_000_000_000,
         }
     }
@@ -3884,5 +4110,306 @@ mod tests {
             0,
             "after debounce flush the `fk` filter matches nothing"
         );
+    }
+
+    // -- GPU tab tests (v0.5) --
+
+    /// Build a snapshot carrying a GPU payload, leaving everything else empty.
+    fn snapshot_with_gpu(gpu: muxtop_core::gpu::GpusSnapshot) -> SystemSnapshot {
+        use muxtop_core::network::NetworkSnapshot;
+        use muxtop_core::system::{CpuSnapshot, LoadSnapshot, MemorySnapshot};
+
+        SystemSnapshot {
+            cpu: CpuSnapshot {
+                global_usage: 0.0,
+                cores: vec![],
+            },
+            memory: MemorySnapshot {
+                total: 0,
+                used: 0,
+                available: 0,
+                swap_total: 0,
+                swap_used: 0,
+            },
+            load: LoadSnapshot {
+                one: 0.0,
+                five: 0.0,
+                fifteen: 0.0,
+                uptime_secs: 0,
+            },
+            processes: vec![],
+            networks: NetworkSnapshot {
+                interfaces: vec![],
+                total_rx: 0,
+                total_tx: 0,
+            },
+            containers: None,
+            kube: None,
+            gpu: Some(gpu),
+            timestamp_ms: 0,
+        }
+    }
+
+    fn gpu_snapshot_with(devices: usize, processes: usize) -> muxtop_core::gpu::GpusSnapshot {
+        use muxtop_core::gpu::{
+            GpuBackend, GpuDeviceSnapshot, GpuProcessKind, GpuProcessSnapshot, GpuVendor,
+            GpusSnapshot,
+        };
+
+        GpusSnapshot {
+            backends: vec![GpuBackend::Nvml],
+            available: devices > 0,
+            devices: (0..devices)
+                .map(|i| GpuDeviceSnapshot {
+                    index: i as u32,
+                    vendor: GpuVendor::Nvidia,
+                    backend: GpuBackend::Nvml,
+                    name: format!("GPU {i}"),
+                    bus_id: String::new(),
+                    driver_version: None,
+                    utilization_pct: Some(10.0),
+                    mem_utilization_pct: None,
+                    mem_used_bytes: Some(1024),
+                    mem_total_bytes: Some(4096),
+                    temperature_c: Some(50.0),
+                    power_watts: None,
+                    power_limit_watts: None,
+                    graphics_clock_mhz: None,
+                    memory_clock_mhz: None,
+                    fan_pct: None,
+                    encoder_pct: None,
+                    decoder_pct: None,
+                    supports_process_stats: true,
+                })
+                .collect(),
+            processes: (0..processes)
+                .map(|i| GpuProcessSnapshot {
+                    pid: 1000 + i as u32,
+                    device_index: 0,
+                    name: format!("worker{i}"),
+                    kind: GpuProcessKind::Compute,
+                    mem_bytes: Some(512),
+                })
+                .collect(),
+            detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_alt6_switches_to_gpu() {
+        let mut app = AppState::new();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::ALT));
+        assert_eq!(app.tab, Tab::Gpu);
+    }
+
+    #[test]
+    fn test_gpu_subview_keys_switch_views() {
+        let mut app = AppState::new();
+        app.tab = Tab::Gpu;
+        assert_eq!(app.gpu_subview, GpuSubview::Devices);
+
+        app.handle_key_event(key(KeyCode::Char('P')));
+        assert_eq!(app.gpu_subview, GpuSubview::Procs);
+
+        app.handle_key_event(key(KeyCode::Char('D')));
+        assert_eq!(app.gpu_subview, GpuSubview::Devices);
+    }
+
+    /// `D` and `P` are bound on both the Kube and GPU tabs; the guards must
+    /// keep them from crossing over.
+    #[test]
+    fn test_gpu_subview_keys_do_not_leak_into_kube() {
+        let mut app = AppState::new();
+        app.tab = Tab::Kube;
+        app.handle_key_event(key(KeyCode::Char('P')));
+        assert_eq!(app.kube_subview, KubeSubview::Pods);
+        assert_eq!(
+            app.gpu_subview,
+            GpuSubview::Devices,
+            "the Kube tab must not move the GPU sub-view"
+        );
+
+        let mut app = AppState::new();
+        app.tab = Tab::Gpu;
+        app.handle_key_event(key(KeyCode::Char('D')));
+        assert_eq!(
+            app.kube_subview,
+            KubeSubview::Pods,
+            "the GPU tab must not move the Kube sub-view"
+        );
+    }
+
+    #[test]
+    fn test_gpu_subview_switch_resets_sort_filter_and_selection() {
+        let mut app = AppState::new();
+        app.tab = Tab::Gpu;
+        app.gpu_filter_input = "stale".into();
+        app.gpu_selected = 7;
+        app.gpu_scroll_offset = 3;
+        app.gpu_sort_field = GpuSortField::DeviceTemp;
+
+        app.switch_gpu_subview(GpuSubview::Procs);
+
+        assert!(app.gpu_filter_input.is_empty());
+        assert_eq!(app.gpu_selected, 0);
+        assert_eq!(app.gpu_scroll_offset, 0);
+        assert_eq!(app.gpu_sort_field, GpuSortField::ProcMem);
+    }
+
+    #[test]
+    fn test_gpu_sort_cycles_within_the_active_subview() {
+        // Devices cycle stays in the Device domain and returns to its start.
+        let mut field = GpuSortField::default_for(GpuSubview::Devices);
+        let start = field;
+        let mut seen = vec![field];
+        for _ in 0..5 {
+            field = next_gpu_sort_field(field, GpuSubview::Devices);
+            assert!(
+                matches!(
+                    field,
+                    GpuSortField::DeviceIndex
+                        | GpuSortField::DeviceName
+                        | GpuSortField::DeviceUtil
+                        | GpuSortField::DeviceMem
+                        | GpuSortField::DeviceTemp
+                        | GpuSortField::DevicePower
+                ),
+                "cycle escaped the Devices domain: {field:?}"
+            );
+            seen.push(field);
+        }
+        assert_eq!(
+            next_gpu_sort_field(field, GpuSubview::Devices),
+            start,
+            "the cycle must close"
+        );
+        assert_eq!(seen.len(), 6, "every Devices sort field is reachable");
+    }
+
+    #[test]
+    fn test_gpu_sort_recovers_from_an_out_of_domain_field() {
+        // A Devices field while the Procs sub-view is active must fall back
+        // to the Procs default instead of getting stuck.
+        assert_eq!(
+            next_gpu_sort_field(GpuSortField::DeviceTemp, GpuSubview::Procs),
+            GpuSortField::ProcMem
+        );
+        assert_eq!(
+            next_gpu_sort_field(GpuSortField::ProcPid, GpuSubview::Devices),
+            GpuSortField::DeviceIndex
+        );
+    }
+
+    #[test]
+    fn test_gpu_count_tracks_the_active_subview() {
+        let mut app = AppState::new();
+        app.tab = Tab::Gpu;
+        app.apply_snapshot(snapshot_with_gpu(gpu_snapshot_with(2, 5)));
+
+        assert_eq!(app.gpu_count(), 2, "Devices sub-view counts devices");
+        app.switch_gpu_subview(GpuSubview::Procs);
+        assert_eq!(app.gpu_count(), 5, "Procs sub-view counts processes");
+    }
+
+    #[test]
+    fn test_gpu_count_is_zero_without_a_snapshot() {
+        let app = AppState::new();
+        assert_eq!(app.gpu_count(), 0);
+    }
+
+    #[test]
+    fn test_gpu_filter_matches_pid_and_name() {
+        let mut app = AppState::new();
+        app.tab = Tab::Gpu;
+        app.apply_snapshot(snapshot_with_gpu(gpu_snapshot_with(1, 3)));
+        app.switch_gpu_subview(GpuSubview::Procs);
+
+        app.gpu_filter_input = "worker1".into();
+        assert_eq!(app.gpu_count(), 1);
+
+        app.gpu_filter_input = "1002".into();
+        assert_eq!(app.gpu_count(), 1, "filtering by PID must work");
+
+        app.gpu_filter_input = "nope".into();
+        assert_eq!(app.gpu_count(), 0);
+    }
+
+    #[test]
+    fn test_gpu_filter_input_mode_captures_keys() {
+        let mut app = AppState::new();
+        app.tab = Tab::Gpu;
+        app.handle_key_event(key(KeyCode::Char('/')));
+        assert!(app.gpu_filter_active);
+
+        app.handle_key_event(key(KeyCode::Char('a')));
+        app.handle_key_event(key(KeyCode::Char('b')));
+        assert_eq!(app.gpu_filter_input, "ab");
+
+        app.handle_key_event(key(KeyCode::Backspace));
+        assert_eq!(app.gpu_filter_input, "a");
+
+        app.handle_key_event(key(KeyCode::Enter));
+        assert!(!app.gpu_filter_active);
+        assert_eq!(
+            app.gpu_filter_input, "a",
+            "Enter commits, it does not clear"
+        );
+    }
+
+    #[test]
+    fn test_gpu_esc_clears_a_committed_filter() {
+        let mut app = AppState::new();
+        app.tab = Tab::Gpu;
+        app.gpu_filter_input = "abc".into();
+        app.gpu_selected = 4;
+
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(app.gpu_filter_input.is_empty());
+        assert_eq!(app.gpu_selected, 0);
+    }
+
+    #[test]
+    fn test_gpu_selection_is_bounded_by_the_row_count() {
+        let mut app = AppState::new();
+        app.tab = Tab::Gpu;
+        app.apply_snapshot(snapshot_with_gpu(gpu_snapshot_with(2, 0)));
+
+        // `G` jumps to the last row; with 2 devices that is index 1.
+        app.handle_key_event(key(KeyCode::Char('G')));
+        assert_eq!(app.gpu_selected, 1);
+
+        // And moving past the end must not run away.
+        for _ in 0..10 {
+            app.handle_key_event(key(KeyCode::Char('j')));
+        }
+        assert!(
+            app.gpu_selected < 2,
+            "selection escaped the row count: {}",
+            app.gpu_selected
+        );
+    }
+
+    #[test]
+    fn test_gpu_palette_command_switches_tab() {
+        let mut app = AppState::new();
+        app.execute_command(Command::SwitchToGpu);
+        assert_eq!(app.tab, Tab::Gpu);
+    }
+
+    /// Every tab reachable from the palette — the Kube tab shipped in v0.4
+    /// without an entry and the gap went unnoticed for two releases.
+    #[test]
+    fn test_palette_has_a_switch_command_for_every_tab() {
+        for tab in Tab::ALL {
+            let expected = format!("Switch to {}", tab.label());
+            let found = Command::ALL.iter().any(|c| {
+                let label = c.label();
+                label == expected
+                    // Kube's entry reads "Switch to Kubernetes tab".
+                    || (*tab == Tab::Kube && label == "Switch to Kubernetes tab")
+                    || label == format!("{expected} tab")
+            });
+            assert!(found, "no palette command switches to the {tab} tab");
+        }
     }
 }

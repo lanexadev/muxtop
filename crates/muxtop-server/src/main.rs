@@ -151,6 +151,15 @@ struct Cli {
     /// flag is the only way for an operator to opt-out at the server.
     #[arg(long, conflicts_with = "kube_context")]
     no_kube: bool,
+
+    /// Disable GPU detection entirely; remote clients see an empty GPU tab.
+    ///
+    /// The server probes NVIDIA (NVML) and AMD (amdgpu sysfs) at startup and
+    /// serves the digested snapshot. Only aggregate telemetry crosses the
+    /// wire — device names, utilisation, memory and the PIDs already visible
+    /// in the Processes tab.
+    #[arg(long)]
+    no_gpu: bool,
 }
 
 /// Create the data directory and harden it (Unix: chmod 0700) so other users
@@ -418,14 +427,27 @@ async fn main() -> Result<()> {
         tracing::info!("Kube tab unavailable (no kubeconfig / unreachable)");
     }
 
+    // Detect GPUs for the GPU tab. Detection never fails — it returns an
+    // engine carrying the reason when no backend initialises — so `--no-gpu`
+    // is the only way this ends up `None`.
+    let gpu_engine: Option<std::sync::Arc<dyn muxtop_core::gpu_engine::GpuEngine + Send + Sync>> =
+        if cli.no_gpu {
+            tracing::info!("GPU tab disabled by --no-gpu");
+            None
+        } else {
+            Some(muxtop_core::gpu_engine::detect_gpu_engines())
+        };
+
     let token = CancellationToken::new();
 
-    // Spawn the system collector with optional container + cluster engines.
+    // Spawn the system collector with optional container + cluster + GPU
+    // engines.
     let (collector_tx, collector_rx) = mpsc::channel::<SystemSnapshot>(4);
-    let collector = Collector::with_engines(
+    let collector = Collector::with_all_engines(
         Duration::from_secs(cli.refresh),
         container_engine,
         cluster_engine,
+        gpu_engine,
     );
     let collector_handle = collector.spawn(collector_tx, token.clone());
 

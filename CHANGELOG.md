@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-05
+
+Feature release: the **GPU** tab. NVIDIA via [NVML](https://developer.nvidia.com/nvidia-management-library-nvml) and AMD via the `amdgpu` sysfs interface, with per-process usage on NVIDIA. Auto-detected at startup, so `muxtop` gains a sixth tab on any host with a supported GPU.
+
+**Apple Silicon is deferred to v0.6, not dropped** — see [Why Apple Silicon is not in this release](README.md#why-apple-silicon-is-not-in-this-release). The roadmap's other v0.5 item, interactive `docker exec` (PTY), also moves to v0.6; this release is GPU only.
+
+### Wire protocol break
+
+- **`SystemSnapshot` gains a `gpu` field**, appended after `kube` and before `timestamp_ms`. bincode is order-sensitive, so a 0.4.x client decoding a 0.5 frame reads the GPU bytes as its `timestamp_ms` and fails. **Client and server must match on the minor version**, exactly as for the v0.4 `kube` break.
+
+### Added
+
+#### GPU (`muxtop-core`, `muxtop-tui`, `muxtop`, `muxtop-server`)
+
+- New `Tab::Gpu` (keybind `Alt+6`, palette entry "Switch to GPU tab") with two sub-views switched by `D` / `P`:
+  - **Devices** (default) — 11 columns `#` / NAME / VENDOR / UTIL / MEM / MEM% / TEMP / POWER / CLK / FAN / ENC-DEC, with the utilisation and memory columns on the shared gauge ramp and a GPU-specific temperature ramp (green < 80 °C, amber ≥ 80 °C, red ≥ 90 °C — 80 °C is unremarkable for a GPU under load where the same number on a CPU would be alarming).
+  - **Procs** — 5 columns PID / NAME / GPU / TYPE / GPU MEM, one row per (pid, device) pair as `nvidia-smi` reports it.
+- **Sort cycling** via `s` (Devices: Index→Util→Mem→Temp→Power→Name; Procs: Mem→Pid→Name→Device) and `S` / `I` for direction, with the active column marked `↓` / `↑`. Devices default to **index** order rather than utilisation: users refer to GPUs by number, and a list that reorders itself under load breaks that mental map.
+- **Filter** via `/`, matching device name + vendor on Devices and process name **+ PID** on Procs — a user chasing a runaway job usually has the PID from the Processes tab, not the name.
+- **NVIDIA backend (`nvml_engine.rs`)** — utilisation, memory-controller utilisation, VRAM used/total, temperature, power draw and enforced limit, graphics and memory clocks, fan duty cycle, NVENC/NVDEC utilisation, plus compute and graphics processes merged per PID. `libnvidia-ml.so` / `nvml.dll` is resolved **at runtime** via `libloading`, so muxtop builds and runs identically on hosts with no NVIDIA driver — no feature flag and no separate build. NVML calls run in `spawn_blocking` so the synchronous C library never stalls the runtime worker driving the container and cluster loops.
+- **AMD backend (`amd_engine.rs`)** — `/sys/class/drm/card*/device` plus its `hwmon` node: utilisation, VRAM, temperature, power (average with an instantaneous fallback) and cap, clocks (live `hwmon` frequencies preferred over the `pp_dpm_*` state tables), and fan duty from `pwm1`. Zero dependencies and no privileges beyond world-readable sysfs. Cards are filtered by PCI vendor id so an Intel iGPU sitting at `card0` is not claimed, connector directories (`card0-DP-1`) are rejected, and discovery is ordered numerically so `card10` cannot sort ahead of `card2` and shuffle device indices under the user's cursor between ticks.
+- **`CompositeGpuEngine`** merges several vendor backends into one flat snapshot — an AMD iGPU plus an NVIDIA dGPU is the standard gaming-laptop layout and the Containers/Kube one-daemon model does not fit. Device indices are reassigned across the merged list and `GpuProcessSnapshot::device_index` is remapped through the same shift, so a process keeps pointing at its own card. A backend that fails is skipped rather than fatal: a broken NVIDIA driver must not hide a working AMD card.
+- **`--no-gpu`** on both `muxtop` and `muxtop-server` disables detection entirely. Useful on laptops where probing a discrete GPU can pull it out of runtime-D3 and cost battery.
+- GPU process names are resolved in `SystemSnapshot::collect` from the process table the collector already refreshed for the Processes tab, rather than inside each backend — one hash lookup per GPU process instead of a second full process enumeration per tick.
+- `gpu_bench.rs` criterion benchmark covering the composite merge (up to 8 devices × 8 processes) and name resolution — the only muxtop-authored code on the GPU hot path.
+
+### Changed
+
+- **The collector runs a fourth loop** (`spawn_gpu_loop`) at **1 Hz** — faster than the container (0.5 Hz) and cluster (0.2 Hz) loops. NVML computes `utilization_rates` over an internal window of about one second, so polling slower aliases the signal and renders a GPU pinned at 100 % as an erratic sawtooth. An NVML device query is sub-millisecond, so matching the driver's cadence is the cheap correct choice rather than a trade-off.
+- `Collector::with_all_engines` is the new full constructor; `with_engines` is retained and delegates to it, so existing callers keep compiling.
+- **The tab bar no longer shows `GPU [soon]`** — the placeholder became a real tab. `FUTURE_TABS` is kept but empty; a regression test now asserts no implemented tab is still marked `[soon]`.
+- The palette's "Clear filter" command now clears the Kube and GPU filters too. It previously fell through to the process filter on those tabs, silently clearing the wrong one.
+- Tab-cycling tests derive from `Tab::ALL` instead of hard-coding pairs, so adding a tab no longer means editing half a dozen tests that only care that the order is a closed cycle.
+
+### Honest limitations
+
+Every GPU metric is `Option`, and the UI renders an unavailable one as `—`. **`—` means "this driver cannot report this", never "zero"** — an idle GPU shows `0 %` and conflating the two would make the tab lie.
+
+- **AMD reports no per-process usage.** The `amdgpu` sysfs interface has no equivalent of NVML's process queries, so the Procs sub-view states that explicitly instead of showing an empty list that reads as "nothing is using the GPU". The summary bar carries a `per-process: unsupported` badge, mirroring the v0.4 `metrics-server: off` badge.
+- **Encoder/decoder utilisation is NVML-only**; AMD renders `—`.
+- **On Windows, per-process GPU memory is unavailable and every process reports `both`.** Under WDDM the OS owns video-memory allocation so NVML returns the per-process figure as unavailable, and it returns identical compute and graphics process lists — verified against an RTX 3080 on Windows 11 (27 PIDs each, full overlap). Both are the driver's answers and are surfaced as-is. On Linux the figures and the compute/graphics distinction are real.
+
+### Security
+
+- Device names, process names and the engine's `detail` string all pass through `scrub_ctrl` before rendering. Device names come from the driver, process names from whatever a user chose to call their binary, and `detail` crosses the wire from the server in `--remote` mode — all three are foreign strings, and the v0.4.1 lesson was that a render site missed by the sanitizer sweep is a terminal-escape injection point.
+- The GPU tab is **read-only by construction**: it has no actions, and no code path sets a clock, a power limit or a fan curve. The `nvml-wrapper` dependency is target-gated to Linux and Windows, so it is absent from macOS builds entirely.
+
 ## [0.4.2] - 2026-08-05
 
 Follow-up to 0.4.1: `--kube-namespace` becomes a real scoping filter instead of a display label, and the workspace compiles on Windows again. No wire-format change — 0.4.1 and 0.4.2 remain compatible on the wire.
