@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-08-05
+
+Follow-up to 0.4.1: `--kube-namespace` becomes a real scoping filter instead of a display label, and the workspace compiles on Windows again. No wire-format change — 0.4.1 and 0.4.2 remain compatible on the wire.
+
 ### Fixed
 
 - **The workspace compiles on Windows again (`muxtop-core`)** — `actions.rs` called `libc::kill`, `libc::setpriority`, `libc::getpriority`, `libc::SIGKILL`, `libc::PRIO_PROCESS` and `libc::id_t` with no `cfg(unix)` gate. None of those exist in `libc` on Windows, so the whole of `muxtop-core` failed to build there and took every dependent crate with it — no `cargo check`, no `cargo test`, no way to work on any part of muxtop from a Windows machine. The POSIX implementations are now gated behind `cfg(unix)`, with `cfg(not(unix))` stubs of identical signature that fail with `ErrorKind::Unsupported`. PID validation was extracted into a shared `validate_pid` that runs *before* the platform split, so the safety guarantees (no `kill(-1, …)`, no `kill(0, …)`) hold and stay tested on every platform.
