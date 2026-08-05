@@ -63,20 +63,22 @@ cargo build --release
 
 | Feature | Detail |
 |---|---|
-| **Tabs** | General, Processes, Network, Containers, Kubernetes and GPU — `Alt+1` … `Alt+6` |
+| **Tabs** | General, Processes, Network, Containers and Kubernetes — `Alt+1` / `Alt+2` / `Alt+3` / `Alt+4` / `Alt+5` |
 | **Network tab** | Interface table with RX/s, TX/s, totals, errors + real-time sparklines |
 | **Containers tab** | Docker/Podman via [bollard](https://github.com/fussybeaver/bollard) — CPU/memory/network/IO table, CPU+RX sparklines, `F9` stop / `F10` kill / `F11` restart actions, automatic socket detection |
 | **Kubernetes tab** | Read-only Pods / Nodes / Deployments via [kube-rs](https://github.com/kube-rs/kube) — switch sub-views with `P` / `N` / `D`, sort with `s`, filter with `/`. Auto-detects `$KUBECONFIG` / `~/.kube/config` / in-cluster ServiceAccount; graceful fallback when `metrics-server` is absent (CPU/MEM render `—`). Lists cluster-wide by default; `--kube-namespace <NS>` scopes Pods and Deployments to one namespace so a namespace-bound Role is enough, and `A` toggles between the two at runtime (see [Kubernetes permissions](#kubernetes-permissions)) |
-| **GPU tab** | Read-only NVIDIA (via NVML) and AMD (via `amdgpu` sysfs) — utilisation, VRAM, temperature, power, clocks, fan, NVENC/NVDEC. Switch sub-views with `D` / `P`, sort with `s`, filter with `/`. Multiple vendors are merged into one list, and any metric a driver cannot report renders `—` rather than a misleading `0` (see [GPU support](#gpu-support)) |
-| **Command palette** | `Ctrl+P` — `kill firefox`, `sort memory`, `stop nginx`, `restart postgres`, etc. |
-| **htop shortcuts** | `F1`–`F5` sort columns, `F7`/`F8` renice, `F9` kill, `F10` force kill |
+| **Command palette** | `Ctrl+P` fuzzy, `:` typed — `kill firefox`, `sort memory`, `stop nginx`, `restart postgres`, etc. |
+| **Help screen** | `?` — generated from the keymap, so it always matches the bindings |
+| **Inspector** | `Enter` on any row: full command line, image, pod node, interface errors |
+| **htop shortcuts** | `F1` help, `F5` tree, `F6` sort, `F7`/`F8` renice, `F9` kill, `F10` force kill |
 | **Fuzzy search** | Powered by [nucleo](https://github.com/helix-editor/nucleo) (from the Helix editor) |
-| **Tree view** | `F5` toggles the parent/child hierarchical display |
-| **Renice** | `+` / `-` to adjust process priority |
+| **Tree view** | `t` / `F5` toggles the parent/child hierarchical display |
+| **Renice** | `+` / `-` or `F7` / `F8` to adjust process priority |
 | **Remote monitoring** | `--remote host:port` + `--token` to monitor a remote server over encrypted TLS |
 | **Native TLS** | rustls encryption (TLS 1.3-only since 0.3.1), self-signed cert auto-generation (`--tls-generate`), mandatory token auth |
 | **Async collection** | tokio-based — the UI never blocks, even at 3000+ processes |
-| **Tokyo Night theme** | Native TrueColor, automatic fallback for ANSI/16-color terminals |
+| **Tokyo Night theme** | TrueColor, 256-color and 16-color renditions, plus a light and a monochrome theme (`--theme`) |
+| **Degrades honestly** | ASCII glyph set on the Linux console, `NO_COLOR` honoured, mouse optional — see [Terminal compatibility](#terminal-compatibility) |
 | **Static binary** | Single musl binary, no system dependencies |
 | **Zero telemetry** | No client-side network calls, ever (see [Privacy](#privacy--telemetry)) |
 
@@ -112,52 +114,6 @@ rules:
 
 ---
 
-## GPU support
-
-muxtop probes for GPUs at startup and needs **no extra privileges** — NVML is
-readable by any user, and the `amdgpu` sysfs nodes are world-readable. Nothing
-is installed and no vendor SDK is required at build time: the NVIDIA library is
-loaded dynamically at runtime, so the same binary runs on machines with and
-without an NVIDIA driver. Disable the probe with `--no-gpu`.
-
-| Vendor | Backend | Platforms | Status |
-|---|---|---|---|
-| **NVIDIA** | NVML (`libnvidia-ml.so` / `nvml.dll`, loaded at runtime) | Linux, Windows | Full — including per-process usage |
-| **AMD** | `amdgpu` sysfs (`/sys/class/drm/card*/device`) | Linux | Devices only — no per-process usage |
-| **Intel** | — | — | Not implemented |
-| **Apple Silicon** | IOReport | macOS | **Planned for v0.6** |
-
-### What each backend can and cannot report
-
-Unlike CPU or memory, no GPU metric is universally available, so every field is
-optional and the UI renders an unavailable one as `—`. **A `—` means "this
-driver cannot report this", not "zero"** — conflating the two would make the tab
-lie about an idle GPU.
-
-- **AMD has no per-process accounting.** The `amdgpu` sysfs interface exposes no
-  equivalent of NVML's process queries, so the Procs sub-view says so explicitly
-  instead of showing an empty list that reads as "nothing is using the GPU".
-- **Encoder/decoder utilisation is NVML-only.** AMD renders `—` for that column.
-- **On Windows, per-process GPU memory is unavailable and every process shows
-  `both`.** Under the WDDM driver model the OS owns video-memory allocation, so
-  NVML reports the per-process figure as unavailable; it also returns identical
-  compute and graphics process lists, so the TYPE column carries no information
-  there. Both behaviours are the driver's, and both are reported honestly rather
-  than papered over. On Linux the figures and the distinction are real.
-- **Fanless cards report no fan**, and a laptop dGPU parked in runtime-D3 may
-  report nothing at all until something wakes it.
-
-### Why Apple Silicon is not in this release
-
-macOS exposes GPU counters only through the private `IOReport` framework — the
-same source `powermetrics` reads, and `powermetrics` requires root. Shipping
-that in v0.5 would have meant either taking a private-framework dependency or
-asking every macOS user to run muxtop as root, neither of which fits a tool
-whose premise is staying out of the way. It is scheduled for **v0.6**; the data
-model, the wire format and the tab already accommodate it.
-
----
-
 ## Privileges
 
 Access to the Docker socket (`/var/run/docker.sock`) is **equivalent to root access** on the host machine: any user in the `docker` group can launch a privileged container and break out. To run muxtop with a minimal privilege budget, use **rootless Podman** — the user-scoped socket (`$XDG_RUNTIME_DIR/podman/podman.sock`) is isolated per user and muxtop detects it automatically. Avoid running `muxtop-server` as root on an exposed host: prefer a service account with only the rootless Podman socket mounted read/write.
@@ -174,6 +130,13 @@ muxtop --sort mem                   # sort by memory at startup
 muxtop --tree                       # start in tree view
 muxtop --about                      # version, license, privacy pledge
 
+# Presentation
+muxtop --theme tokyo-night-light    # light terminal background
+muxtop --theme mono                 # no hue at all
+muxtop --no-color                   # same as NO_COLOR=1
+muxtop --ascii                      # force the ASCII glyph set
+muxtop --no-mouse                   # keep the terminal's own text selection
+
 # Containers tab — by default muxtop checks $DOCKER_HOST, /var/run/docker.sock,
 # then the Podman sockets. Pass a path to force, or disable entirely:
 muxtop --docker-socket /var/run/docker.sock   # socket override
@@ -184,9 +147,6 @@ muxtop --no-containers                        # disable container collection
 muxtop --kube-context kind-kind               # use a specific kubeconfig context
 muxtop --kube-namespace kube-system           # scope Pods/Deployments to one namespace
 muxtop --no-kube                              # disable cluster collection entirely
-
-# GPU tab — NVIDIA (NVML) and AMD (amdgpu sysfs) are probed automatically.
-muxtop --no-gpu                               # disable GPU detection entirely
 
 # Run the server (TLS + auth required)
 muxtop-server --token "my-secret-16chars" --tls-generate
@@ -201,30 +161,57 @@ MUXTOP_TOKEN="my-secret-16chars" muxtop --remote host:port --tls-ca cert.pem
 
 ### Keyboard shortcuts
 
+**Press `?` inside muxtop** for the full, always-current reference — it is generated from the keymap
+itself, so it cannot drift from what the keys actually do. The table below is the short version.
+
 | Key | Action |
 |--------|--------|
-| `Ctrl+P` | Command palette |
-| `Alt+1` … `Alt+6` | Switch tab (General / Processes / Network / Containers / Kubernetes / GPU) |
-| `Tab` / `Shift+Tab` · `←` / `→` | Cycle to the next / previous tab |
+| `?` · `F1` | Help |
+| `Ctrl+P` · `Ctrl+K` | Command palette (fuzzy) |
+| `:` | Command mode — `kill firefox`, `sort mem`, `filter ngin`, `theme mono`, `tab kube` |
+| `Tab` / `Shift+Tab` | Cycle to the next / previous tab |
+| `Alt+1` … `Alt+5` | Switch tab (General / Processes / Network / Containers / Kubernetes) |
 | `q` · `Ctrl+C` | Quit |
-| `j` / `k` · `↑` / `↓` | Navigation (vim-style) |
+| `j` / `k` · `↑` / `↓` | Move the row cursor |
+| `h` / `l` · `←` / `→` | Scroll columns (narrow terminals) |
 | `g` / `G` · `Home` / `End` | Jump to first / last row |
-| `PageUp` / `PageDown` | Scroll by 20 rows |
-| `/` | Filter (applies to the active tab) |
-| `Esc` | Clear the active filter |
-| `t` | Tree view (Processes) |
-| `s` | Cycle sort field (active tab) |
-| `S` / `I` | Toggle sort direction (active tab) |
-| `F1` … `F5` | Sort processes by PID / name / CPU / memory / user |
-| `F7` / `F8` | Renice — lower (+1) / raise (−1) priority, Processes tab, local mode |
+| `PageUp` / `PageDown` · `Ctrl+U` / `Ctrl+D` | Scroll by a page / half a page |
+| `Enter` · `i` | Inspect the selected row |
+| `x` | Contextual actions menu |
+| `y` | Copy the selected row's identifier (works over ssh, via OSC 52) |
+| `Space` | Pause / resume the view |
+| `Ctrl+L` | Message log |
+| `/` · `F3` / `F4` | Filter (applies to the active tab) |
+| `Esc` | One step back: close overlay → dismiss messages → leave the filter → clear it |
+| `s` · `F6` | Cycle sort field (active tab) |
+| `S` / `I` | Reverse sort direction (active tab) |
+| `t` · `F5` | Tree view (Processes) |
+| `F7` / `F8` · `-` / `+` | Renice — lower / raise priority (Processes, local mode) |
 | `F9` | Kill process, SIGTERM (Processes) · Stop container (Containers) |
 | `F10` | Force kill, SIGKILL (Processes) · Kill container (Containers) |
 | `F11` | Restart container (Containers) |
-| `P` / `N` / `D` | Switch Kube sub-view to **P**ods / **N**odes / **D**eployments (Kubernetes tab only) |
+| `P` / `N` / `D` · `[` / `]` | Switch Kube sub-view to **P**ods / **N**odes / **D**eployments |
 | `A` | Toggle namespace scope — one namespace ↔ **A**ll namespaces (Kubernetes tab, local mode) |
-| `D` / `P` | Switch GPU sub-view to **D**evices / **P**rocs (GPU tab only) |
 
-> There is no built-in help screen yet — `Ctrl+P` lists every command with its shortcut.
+Tab-scoped keys only act on their own tab: pressing `F9` on the Network tab does nothing rather than
+silently killing a process you cannot see.
+
+### Terminal compatibility
+
+muxtop adapts to the terminal it finds, because a headless Ubuntu box reached over `ssh` and a kitty
+window are both first-class targets:
+
+| Detected | Behaviour |
+|---|---|
+| 24-bit colour (`$COLORTERM`, or a known terminal) | Full Tokyo Night |
+| 256 colours (`xterm-256color`, Terminal.app, tmux) | 256-colour Tokyo Night |
+| 16 colours (`TERM=linux`, `xterm`, serial console) | ANSI palette, the terminal's own colours |
+| `NO_COLOR`, `TERM=dumb` | No colour at all — hierarchy through bold / dim / reverse |
+| No UTF-8 locale, or `TERM=linux` | ASCII glyph set (the console font has no block or braille glyphs) |
+| No pointer (`TERM=linux`, `dumb`) | Mouse reporting stays off |
+
+Everything the mouse can do, the keyboard can do. Overrides: `--theme <name>` (`tokyo-night`,
+`tokyo-night-light`, `mono`), `--no-color`, `--ascii`, `--no-mouse`.
 
 ---
 
@@ -256,7 +243,7 @@ muxtop/
 ├── src/                         # Entry point (clap CLI + tokio bootstrap)
 └── crates/
     ├── muxtop-core/             # System collection, data models, actions
-    │   ├── src/collector.rs     # 4 async loops: sysinfo 1 Hz, containers 0.5 Hz, cluster 0.2 Hz, gpu 1 Hz
+    │   ├── src/collector.rs     # 3 async loops: sysinfo 1 Hz, containers 0.5 Hz, cluster 0.2 Hz
     │   ├── src/process.rs       # Sort, filter, process tree
     │   ├── src/system.rs        # CPU / memory / load snapshots
     │   ├── src/network.rs       # Network interfaces + history
@@ -265,14 +252,13 @@ muxtop/
     │   ├── src/docker_engine.rs # Concrete bollard-backed implementation
     │   ├── src/kube.rs          # Pod / Node / Deployment / Cluster snapshots
     │   ├── src/cluster_engine.rs # Async trait + kubeconfig detection
-    │   ├── src/kube_engine.rs   # Concrete kube-rs-backed implementation
-    │   ├── src/gpu.rs           # GPU device / process snapshots (every metric optional)
-    │   ├── src/gpu_engine.rs    # Async trait + composite that merges vendor backends
-    │   ├── src/nvml_engine.rs   # NVIDIA backend (NVML, dynamically loaded)
-    │   └── src/amd_engine.rs    # AMD backend (amdgpu sysfs)
+    │   └── src/kube_engine.rs   # Concrete kube-rs-backed implementation
     ├── muxtop-tui/              # ratatui interface
     │   ├── src/app.rs           # State machine, event handling
-    │   └── src/ui/              # Tabs General/Processes/Network/Containers/Kube/GPU, palette, theme
+    │   ├── src/keymap.rs        # Single source of truth for bindings (drives dispatch + help)
+    │   ├── src/notify.rs        # Typed toast stack and message log
+    │   ├── src/ui/widgets/      # Shared table, meters, sparklines, badges, empty states
+    │   └── src/ui/              # Tabs General/Processes/Network/Containers/Kube, chrome, overlays
     ├── muxtop-proto/            # Wire protocol and binary serialization
     └── muxtop-server/           # TCP daemon for remote monitoring
 ```
@@ -298,8 +284,7 @@ just dev      # continuous check with bacon
 | **v0.3** ✓ | Docker / Podman Containers tab (via [bollard](https://github.com/fussybeaver/bollard)) + Stop/Kill/Restart actions |
 | **v0.3.1** ✓ | TLS 1.3 hardening, per-IP rate limit, ANSI sanitizer, event-driven render, `lto=fat` build sweep |
 | **v0.4** ✓ | Kubernetes Pod tab (read-only) via [kube-rs](https://github.com/kube-rs/kube), kubeconfig auto-detection, metrics-server graceful degradation |
-| **v0.5** ✓ | GPU tab — NVIDIA via NVML, AMD via `amdgpu` sysfs, per-process usage, graceful per-metric degradation |
-| v0.6 | Apple Silicon GPU support (IOReport) + interactive `docker exec` (PTY) |
+| v0.5 | GPU monitoring (NVIDIA / AMD / Apple Silicon) + interactive `docker exec` (PTY) |
 | v1.0 | WASM plugin system + themes + configuration file |
 
 ---
@@ -316,7 +301,6 @@ If you observe outbound activity from muxtop that isn't tied to a feature you've
 When the Kubernetes or Containers tab is active, muxtop only **reads** from the corresponding API:
 - Kubernetes : `LIST` on Pods / Nodes / Deployments + `GET` on `metrics.k8s.io/v1beta1`, scoped to one namespace or cluster-wide per [Kubernetes permissions](#kubernetes-permissions). No `CREATE` / `UPDATE` / `DELETE` / `PATCH` is ever issued. Write actions (Delete pod, Scale deployment, Rollout restart) are explicitly out of scope for v0.4.
 - Containers : `GET /containers/json` + `/stats?stream=false`. The Stop / Kill / Restart actions are gated behind a confirmation dialog and are local-only — disabled in `--remote` mode.
-- GPU : NVML query calls and reads of `/sys/class/drm/card*/device`. Both are read-only by construction — muxtop never sets a clock, a power limit or a fan curve, and the GPU tab has no actions at all. `--no-gpu` skips the probe entirely.
 
 ### Remote mode and credentials
 

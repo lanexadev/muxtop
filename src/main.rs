@@ -79,6 +79,26 @@ struct Cli {
     #[arg(long)]
     tree: bool,
 
+    /// Colour scheme: tokyo-night, tokyo-night-light, mono
+    #[arg(long, default_value = "tokyo-night", value_name = "NAME")]
+    theme: muxtop_tui::ThemeKind,
+
+    /// Disable all colour. `NO_COLOR` in the environment does the same.
+    #[arg(long)]
+    no_color: bool,
+
+    /// Use the ASCII glyph set even on a UTF-8 terminal. muxtop already
+    /// switches to it automatically on the Linux console and on terminals
+    /// without a UTF-8 locale; this forces it everywhere.
+    #[arg(long)]
+    ascii: bool,
+
+    /// Never enable mouse reporting. Mouse capture takes the terminal's own
+    /// text selection away; every gesture has a keyboard equivalent, so this
+    /// costs nothing but convenience.
+    #[arg(long)]
+    no_mouse: bool,
+
     /// Show version, license, repository, and privacy pledge
     #[arg(long)]
     about: bool,
@@ -364,6 +384,12 @@ async fn run_app(cli: Cli) -> Result<()> {
         sort_field: cli.sort,
         tree_mode: cli.tree,
         connection_mode,
+        theme: cli.theme,
+        caps: muxtop_tui::CapsOverrides {
+            no_color: cli.no_color,
+            ascii: cli.ascii,
+            no_mouse: cli.no_mouse,
+        },
     };
 
     // Benchmark mode: drain snapshots into an AppState for N seconds with no

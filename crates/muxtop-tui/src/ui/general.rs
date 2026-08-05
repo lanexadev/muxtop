@@ -1,625 +1,515 @@
-// General tab — CPU bars, memory bars, system info line.
+// General tab — the dashboard.
+//
+// 0.4 drew CPU bars, memory bars, one info line, and then a `Constraint::Min(0)`
+// of nothing: on a 50-row terminal roughly half of this tab was blank. The space
+// now carries the summary that makes a tabbed monitor worth having — including
+// the cross-tab "Workloads" card, which is where a future GPU summary lands with
+// no layout work at all.
 
-use ratatui::{
-    Frame,
-    layout::{Alignment, Constraint, Layout, Rect},
-    style::{Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
-};
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
 
-use super::theme::Theme;
-use crate::app::AppState;
-use muxtop_core::system::{CoreSnapshot, SystemSnapshot};
+use super::Render;
+use super::sanitize::scrub_ctrl;
+use super::widgets::empty::{self, EmptyState};
+use super::widgets::{meter, panel, spark};
+use crate::terminal::Breakpoint;
+use crate::ui::theme::Level;
+use muxtop_core::system::SystemSnapshot;
 
-/// Render the General tab content area.
-pub fn draw_general_tab(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
-    let Some(ref snapshot) = app.last_snapshot else {
-        let para = Paragraph::new("Waiting for data...").alignment(Alignment::Center);
-        frame.render_widget(para, area);
+pub fn draw_general_tab(frame: &mut Frame, area: Rect, r: &Render<'_>) {
+    let Some(snapshot) = r.app.last_snapshot.as_ref() else {
+        let waiting = r.ellipsis("Waiting for data");
+        empty::render(frame, area, &EmptyState::waiting(&waiting), r.theme);
         return;
     };
 
-    let unicode = app.term_caps.unicode;
+    let two_column = r.breakpoint >= Breakpoint::Md && area.width >= 96;
+    let cpu_h = cpu_height(snapshot, area.height, two_column);
+    let mem_h = if snapshot.memory.swap_total > 0 { 4 } else { 3 };
 
-    // Compute heights dynamically to avoid wasted empty space.
-    let n_cores = snapshot.cpu.cores.len();
-    let cpu_h = if n_cores == 0 {
-        3
-    } else if n_cores <= 16 {
-        n_cores as u16 + 2 // cores + border top/bottom
-    } else {
-        (n_cores.div_ceil(2)) as u16 + 2 // two-column layout
-    };
-    let has_swap = snapshot.memory.swap_total > 0;
-    let mem_h = if has_swap { 4 } else { 3 }; // border(2) + RAM(1) + optional Swap(1)
-
-    let chunks = Layout::vertical([
+    let [top, middle, bottom] = Layout::vertical([
         Constraint::Length(cpu_h),
         Constraint::Length(mem_h),
-        Constraint::Length(1),
-        Constraint::Min(0), // absorb remaining space
+        Constraint::Fill(1),
     ])
-    .split(area);
+    .areas(area);
 
-    draw_cpu_bars(frame, chunks[0], snapshot, unicode, theme);
-    draw_memory_bars(frame, chunks[1], snapshot, unicode, theme);
-    draw_system_info(frame, chunks[2], snapshot, theme);
-}
+    if two_column {
+        let [left, right] =
+            Layout::horizontal([Constraint::Percentage(60), Constraint::Fill(1)]).areas(top);
+        draw_cpu(frame, left, r, snapshot);
+        draw_load(frame, right, r, snapshot);
 
-/// Format uptime in seconds as "Xd Yh Zm".
-fn format_uptime(secs: u64) -> String {
-    let days = secs / 86400;
-    let hours = (secs % 86400) / 3600;
-    let mins = (secs % 3600) / 60;
-    format!("{days}d {hours}h {mins}m")
-}
-
-/// Render a single-line system info bar: uptime, load averages, task counts.
-fn draw_system_info(frame: &mut Frame, area: Rect, snapshot: &SystemSnapshot, theme: &Theme) {
-    let running = snapshot
-        .processes
-        .iter()
-        .filter(|p| p.status == "Running")
-        .count();
-    let total = snapshot.processes.len();
-    let uptime = format_uptime(snapshot.load.uptime_secs);
-
-    let line = Line::from(vec![
-        Span::styled(
-            format!(" Uptime: {uptime} "),
-            Style::default()
-                .fg(theme.fg)
-                .bg(theme.selection_bg)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("   "),
-        Span::styled(
-            format!(
-                " Load: {:.2} {:.2} {:.2} ",
-                snapshot.load.one, snapshot.load.five, snapshot.load.fifteen
-            ),
-            Style::default().fg(theme.fg).bg(theme.selection_bg),
-        ),
-        Span::raw("   "),
-        Span::styled(
-            format!(" Tasks: {total} ({running} running) "),
-            Style::default().fg(theme.fg).bg(theme.selection_bg),
-        ),
-    ]);
-    let para = Paragraph::new(line).style(Style::default().bg(theme.bg));
-    frame.render_widget(para, area);
-}
-
-/// Convert bytes to GiB string with one decimal place.
-fn format_bytes_gb(bytes: u64) -> String {
-    let gib = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-    format!("{gib:.1}")
-}
-
-/// Render RAM bar and optional Swap bar inside a bordered block.
-fn draw_memory_bars(
-    frame: &mut Frame,
-    area: Rect,
-    snapshot: &SystemSnapshot,
-    unicode: bool,
-    theme: &Theme,
-) {
-    let block = Block::default()
-        .title(" Memory ")
-        .title_style(
-            Style::default()
-                .fg(theme.accent_primary)
-                .add_modifier(Modifier::BOLD),
-        )
-        .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
-        .border_style(Style::default().fg(theme.text_dim));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let mem = &snapshot.memory;
-    let mut lines: Vec<Line<'static>> = Vec::new();
-
-    lines.push(make_bar_line(
-        "Mem",
-        mem.used,
-        mem.total,
-        inner.width,
-        unicode,
-        theme,
-    ));
-
-    if mem.swap_total > 0 {
-        lines.push(make_bar_line(
-            "Swp",
-            mem.swap_used,
-            mem.swap_total,
-            inner.width,
-            unicode,
-            theme,
-        ));
+        let [left, right] =
+            Layout::horizontal([Constraint::Percentage(60), Constraint::Fill(1)]).areas(middle);
+        draw_memory(frame, left, r, snapshot);
+        draw_network(frame, right, r, snapshot);
+    } else {
+        draw_cpu(frame, top, r, snapshot);
+        draw_memory(frame, middle, r, snapshot);
     }
 
-    let para = Paragraph::new(lines);
-    frame.render_widget(para, inner);
+    if bottom.height >= 3 {
+        if two_column {
+            let [left, right] =
+                Layout::horizontal([Constraint::Percentage(60), Constraint::Fill(1)]).areas(bottom);
+            draw_top_processes(frame, left, r, snapshot);
+            draw_workloads(frame, right, r, snapshot);
+        } else {
+            draw_top_processes(frame, bottom, r, snapshot);
+        }
+    }
 }
 
-/// Build a single horizontal bar line (used for both RAM and Swap).
-fn make_bar_line(
-    label: &str,
-    used: u64,
-    total: u64,
-    width: u16,
-    _unicode: bool,
-    theme: &Theme,
-) -> Line<'static> {
-    let pct = if total > 0 {
-        (used as f64 / total as f64 * 100.0).clamp(0.0, 100.0)
+/// How tall the CPU panel should be: enough for its cores, but never more than
+/// half the screen — the panels below it carry information too.
+fn cpu_height(snapshot: &SystemSnapshot, available: u16, two_column: bool) -> u16 {
+    let cores = snapshot.cpu.cores.len() as u16;
+    if cores == 0 {
+        return 3;
+    }
+    let rows = if cores > 8 || two_column {
+        cores.div_ceil(2)
     } else {
-        0.0
+        cores
     };
-    let used_gb = format_bytes_gb(used);
-    let total_gb = format_bytes_gb(total);
-    let info = format!("{pct:.0}%  {used_gb}/{total_gb}G");
-
-    build_htop_bar(label, 5, info, pct, width, theme)
+    (rows + 2).clamp(3, (available / 2).max(3))
 }
 
-/// Render per-core CPU usage bars inside a "CPU" bordered block.
-fn draw_cpu_bars(
-    frame: &mut Frame,
-    area: Rect,
-    snapshot: &SystemSnapshot,
-    unicode: bool,
-    theme: &Theme,
-) {
-    let block = Block::default()
-        .title(" CPU ")
-        .title_style(
-            Style::default()
-                .fg(theme.accent_primary)
-                .add_modifier(Modifier::BOLD),
-        )
-        .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
-        .border_style(Style::default().fg(theme.text_dim));
+// ---------------------------------------------------------------------------
+// Panels
+// ---------------------------------------------------------------------------
+
+fn draw_cpu(frame: &mut Frame, area: Rect, r: &Render<'_>, snapshot: &SystemSnapshot) {
+    let block = panel::block(Some("CPU"), false, r.theme, r.glyphs);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
 
     let cores = &snapshot.cpu.cores;
     if cores.is_empty() {
         return;
     }
 
-    if cores.len() <= 16 {
+    // Two columns when there are many cores, or when the panel is wide enough
+    // that one core per row would waste most of it.
+    let columns = if cores.len() > inner.height as usize || inner.width >= 64 {
+        2
+    } else {
+        1
+    };
+
+    if columns == 1 {
         let lines: Vec<Line<'static>> = cores
             .iter()
-            .map(|c| make_cpu_bar_line(c, inner.width, unicode, theme))
+            .take(inner.height as usize)
+            .map(|c| core_bar(&c.name, f64::from(c.usage), inner.width, r))
             .collect();
         frame.render_widget(Paragraph::new(lines), inner);
     } else {
-        let [left_area, right_area] =
-            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .areas(inner);
-
+        let [left, right] =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Fill(1)]).areas(inner);
         let mid = cores.len().div_ceil(2);
-        let left_lines: Vec<Line<'static>> = cores[..mid]
-            .iter()
-            .map(|c| make_cpu_bar_line(c, left_area.width, unicode, theme))
-            .collect();
-        let right_lines: Vec<Line<'static>> = cores[mid..]
-            .iter()
-            .map(|c| make_cpu_bar_line(c, right_area.width, unicode, theme))
-            .collect();
-
-        frame.render_widget(Paragraph::new(left_lines), left_area);
-        frame.render_widget(Paragraph::new(right_lines), right_area);
+        let build = |slice: &[muxtop_core::system::CoreSnapshot], width: u16, height: u16| {
+            slice
+                .iter()
+                .take(height as usize)
+                .map(|c| core_bar(&c.name, f64::from(c.usage), width, r))
+                .collect::<Vec<_>>()
+        };
+        frame.render_widget(
+            Paragraph::new(build(&cores[..mid], left.width, left.height)),
+            left,
+        );
+        frame.render_widget(
+            Paragraph::new(build(&cores[mid..], right.width, right.height)),
+            right,
+        );
     }
 }
 
-/// Build a single CPU core bar line, htop-style: "cpu0  [|||||         45.2%]"
-fn make_cpu_bar_line(
-    core: &CoreSnapshot,
-    width: u16,
-    _unicode: bool,
-    theme: &Theme,
-) -> Line<'static> {
-    let pct = core.usage.clamp(0.0, 100.0) as f64;
-    let info = format!("{pct:.1}%");
-    build_htop_bar(&core.name, 6, info, pct, width, theme)
+fn core_bar(name: &str, usage: f64, width: u16, r: &Render<'_>) -> Line<'static> {
+    meter::bar_line(
+        name,
+        6,
+        &format!("{usage:.1}%"),
+        usage,
+        width,
+        r.theme,
+        r.glyphs,
+    )
 }
 
-/// Core htop-style bar builder.
-///
-/// Renders: `LABEL [|||||||||||       info]`
-///
-/// The fill is split into colour zones the same way htop does:
-///   - green  : chars covering the 0 – 50 % region of the bar
-///   - yellow : chars covering the 50 – 80 % region
-///   - red    : chars covering the 80 – 100 % region
-///
-/// Only the zones actually reached by `pct` are drawn, so a bar at 60 %
-/// shows green + a little yellow; a bar at 30 % shows only green.
-/// `info` is right-aligned inside the brackets; the fill never overwrites it.
-fn build_htop_bar(
-    label: &str,
-    label_w: usize,
-    info: String,
-    pct: f64,
-    width: u16,
-    theme: &Theme,
-) -> Line<'static> {
-    let label_str = format!("{:<width$}", label, width = label_w);
-    // bar_w = total chars available between "[" and "]"
-    let bar_w = (width as usize)
-        .saturating_sub(label_w + 2) // 2 = "[" + "]"
+fn draw_memory(frame: &mut Frame, area: Rect, r: &Render<'_>, snapshot: &SystemSnapshot) {
+    let block = panel::block(Some("Memory"), false, r.theme, r.glyphs);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let mem = &snapshot.memory;
+    let mut lines = vec![mem_bar("Mem", mem.used, mem.total, inner.width, r)];
+    if mem.swap_total > 0 {
+        lines.push(mem_bar(
+            "Swap",
+            mem.swap_used,
+            mem.swap_total,
+            inner.width,
+            r,
+        ));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn mem_bar(label: &str, used: u64, total: u64, width: u16, r: &Render<'_>) -> Line<'static> {
+    let pct = if total > 0 {
+        (used as f64 / total as f64 * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+    let info = format!(
+        "{pct:.0}%  {}/{}",
+        meter::human_bytes(used),
+        meter::human_bytes(total)
+    );
+    meter::bar_line(label, 6, &info, pct, width, r.theme, r.glyphs)
+}
+
+fn draw_load(frame: &mut Frame, area: Rect, r: &Render<'_>, snapshot: &SystemSnapshot) {
+    let block = panel::block(Some("Load"), false, r.theme, r.glyphs);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let cores = snapshot.cpu.cores.len().max(1) as f64;
+    let load = &snapshot.load;
+    // Load is only meaningful against the core count — 4.0 is a catastrophe on
+    // a 2-core box and a quiet afternoon on a 64-core one.
+    let lines: Vec<Line<'static>> = [("1m", load.one), ("5m", load.five), ("15m", load.fifteen)]
+        .into_iter()
+        .take(inner.height as usize)
+        .map(|(label, value)| {
+            let pct = (value / cores * 100.0).clamp(0.0, 100.0);
+            meter::bar_line(
+                label,
+                4,
+                &format!("{value:.2}"),
+                pct,
+                inner.width,
+                r.theme,
+                r.glyphs,
+            )
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_network(frame: &mut Frame, area: Rect, r: &Render<'_>, _snapshot: &SystemSnapshot) {
+    let block = panel::block(Some("Network"), false, r.theme, r.glyphs);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 || inner.width < 12 {
+        return;
+    }
+
+    let history = &r.app.network_history;
+    let interfaces = r.app.visible_interfaces();
+    // The busiest interface is the one worth graphing on a summary screen.
+    let Some(busiest) = interfaces.iter().max_by(|a, b| {
+        (history.bandwidth_rx(&a.name) + history.bandwidth_tx(&a.name))
+            .partial_cmp(&(history.bandwidth_rx(&b.name) + history.bandwidth_tx(&b.name)))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }) else {
+        return;
+    };
+
+    let width = inner.width.saturating_sub(12);
+    let rx = history.sparkline_rx(&busiest.name, width as usize);
+    let tx = history.sparkline_tx(&busiest.name, width as usize);
+    let scale = rx
+        .iter()
+        .chain(tx.iter())
+        .copied()
+        .max()
+        .unwrap_or(1)
         .max(1);
 
-    // Clip info to fit if the terminal is very narrow.
-    let info = if info.len() >= bar_w {
-        info.chars().take(bar_w).collect::<String>()
-    } else {
-        info
-    };
-    let info_len = info.len();
-
-    // Total fill chars: proportional to pct, never overlapping info.
-    let max_filled = bar_w.saturating_sub(info_len);
-    let filled = ((max_filled as f64) * (pct / 100.0)).round() as usize;
-    let filled = filled.min(max_filled);
-
-    // Zone boundaries expressed in characters (relative to max_filled).
-    // green: [0, g_end)  yellow: [g_end, y_end)  red: [y_end, filled)
-    let g_end = ((max_filled as f64) * 0.50).round() as usize;
-    let y_end = ((max_filled as f64) * 0.80).round() as usize;
-
-    let green_n = filled.min(g_end);
-    let yellow_n = if filled > g_end {
-        (filled - g_end).min(y_end - g_end)
-    } else {
-        0
-    };
-    let red_n = filled.saturating_sub(y_end);
-
-    let empty = bar_w - filled - info_len;
-
-    let mut spans: Vec<Span<'static>> = vec![
-        Span::styled(
-            label_str,
-            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+    let mut lines = Vec::with_capacity(2);
+    for (arrow, data, rate, color) in [
+        (
+            r.glyphs.arrow_down,
+            rx,
+            history.bandwidth_rx(&busiest.name),
+            r.theme.success,
         ),
-        Span::styled("[", Style::default().fg(theme.accent_primary)),
-    ];
-    if green_n > 0 {
-        spans.push(Span::styled(
-            "|".repeat(green_n),
-            Style::default().fg(theme.success),
-        ));
+        (
+            r.glyphs.arrow_up,
+            tx,
+            history.bandwidth_tx(&busiest.name),
+            r.theme.info,
+        ),
+    ] {
+        let mut spans = vec![Span::styled(
+            format!("{arrow} {:>9} ", meter::human_rate(rate as u64)),
+            r.theme.dim(),
+        )];
+        spans.extend(
+            spark::line(
+                &data,
+                width,
+                Some(scale),
+                spark::Tint::Flat,
+                color,
+                r.theme,
+                r.glyphs,
+            )
+            .spans,
+        );
+        lines.push(Line::from(spans));
     }
-    if yellow_n > 0 {
-        spans.push(Span::styled(
-            "|".repeat(yellow_n),
-            Style::default().fg(theme.warning),
-        ));
-    }
-    if red_n > 0 {
-        spans.push(Span::styled(
-            "|".repeat(red_n),
-            Style::default().fg(theme.danger),
-        ));
-    }
-    spans.push(Span::raw(" ".repeat(empty)));
-    spans.push(Span::styled(info, Style::default().fg(theme.text_dim)));
-    spans.push(Span::styled("]", Style::default().fg(theme.accent_primary)));
+    frame.render_widget(Paragraph::new(lines), inner);
+}
 
-    Line::from(spans)
+fn draw_top_processes(frame: &mut Frame, area: Rect, r: &Render<'_>, snapshot: &SystemSnapshot) {
+    let block = panel::block(Some("Top processes"), false, r.theme, r.glyphs);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let mut procs: Vec<_> = snapshot.processes.iter().collect();
+    procs.sort_by(|a, b| {
+        b.cpu_percent
+            .partial_cmp(&a.cpu_percent)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut lines = vec![Line::from(Span::styled(
+        format!("{:>6} {:>6}  COMMAND", "CPU%", "MEM%"),
+        r.theme.dim(),
+    ))];
+    let cmd_w = (inner.width as usize).saturating_sub(15);
+    for p in procs.iter().take(inner.height.saturating_sub(1) as usize) {
+        let command = scrub_ctrl(&p.command);
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{:>6.1} ", p.cpu_percent),
+                ratatui::style::Style::default().fg(r.theme.gauge_color(f64::from(p.cpu_percent))),
+            ),
+            Span::styled(format!("{:>6.1}  ", p.memory_percent), r.theme.body()),
+            Span::styled(
+                r.glyphs.truncate(&command, cmd_w).into_owned(),
+                r.theme.body(),
+            ),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Cross-tab summary: what the other tabs would tell you, without switching.
+fn draw_workloads(frame: &mut Frame, area: Rect, r: &Render<'_>, snapshot: &SystemSnapshot) {
+    let block = panel::block(Some("Workloads"), false, r.theme, r.glyphs);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(4);
+
+    let running = snapshot
+        .processes
+        .iter()
+        .filter(|p| p.status == "Running")
+        .count();
+    lines.push(row(
+        "Processes",
+        format!(
+            "{} {} {running} running",
+            snapshot.processes.len(),
+            r.glyphs.sep
+        ),
+        Level::Neutral,
+        r,
+    ));
+
+    lines.push(match snapshot.containers.as_ref() {
+        None => row("Containers", "no engine".into(), Level::Neutral, r),
+        Some(cs) if !cs.daemon_up => row("Containers", "daemon down".into(), Level::Error, r),
+        Some(cs) => {
+            let up = cs
+                .containers
+                .iter()
+                .filter(|c| c.state == muxtop_core::containers::ContainerState::Running)
+                .count();
+            row(
+                "Containers",
+                format!(
+                    "{up} running {} {} total",
+                    r.glyphs.sep,
+                    cs.containers.len()
+                ),
+                Level::Success,
+                r,
+            )
+        }
+    });
+
+    lines.push(match snapshot.kube.as_ref() {
+        None => row("Kubernetes", "not configured".into(), Level::Neutral, r),
+        Some(k) if !k.reachable => row("Kubernetes", "unreachable".into(), Level::Error, r),
+        Some(k) => {
+            let broken = k
+                .pods
+                .iter()
+                .filter(|p| {
+                    matches!(
+                        p.phase,
+                        muxtop_core::kube::PodPhase::CrashLoop
+                            | muxtop_core::kube::PodPhase::Failed
+                    )
+                })
+                .count();
+            let level = if broken > 0 {
+                Level::Error
+            } else {
+                Level::Success
+            };
+            let text = if broken > 0 {
+                format!("{} pods {} {broken} failing", k.pods.len(), r.glyphs.sep)
+            } else {
+                format!(
+                    "{} pods {} {} nodes",
+                    k.pods.len(),
+                    r.glyphs.sep,
+                    k.nodes.len()
+                )
+            };
+            row("Kubernetes", text, level, r)
+        }
+    });
+
+    let visible: Vec<Line<'static>> = lines.into_iter().take(inner.height as usize).collect();
+    frame.render_widget(Paragraph::new(visible), inner);
+}
+
+fn row(label: &str, value: String, level: Level, r: &Render<'_>) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<12}"), r.theme.dim()),
+        Span::styled(value, r.theme.level_style(level)),
+    ])
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::app::AppState;
-    use ratatui::{Terminal, backend::TestBackend};
 
-    fn render_with(app: &AppState, width: u16, height: u16) -> ratatui::buffer::Buffer {
-        let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let _theme = super::super::theme::Theme::new(crate::terminal::ColorSupport::TrueColor);
-        terminal
-            .draw(|frame| {
-                // Directly call draw_general_tab since using draw_root uses its own theme internal creation logic! Wait,
-                // the simplest is to just call draw_root and it will re-invoke all correctly.
-                crate::ui::draw_root(frame, app)
-            })
-            .unwrap();
-        terminal.backend().buffer().clone()
+    use crate::app::{AppState, Tab};
+    use crate::ui::test_support::*;
+
+    fn app() -> AppState {
+        let mut app = app_with_data();
+        app.tab = Tab::General;
+        app
     }
 
-    fn buffer_line_text(buf: &ratatui::buffer::Buffer, row: u16) -> String {
-        let width = buf.area.width;
-        (0..width)
-            .map(|col| buf.cell((col, row)).map(|c| c.symbol()).unwrap_or(" "))
-            .collect::<String>()
-            .trim_end()
-            .to_string()
+    #[test]
+    fn dashboard_shows_cpu_and_memory() {
+        let text = all_text(&render_with(&app(), 120, 40));
+        assert!(text.contains("CPU"));
+        assert!(text.contains("cpu0"));
+        assert!(text.contains("Memory"));
+        assert!(text.contains("Mem"));
+        assert!(text.contains("Swap"));
     }
 
-    fn buffer_contains(buf: &ratatui::buffer::Buffer, needle: &str) -> bool {
-        let height = buf.area.height;
-        (0..height).any(|row| buffer_line_text(buf, row).contains(needle))
+    #[test]
+    fn dashboard_fills_the_screen_instead_of_leaving_it_blank() {
+        // The 0.4 layout absorbed the remaining height with nothing in it.
+        let text = all_text(&render_with(&app(), 140, 40));
+        assert!(text.contains("Top processes"), "wasted space:\n{text}");
+        assert!(text.contains("Workloads"));
+        assert!(text.contains("Load"));
+        assert!(text.contains("Network"));
     }
 
-    fn make_test_snapshot(
-        core_count: usize,
-        running_count: usize,
-    ) -> muxtop_core::system::SystemSnapshot {
-        use muxtop_core::process::ProcessInfo;
-        use muxtop_core::system::*;
+    #[test]
+    fn workloads_card_summarises_the_other_tabs() {
+        let text = all_text(&render_with(&app(), 140, 40));
+        assert!(text.contains("Processes"));
+        assert!(text.contains("Containers"));
+        assert!(text.contains("Kubernetes"));
+        assert!(text.contains("no engine"), "an absent engine must say so");
+    }
 
-        let cores = (0..core_count)
-            .map(|i| CoreSnapshot {
+    #[test]
+    fn narrow_terminals_stack_into_one_column() {
+        let text = all_text(&render_with(&app(), 70, 30));
+        assert!(text.contains("CPU"));
+        assert!(text.contains("Memory"));
+        // The side cards are dropped rather than squeezed into nothing.
+        assert!(!text.contains("Workloads"));
+    }
+
+    #[test]
+    fn swap_row_is_hidden_when_there_is_no_swap() {
+        let mut snap = snapshot();
+        snap.memory.swap_total = 0;
+        snap.memory.swap_used = 0;
+        let mut app = AppState::new();
+        app.tab = Tab::General;
+        app.apply_snapshot(snap);
+        assert!(!all_text(&render_with(&app, 120, 40)).contains("Swap"));
+    }
+
+    #[test]
+    fn many_cores_use_two_columns_without_overflowing() {
+        let mut snap = snapshot();
+        snap.cpu.cores = (0..64)
+            .map(|i| muxtop_core::system::CoreSnapshot {
                 name: format!("cpu{i}"),
-                usage: (i as f32 * 10.0) % 100.0,
+                usage: (i as f32) % 100.0,
                 frequency: 3600,
             })
             .collect();
-
-        let mut processes = Vec::new();
-        for i in 0..5 {
-            processes.push(ProcessInfo {
-                pid: i as u32,
-                parent_pid: None,
-                name: format!("proc{i}"),
-                command: format!("/usr/bin/proc{i}"),
-                user: "user".to_string(),
-                cpu_percent: 10.0,
-                memory_bytes: 1000,
-                memory_percent: 1.0,
-                status: if i < running_count {
-                    "Running".to_string()
-                } else {
-                    "Sleeping".to_string()
-                },
-            });
-        }
-
-        SystemSnapshot {
-            cpu: CpuSnapshot {
-                global_usage: 42.5,
-                cores,
-            },
-            memory: MemorySnapshot {
-                total: 16_000_000_000,
-                used: 8_000_000_000,
-                available: 8_000_000_000,
-                swap_total: 4_000_000_000,
-                swap_used: 1_000_000_000,
-            },
-            load: LoadSnapshot {
-                one: 2.31,
-                five: 1.87,
-                fifteen: 1.42,
-                uptime_secs: 90061,
-            },
-            processes,
-            networks: muxtop_core::network::NetworkSnapshot {
-                interfaces: vec![],
-                total_rx: 0,
-                total_tx: 0,
-            },
-            containers: None,
-            kube: None,
-            gpu: None,
-            timestamp_ms: 0,
-        }
-    }
-
-    // -- STORY-01: Scaffold --
-
-    #[test]
-    fn test_general_tab_callable() {
-        let app = AppState::new();
-        let buf = render_with(&app, 80, 24);
-        assert!(!buffer_contains(&buf, "[General view"));
-    }
-
-    // -- STORY-02: 3-zone layout + no-data handling --
-
-    #[test]
-    fn test_general_no_data_shows_waiting() {
-        let app = AppState::new();
-        let buf = render_with(&app, 80, 24);
-        assert!(buffer_contains(&buf, "Waiting for data..."));
-    }
-
-    #[test]
-    fn test_general_three_zones_with_data() {
         let mut app = AppState::new();
-        app.apply_snapshot(make_test_snapshot(4, 2));
-        let buf = render_with(&app, 80, 24);
-        assert!(!buffer_contains(&buf, "Waiting for data..."));
-    }
-
-    // -- STORY-05: System info line --
-
-    #[test]
-    fn test_format_uptime_zero() {
-        assert_eq!(format_uptime(0), "0d 0h 0m");
-    }
-
-    #[test]
-    fn test_format_uptime_complex() {
-        assert_eq!(format_uptime(90061), "1d 1h 1m");
-    }
-
-    #[test]
-    fn test_format_uptime_hours_only() {
-        assert_eq!(format_uptime(7200), "0d 2h 0m");
-    }
-
-    #[test]
-    fn test_system_info_tasks_count() {
-        let mut app = AppState::new();
-        app.apply_snapshot(make_test_snapshot(4, 2));
-        let buf = render_with(&app, 80, 24);
-        assert!(buffer_contains(&buf, "Tasks: 5 (2 running)"));
-    }
-
-    #[test]
-    fn test_system_info_load_averages() {
-        let mut app = AppState::new();
-        app.apply_snapshot(make_test_snapshot(4, 2));
-        let buf = render_with(&app, 80, 24);
-        assert!(buffer_contains(&buf, "2.31"));
-        assert!(buffer_contains(&buf, "1.87"));
-        assert!(buffer_contains(&buf, "1.42"));
-    }
-
-    #[test]
-    fn test_system_info_pipe_separated() {
-        let mut app = AppState::new();
-        app.apply_snapshot(make_test_snapshot(4, 2));
-        let buf = render_with(&app, 80, 24);
-        assert!(buffer_contains(&buf, "Tasks: 5 (2 running)"));
-    }
-
-    // -- STORY-04: Memory bars --
-
-    #[test]
-    fn test_format_bytes_gb() {
-        let result = format_bytes_gb(16_000_000_000);
-        assert!(
-            result.contains('.'),
-            "Should contain decimal point: {result}"
-        );
-        assert!(!result.is_empty());
-    }
-
-    #[test]
-    fn test_format_bytes_gb_zero() {
-        assert_eq!(format_bytes_gb(0), "0.0");
-    }
-
-    #[test]
-    fn test_memory_bar_shows_values() {
-        let mut app = AppState::new();
-        app.apply_snapshot(make_test_snapshot(4, 2));
-        let buf = render_with(&app, 80, 24);
-        assert!(buffer_contains(&buf, "Mem"));
-        assert!(buffer_contains(&buf, "%"));
-    }
-
-    #[test]
-    fn test_memory_swap_shown_when_active() {
-        let mut app = AppState::new();
-        app.apply_snapshot(make_test_snapshot(4, 2));
-        let buf = render_with(&app, 80, 24);
-        assert!(buffer_contains(&buf, "Swp"));
-    }
-
-    #[test]
-    fn test_memory_swap_hidden_when_zero() {
-        let mut app = AppState::new();
-        let mut snap = make_test_snapshot(4, 2);
-        snap.memory.swap_total = 0;
-        snap.memory.swap_used = 0;
+        app.tab = Tab::General;
         app.apply_snapshot(snap);
-        let buf = render_with(&app, 80, 24);
-        assert!(!buffer_contains(&buf, "Swp"));
-    }
-
-    // -- STORY-03: CPU bars --
-
-    #[test]
-    fn test_cpu_bars_show_core_labels() {
-        let mut app = AppState::new();
-        app.apply_snapshot(make_test_snapshot(4, 2));
-        let buf = render_with(&app, 80, 24);
-        assert!(buffer_contains(&buf, "cpu0"));
-        assert!(buffer_contains(&buf, "cpu1"));
-        assert!(buffer_contains(&buf, "cpu2"));
-        assert!(buffer_contains(&buf, "cpu3"));
+        let buf = render_with(&app, 160, 50);
+        let text = all_text(&buf);
+        assert!(text.contains("cpu0"));
+        // Nothing may spill past the panel.
+        for row in 0..buf.area.height {
+            assert!(line_text(&buf, row).chars().count() <= 160);
+        }
     }
 
     #[test]
-    fn test_cpu_bars_show_percentages() {
+    fn zero_cores_does_not_panic() {
+        let mut snap = snapshot();
+        snap.cpu.cores.clear();
         let mut app = AppState::new();
-        app.apply_snapshot(make_test_snapshot(4, 2));
-        let buf = render_with(&app, 80, 24);
-        assert!(buffer_contains(&buf, "%"));
+        app.tab = Tab::General;
+        app.apply_snapshot(snap);
+        let _ = render_with(&app, 120, 40);
     }
 
     #[test]
-    fn test_cpu_bars_zero_cores_no_panic() {
-        let mut app = AppState::new();
-        app.apply_snapshot(make_test_snapshot(0, 0));
-        let _buf = render_with(&app, 80, 24);
-    }
-
-    #[test]
-    fn test_cpu_bars_condense_20_cores() {
-        let mut app = AppState::new();
-        app.apply_snapshot(make_test_snapshot(20, 0));
-        let buf = render_with(&app, 80, 24);
-        assert!(buffer_contains(&buf, "cpu0"));
-        assert!(buffer_contains(&buf, "cpu10"));
-    }
-
-    // Guard G-04: odd core count 2-column split
-    #[test]
-    fn test_cpu_bars_condense_odd_17_cores() {
-        let mut app = AppState::new();
-        app.apply_snapshot(make_test_snapshot(17, 0));
-        let buf = render_with(&app, 100, 30);
-        // 17 cores: left column gets ceil(17/2)=9, right gets 8
-        assert!(buffer_contains(&buf, "cpu0"));
-        assert!(buffer_contains(&buf, "cpu8"));
-        assert!(buffer_contains(&buf, "cpu16"));
-    }
-
-    #[test]
-    fn test_cpu_bars_condense_odd_21_cores() {
-        let mut app = AppState::new();
-        app.apply_snapshot(make_test_snapshot(21, 0));
-        let buf = render_with(&app, 100, 30);
-        // 21 cores: left column gets ceil(21/2)=11, right gets 10
-        assert!(buffer_contains(&buf, "cpu0"));
-        assert!(buffer_contains(&buf, "cpu10"));
-        assert!(buffer_contains(&buf, "cpu20"));
-    }
-
-    // -- STORY-06: Integration + edge cases --
-
-    #[test]
-    fn test_general_full_render_80x24() {
-        let mut app = AppState::new();
-        app.apply_snapshot(make_test_snapshot(4, 2));
-        let buf = render_with(&app, 80, 24);
-        assert!(buffer_contains(&buf, "CPU"));
-        assert!(buffer_contains(&buf, "Mem"));
-        assert!(buffer_contains(&buf, "Tasks"));
-    }
-
-    #[test]
-    fn test_general_tiny_terminal_no_panic() {
-        let mut app = AppState::new();
-        app.apply_snapshot(make_test_snapshot(4, 2));
-        let _buf = render_with(&app, 40, 6);
-    }
-
-    #[test]
-    fn test_general_large_terminal_no_panic() {
-        let mut app = AppState::new();
-        app.apply_snapshot(make_test_snapshot(4, 2));
-        let _buf = render_with(&app, 200, 50);
-    }
-
-    #[test]
-    fn test_general_replaces_placeholder() {
-        let mut app = AppState::new();
-        app.apply_snapshot(make_test_snapshot(4, 2));
-        let buf = render_with(&app, 80, 24);
-        assert!(!buffer_contains(&buf, "[General view"));
+    fn renders_under_every_profile_and_size() {
+        let mut app = app();
+        for (w, h) in [(1u16, 1u16), (40, 6), (60, 20), (80, 24), (200, 60)] {
+            let _ = render_with(&app, w, h);
+        }
+        for (color, unicode) in all_profiles() {
+            let _ = render_caps(&mut app, 140, 40, color, unicode);
+        }
     }
 }

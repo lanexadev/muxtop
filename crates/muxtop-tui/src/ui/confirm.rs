@@ -1,177 +1,136 @@
-// Confirmation dialog overlay rendering.
+// Confirmation dialog.
+//
+// The last gate before something irreversible. Restyled for 0.5.1: a danger
+// border, the target spelled out, and cancel offered first — but the behaviour
+// that mattered is unchanged, because it was already right.
 
-use ratatui::{
-    Frame,
-    layout::Rect,
-    style::{Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
-};
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Layout};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Clear, Paragraph};
 
-use super::theme::Theme;
-use crate::app::AppState;
+use ratatui::layout::Alignment;
 
-/// Render the confirmation dialog as a centered overlay.
-pub fn draw_confirm(frame: &mut Frame, app: &AppState, theme: &Theme) {
-    let Some(ref action) = app.confirm else {
+use crate::ui::Render;
+use crate::ui::theme::Level;
+use crate::ui::widgets::{overlay, panel};
+
+pub fn draw_confirm(frame: &mut Frame, r: &Render<'_>) {
+    let Some(action) = r.app.confirm.as_ref() else {
         return;
     };
-
-    let area = frame.area();
     let prompt = action.prompt();
+    let area = frame.area();
 
-    // Dialog dimensions: fit the prompt + some padding.
-    let width = (prompt.len() as u16 + 6).min(area.width.saturating_sub(4));
-    let height = 3u16.min(area.height.saturating_sub(2)); // border + text + border
+    // Wide enough for the prompt, within reason.
+    let width = (prompt.chars().count() as u16 + 6)
+        .clamp(24, 72)
+        .min(area.width);
+    let height = 7.min(area.height);
+    let popup = overlay::centered(width, height, area);
 
-    if width < 10 || height < 3 {
+    if popup.width < 6 || popup.height < 3 {
         return;
     }
 
-    let popup = centered_rect(width, height, area);
-
-    // Clear the area behind the popup.
     frame.render_widget(Clear, popup);
-
-    let block = Block::default()
-        .title(" Confirm ")
-        .title_style(
-            Style::default()
-                .fg(theme.bg)
-                .bg(theme.warning)
-                .add_modifier(Modifier::BOLD),
-        )
-        .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
-        .border_style(Style::default().fg(theme.warning).bg(theme.bg));
-
+    let block = panel::block(Some("Confirm"), true, r.theme, r.glyphs)
+        .border_style(r.theme.level_style(Level::Error))
+        .title_style(r.theme.level_style(Level::Error));
     let inner = block.inner(popup);
-    frame.render_widget(Clear, popup); // Clear must be matched precisely to widget bounds.
     frame.render_widget(block, popup);
-
-    if inner.height == 0 || inner.width == 0 {
+    if inner.height == 0 {
         return;
     }
 
-    let line = Line::from(vec![Span::styled(
-        format!(" {prompt}"),
-        Style::default().fg(theme.fg),
-    )]);
+    let [text_area, _, keys_area] = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
 
-    frame.render_widget(Paragraph::new(line), inner);
-}
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(prompt, r.theme.strong())))
+            .alignment(Alignment::Center)
+            .wrap(ratatui::widgets::Wrap { trim: true }),
+        text_area,
+    );
 
-/// Create a centered `Rect` of given size within `area`.
-fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
-    let x = area.x + (area.width.saturating_sub(width)) / 2;
-    let y = area.y + (area.height.saturating_sub(height)) / 2;
-    Rect::new(x, y, width.min(area.width), height.min(area.height))
+    // Cancel is listed first: the safe answer should be the one the eye lands
+    // on, even though both keys are one press away.
+    let keys = Line::from(vec![
+        Span::styled(" Esc ", r.theme.key()),
+        Span::styled(" cancel   ", r.theme.key_desc()),
+        Span::styled(" y ", r.theme.level_fill(Level::Error)),
+        Span::styled(" confirm ", r.theme.key_desc()),
+    ]);
+    frame.render_widget(Paragraph::new(keys).alignment(Alignment::Center), keys_area);
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::app::{AppState, ConfirmAction};
+    use crate::app::{AppState, ConfirmAction, Tab};
+    use crate::terminal::ColorSupport;
+    use crate::ui::test_support::*;
     use muxtop_core::actions::Signal;
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
 
-    fn render_with(app: &AppState, width: u16, height: u16) -> ratatui::buffer::Buffer {
-        let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| {
-                crate::ui::draw_root(frame, app);
-            })
-            .unwrap();
-        terminal.backend().buffer().clone()
-    }
-
-    fn buffer_contains(buf: &ratatui::buffer::Buffer, needle: &str) -> bool {
-        let height = buf.area.height;
-        (0..height).any(|row| {
-            let width = buf.area.width;
-            let line: String = (0..width)
-                .map(|col| buf.cell((col, row)).map(|c| c.symbol()).unwrap_or(" "))
-                .collect();
-            line.contains(needle)
-        })
-    }
-
-    #[test]
-    fn test_confirm_dialog_not_shown_when_none() {
-        let app = AppState::new();
-        let buf = render_with(&app, 80, 24);
-        assert!(!buffer_contains(&buf, "Confirm"));
-    }
-
-    #[test]
-    fn test_confirm_dialog_shows_kill_prompt() {
-        let mut app = AppState::new();
+    fn app_with_confirm() -> AppState {
+        let mut app = app_with_data();
+        app.tab = Tab::Processes;
         app.confirm = Some(ConfirmAction::Kill {
             pid: 1234,
             name: "firefox".to_string(),
             signal: Signal::Term,
         });
-        let buf = render_with(&app, 80, 24);
-        assert!(buffer_contains(&buf, "Confirm"));
-        assert!(buffer_contains(&buf, "SIGTERM"));
-        assert!(buffer_contains(&buf, "firefox"));
-        assert!(buffer_contains(&buf, "1234"));
+        app
     }
 
     #[test]
-    fn test_confirm_dialog_shows_sigkill_prompt() {
-        let mut app = AppState::new();
+    fn confirm_names_the_exact_target() {
+        let text = all_text(&render_with(&app_with_confirm(), 100, 30));
+        assert!(text.contains("firefox"));
+        assert!(text.contains("1234"), "the PID disambiguates the target");
+        assert!(text.contains("SIGTERM"));
+    }
+
+    #[test]
+    fn confirm_offers_both_answers() {
+        let text = all_text(&render_with(&app_with_confirm(), 100, 30));
+        assert!(text.contains("cancel"));
+        assert!(text.contains("confirm"));
+    }
+
+    #[test]
+    fn confirm_scrubs_control_characters_from_the_target_name() {
+        let mut app = app_with_data();
         app.confirm = Some(ConfirmAction::Kill {
-            pid: 42,
-            name: "chrome".to_string(),
+            pid: 7,
+            name: "evil\x1b[31mname".to_string(),
             signal: Signal::Kill,
         });
-        let buf = render_with(&app, 80, 24);
-        assert!(buffer_contains(&buf, "SIGKILL"));
-        assert!(buffer_contains(&buf, "chrome"));
+        let text = all_text(&render_with(&app, 100, 30));
+        assert!(!text.contains('\x1b'));
     }
 
     #[test]
-    fn test_confirm_dialog_shows_renice_prompt() {
-        let mut app = AppState::new();
-        app.confirm = Some(ConfirmAction::Renice {
-            pid: 99,
-            name: "node".to_string(),
-            delta: 1,
-        });
-        let buf = render_with(&app, 80, 24);
-        assert!(buffer_contains(&buf, "Renice"));
-        assert!(buffer_contains(&buf, "node"));
+    fn confirm_outranks_every_other_overlay() {
+        let mut app = app_with_confirm();
+        app.overlay = crate::app::Overlay::Help;
+        let text = all_text(&render_with(&app, 100, 30));
+        assert!(
+            text.contains("firefox"),
+            "the destructive gate must stay on top:\n{text}"
+        );
     }
 
     #[test]
-    fn test_confirm_dialog_minimal_terminal_no_panic() {
-        let mut app = AppState::new();
-        app.confirm = Some(ConfirmAction::Kill {
-            pid: 1,
-            name: "init".to_string(),
-            signal: Signal::Term,
-        });
-        let _buf = render_with(&app, 10, 5);
-        let _buf = render_with(&app, 1, 1);
-    }
-
-    #[test]
-    fn test_confirm_action_prompt_format() {
-        let kill = ConfirmAction::Kill {
-            pid: 100,
-            name: "test".to_string(),
-            signal: Signal::Term,
-        };
-        assert!(kill.prompt().contains("SIGTERM"));
-        assert!(kill.prompt().contains("100"));
-
-        let renice = ConfirmAction::Renice {
-            pid: 200,
-            name: "proc".to_string(),
-            delta: -1,
-        };
-        assert!(renice.prompt().contains("higher priority"));
+    fn confirm_survives_tiny_terminals_and_ascii() {
+        let mut app = app_with_confirm();
+        for (w, h) in [(1u16, 1u16), (8, 3), (20, 6), (40, 10)] {
+            let _ = render_with(&app, w, h);
+        }
+        let buf = render_caps(&mut app, 80, 24, ColorSupport::Basic, false);
+        assert!(all_text(&buf).is_ascii());
     }
 }

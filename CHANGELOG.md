@@ -7,52 +7,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.5.0] - 2026-08-05
+### Ergonomics and UI/UX overhaul
 
-Feature release: the **GPU** tab. NVIDIA via [NVML](https://developer.nvidia.com/nvidia-management-library-nvml) and AMD via the `amdgpu` sysfs interface, with per-process usage on NVIDIA. Auto-detected at startup, so `muxtop` gains a sixth tab on any host with a supported GPU.
+A full rework of how muxtop is navigated, read and understood. The audit that produced it, with the
+per-screen specifications, is in [`docs/UX-v0.5.1.md`](docs/UX-v0.5.1.md).
 
-**Apple Silicon is deferred to v0.6, not dropped** — see [Why Apple Silicon is not in this release](README.md#why-apple-silicon-is-not-in-this-release). The roadmap's other v0.5 item, interactive `docker exec` (PTY), also moves to v0.6; this release is GPU only.
+The root cause of most of what follows was structural: the four table views each hand-rolled their
+own column header, scroll arithmetic, striping, filter bar and empty state. Four copies meant four
+behaviours and four places to fix every bug. They now share `ui/widgets/`, and the keymap is a single
+table that drives dispatch, the help screen and the footer hints at once.
 
-### Wire protocol break
+#### Changed — breaking
 
-- **`SystemSnapshot` gains a `gpu` field**, appended after `kube` and before `timestamp_ms`. bincode is order-sensitive, so a 0.4.x client decoding a 0.5 frame reads the GPU bytes as its `timestamp_ms` and fails. **Client and server must match on the minor version**, exactly as for the v0.4 `kube` break.
+- **`←` / `→` no longer switch tabs.** They scroll columns. Horizontal arrows meaning "change screen"
+  while vertical arrows meant "change row" was the single most disorienting thing in the 0.4 UI. Use
+  `Tab` / `Shift+Tab`, or `Alt+1`…`Alt+5`.
+- **`F1`–`F5` no longer sort.** muxtop advertises htop shortcuts, so it now honours the htop map:
+  `F1` Help, `F3`/`F4` Search/Filter, `F5` Tree, `F6` Sort, `F7`/`F8` Nice, `F9` Kill, `F10` Force
+  kill. A user coming from htop pressing `F1` expecting documentation used to silently re-sort the
+  table instead.
+- **Tab-scoped keys act only on their own tab.** `t` and the function keys used to fire from
+  anywhere: pressing `F9` on the Network tab killed the selected *process*, and `t` re-shaped a
+  process table the user was not looking at.
+- **`Esc` is progressive.** One step back per press: close overlay → dismiss messages → leave the
+  filter input → clear the filter. It never quits.
 
-### Added
+#### Fixed
 
-#### GPU (`muxtop-core`, `muxtop-tui`, `muxtop`, `muxtop-server`)
+- **The mouse wheel works.** It moved `scroll_offset` without the selection, so `effective_scroll`
+  snapped the view back on the very next frame and the wheel appeared dead. It also always moved the
+  *process* offset, whatever tab was on screen.
+- **"Clear filter" clears the filter you can see.** The palette command had no `Tab::Kube` arm, so on
+  the Kube tab it cleared the process filter instead. Every filter operation now routes through one
+  implementation.
+- **Message severity is declared, not guessed.** The footer decided whether a message was an error by
+  testing it for the substring `"failed"`, so rewording an error painted it on the success colour.
+- **256-colour terminals get a 256-colour theme.** `ColorSupport::Colors256` was detected and then
+  discarded — `Theme::new` only branched on TrueColor, so Terminal.app and a default
+  `ssh user@host` session both fell through to 16 colours.
+- **`NO_COLOR` is honoured**, and `TERM=dumb` really gets no colour: the "no colour" branch used to
+  emit `Cyan` and `Green` like every other fallback.
+- **`+` / `-` renice exists.** It had been in the README since 0.1 with no handler behind it.
+- **Palette commands take arguments** — `kill firefox`, `stop nginx`, `restart postgres` — as the
+  README has advertised since 0.3 against a command enum that could not carry one.
 
-- New `Tab::Gpu` (keybind `Alt+6`, palette entry "Switch to GPU tab") with two sub-views switched by `D` / `P`:
-  - **Devices** (default) — 11 columns `#` / NAME / VENDOR / UTIL / MEM / MEM% / TEMP / POWER / CLK / FAN / ENC-DEC, with the utilisation and memory columns on the shared gauge ramp and a GPU-specific temperature ramp (green < 80 °C, amber ≥ 80 °C, red ≥ 90 °C — 80 °C is unremarkable for a GPU under load where the same number on a CPU would be alarming).
-  - **Procs** — 5 columns PID / NAME / GPU / TYPE / GPU MEM, one row per (pid, device) pair as `nvidia-smi` reports it.
-- **Sort cycling** via `s` (Devices: Index→Util→Mem→Temp→Power→Name; Procs: Mem→Pid→Name→Device) and `S` / `I` for direction, with the active column marked `↓` / `↑`. Devices default to **index** order rather than utilisation: users refer to GPUs by number, and a list that reorders itself under load breaks that mental map.
-- **Filter** via `/`, matching device name + vendor on Devices and process name **+ PID** on Procs — a user chasing a runaway job usually has the PID from the Processes tab, not the name.
-- **NVIDIA backend (`nvml_engine.rs`)** — utilisation, memory-controller utilisation, VRAM used/total, temperature, power draw and enforced limit, graphics and memory clocks, fan duty cycle, NVENC/NVDEC utilisation, plus compute and graphics processes merged per PID. `libnvidia-ml.so` / `nvml.dll` is resolved **at runtime** via `libloading`, so muxtop builds and runs identically on hosts with no NVIDIA driver — no feature flag and no separate build. NVML calls run in `spawn_blocking` so the synchronous C library never stalls the runtime worker driving the container and cluster loops.
-- **AMD backend (`amd_engine.rs`)** — `/sys/class/drm/card*/device` plus its `hwmon` node: utilisation, VRAM, temperature, power (average with an instantaneous fallback) and cap, clocks (live `hwmon` frequencies preferred over the `pp_dpm_*` state tables), and fan duty from `pwm1`. Zero dependencies and no privileges beyond world-readable sysfs. Cards are filtered by PCI vendor id so an Intel iGPU sitting at `card0` is not claimed, connector directories (`card0-DP-1`) are rejected, and discovery is ordered numerically so `card10` cannot sort ahead of `card2` and shuffle device indices under the user's cursor between ticks.
-- **`CompositeGpuEngine`** merges several vendor backends into one flat snapshot — an AMD iGPU plus an NVIDIA dGPU is the standard gaming-laptop layout and the Containers/Kube one-daemon model does not fit. Device indices are reassigned across the merged list and `GpuProcessSnapshot::device_index` is remapped through the same shift, so a process keeps pointing at its own card. A backend that fails is skipped rather than fatal: a broken NVIDIA driver must not hide a working AMD card.
-- **`--no-gpu`** on both `muxtop` and `muxtop-server` disables detection entirely. Useful on laptops where probing a discrete GPU can pull it out of runtime-D3 and cost battery.
-- GPU process names are resolved in `SystemSnapshot::collect` from the process table the collector already refreshed for the Processes tab, rather than inside each backend — one hash lookup per GPU process instead of a second full process enumeration per tick.
-- `gpu_bench.rs` criterion benchmark covering the composite merge (up to 8 devices × 8 processes) and name resolution — the only muxtop-authored code on the GPU hot path.
+#### Added
 
-### Changed
+- **Help overlay (`?` / `F1`)**, generated from the keymap table, so it cannot drift from the
+  bindings. Leads with the active tab's own keys and annotates what remote mode disables.
+- **Inspector (`Enter` / `i`)** — the second layer the tables truncate: full command line, image,
+  memory against its cgroup limit, pod node and QoS, interface error counters. A side panel on wide
+  terminals, a full overlay on narrow ones.
+- **Actions menu (`x`)** listing exactly the actions available on this tab, with their shortcuts.
+- **Command mode (`:`)** for the argument forms, alongside the fuzzy palette (`Ctrl+P` / `Ctrl+K`).
+  The palette now ranks the active tab's commands first, highlights matched characters, remembers the
+  session's recent commands, and finally exposes the Kube sub-views and namespace toggle.
+- **Typed notifications** with a severity, a toast stack, and a session log (`Ctrl+L`) so an action
+  that failed while you were on another tab is still recoverable.
+- **`Space` pauses the view** so a fast-moving table can be read; `r` resumes.
+- **`y` copies the selected row's identifier** over OSC 52 — works through `ssh` and `tmux`.
+- **Live per-tab counts in the tab bar**, and a header line carrying host, connection, uptime and
+  global CPU/memory meters. The hardcoded `GPU [soon]` placeholder is gone.
+- **A status bar that shows state**: sort column and direction, active filter with its match count,
+  cursor position, paused indicator — then as many contextual hints as fit, instead of a fixed list
+  that silently overflowed an 80-column terminal.
+- **The General tab is a dashboard**: CPU, load against core count, memory, a traffic graph, the top
+  processes, and a cross-tab Workloads card. 0.4 absorbed the remaining height with an empty
+  `Constraint::Min(0)` — on a 50-row terminal, half the tab was blank.
+- **Responsive tables.** Columns declare a priority; the least useful are dropped first and the
+  identity column always survives. Plus scrollbars, position readouts, and empty states that say why
+  a view is empty and what to do about it.
+- **`--theme <name>`** (`tokyo-night`, `tokyo-night-light`, `mono`), **`--no-color`**, **`--ascii`**,
+  **`--no-mouse`**.
+- **Honest terminal detection.** `TERM=linux` (the kernel console, a KVM console, serial-over-LAN)
+  gets the ASCII glyph set, because its bitmap font has no block, braille or rounded-box glyphs and
+  would otherwise paint tofu. A non-UTF-8 locale does the same on Unix. Mouse capture is skipped
+  where there is no pointer. Every mouse gesture has a keyboard equivalent.
+- **`muxtop_core::system::host_name()`**, cached, for the header.
 
-- **The collector runs a fourth loop** (`spawn_gpu_loop`) at **1 Hz** — faster than the container (0.5 Hz) and cluster (0.2 Hz) loops. NVML computes `utilization_rates` over an internal window of about one second, so polling slower aliases the signal and renders a GPU pinned at 100 % as an erratic sawtooth. An NVML device query is sub-millisecond, so matching the driver's cadence is the cheap correct choice rather than a trade-off.
-- `Collector::with_all_engines` is the new full constructor; `with_engines` is retained and delegates to it, so existing callers keep compiling.
-- **The tab bar no longer shows `GPU [soon]`** — the placeholder became a real tab. `FUTURE_TABS` is kept but empty; a regression test now asserts no implemented tab is still marked `[soon]`.
-- The palette's "Clear filter" command now clears the Kube and GPU filters too. It previously fell through to the process filter on those tabs, silently clearing the wrong one.
-- Tab-cycling tests derive from `Tab::ALL` instead of hard-coding pairs, so adding a tab no longer means editing half a dozen tests that only care that the order is a closed cycle.
+#### Tests
 
-### Honest limitations
-
-Every GPU metric is `Option`, and the UI renders an unavailable one as `—`. **`—` means "this driver cannot report this", never "zero"** — an idle GPU shows `0 %` and conflating the two would make the tab lie.
-
-- **AMD reports no per-process usage.** The `amdgpu` sysfs interface has no equivalent of NVML's process queries, so the Procs sub-view states that explicitly instead of showing an empty list that reads as "nothing is using the GPU". The summary bar carries a `per-process: unsupported` badge, mirroring the v0.4 `metrics-server: off` badge.
-- **Encoder/decoder utilisation is NVML-only**; AMD renders `—`.
-- **On Windows, per-process GPU memory is unavailable and every process reports `both`.** Under WDDM the OS owns video-memory allocation so NVML returns the per-process figure as unavailable, and it returns identical compute and graphics process lists — verified against an RTX 3080 on Windows 11 (27 PIDs each, full overlap). Both are the driver's answers and are surfaced as-is. On Linux the figures and the compute/graphics distinction are real.
-
-### Security
-
-- Device names, process names and the engine's `detail` string all pass through `scrub_ctrl` before rendering. Device names come from the driver, process names from whatever a user chose to call their binary, and `detail` crosses the wire from the server in `--remote` mode — all three are foreign strings, and the v0.4.1 lesson was that a render site missed by the sanitizer sweep is a terminal-escape injection point.
-- The GPU tab is **read-only by construction**: it has no actions, and no code path sets a clock, a power limit or a fan curve. The `nvml-wrapper` dependency is target-gated to Linux and Windows, so it is absent from macOS builds entirely.
+TUI coverage roughly doubles (≈462 tests). Every tab and every overlay is rendered at sizes from 1×1
+to 400×100 and under all four colour depths crossed with Unicode and ASCII, with an assertion that
+ASCII mode emits no multi-byte character anywhere. Each fixed bug above has a regression test that
+names it.
 
 ## [0.4.2] - 2026-08-05
 
