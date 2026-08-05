@@ -1992,6 +1992,8 @@ impl AppState {
                 self.filter_text_mut().pop();
                 self.after_filter_change(false);
             }
+            // A control chord is a command we do not have here, not text.
+            KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => {}
             KeyCode::Char(c) if self.filter_text().len() < Self::MAX_FILTER_LEN => {
                 self.filter_text_mut().push(c);
                 self.after_filter_change(false);
@@ -2356,9 +2358,13 @@ impl AppState {
     fn handle_palette_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => self.close_overlay(),
-            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Both palette keys toggle it shut again.
+            KeyCode::Char('p' | 'k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.close_overlay()
             }
+            // Any other control chord is a command we do not have, not text:
+            // inserting its letter into the query would be surprising.
+            KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => {}
             KeyCode::Enter => {
                 if let Some(&(cmd, _)) = self.palette.filtered.get(self.palette.selected) {
                     let arg = self.palette.arg.clone();
