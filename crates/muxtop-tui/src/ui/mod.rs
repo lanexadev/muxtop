@@ -1,269 +1,150 @@
 // Layout & rendering for the TUI.
 
+mod actions_menu;
+pub mod chrome;
 mod confirm;
 mod containers;
+mod filter_bar;
 mod general;
+pub mod glyphs;
 mod gpu;
+mod help;
+mod inspector;
 mod kube;
+mod log_view;
 mod network;
 mod palette;
 mod processes;
 pub mod sanitize;
 pub mod theme;
+pub mod widgets;
 
-use ratatui::{
-    Frame,
-    layout::{Constraint, Layout, Rect},
-    style::{Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Tabs},
-};
+use ratatui::Frame;
 
-use crate::ConnectionMode;
-use crate::app::{AppState, Tab};
+use crate::app::{AppState, Overlay, Tab};
+use crate::terminal::Breakpoint;
+use glyphs::Glyphs;
 use theme::Theme;
 
-/// Labels for future tabs (not yet implemented).
+/// Everything a view needs to draw itself.
 ///
-/// Empty since v0.5 promoted GPU from placeholder to a real tab. Kept rather
-/// than deleted: the mechanism is how the tab bar advertises what is coming,
-/// and v0.6 will refill it.
-const FUTURE_TABS: &[&str] = &[];
+/// Bundling these means a view can never accidentally resolve its own theme or
+/// hardcode a glyph, which is how 0.4 ended up with two different sort arrows
+/// and a Unicode flag that `general.rs` accepted and then ignored.
+pub struct Render<'a> {
+    pub app: &'a AppState,
+    pub theme: &'a Theme,
+    pub glyphs: &'a Glyphs,
+    /// Layout class of the frame being drawn.
+    ///
+    /// Derived from the frame, not from `TermCaps`: a resize event and the
+    /// frame that follows it are two different moments, and the layout must
+    /// follow the surface it is actually painting on.
+    pub breakpoint: Breakpoint,
+}
 
-/// Render the full application layout: Header, TabBar, Content, Footer.
+impl Render<'_> {
+    /// Text that ends in an ellipsis, in whichever glyph set is active.
+    pub fn ellipsis(&self, text: &str) -> String {
+        format!("{text}{}", self.glyphs.ellipsis)
+    }
+
+    /// `Process — nginx`, with a dash the terminal can actually render.
+    pub fn titled(&self, kind: &str, name: &str) -> String {
+        format!("{kind} {} {name}", self.glyphs.dash)
+    }
+}
+
+/// Render the full application: chrome, content, overlays.
 pub fn draw_root(frame: &mut Frame, app: &AppState) {
-    let theme = Theme::new(app.term_caps.color_support);
+    let theme = Theme::with_kind(app.theme_kind, app.term_caps.color_support);
+    let glyphs = Glyphs::new(app.term_caps.unicode);
+    let area = frame.area();
+    let r = Render {
+        app,
+        theme: &theme,
+        glyphs: &glyphs,
+        breakpoint: Breakpoint::from_width(area.width),
+    };
+    let (header_area, tabbar_area, content_area, status_area) = chrome::split(area);
 
-    let [header_area, tabbar_area, content_area, footer_area] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(2),
-        Constraint::Fill(1),
-        Constraint::Length(1),
-    ])
-    .areas(frame.area());
+    match tabbar_area {
+        Some(tabs) => {
+            chrome::draw_header(frame, header_area, &r);
+            chrome::draw_tabbar(frame, tabs, &r);
+        }
+        // Too narrow for two rows of chrome: merge them.
+        None => chrome::draw_compact_chrome(frame, header_area, &r),
+    }
 
-    draw_header(frame, header_area, app, &theme);
-    draw_tabbar(frame, tabbar_area, app, &theme);
-    draw_content(frame, content_area, app, &theme);
-    draw_footer(frame, footer_area, app, &theme);
+    draw_content(frame, content_area, &r);
+    chrome::draw_statusbar(frame, status_area, &r);
 
-    // Confirm dialog overlay.
+    // Overlays. The confirm dialog outranks everything else: it is the only
+    // one guarding a destructive action.
+    match app.overlay {
+        Overlay::None => {}
+        Overlay::Palette | Overlay::Command => palette::draw_palette(frame, &r),
+        Overlay::Help => help::draw_help(frame, &r),
+        Overlay::Log => log_view::draw_log(frame, &r),
+        Overlay::Actions => actions_menu::draw_actions(frame, &r),
+        Overlay::Inspector => inspector::draw_inspector(frame, content_area, &r),
+    }
+
     if app.confirm.is_some() {
-        confirm::draw_confirm(frame, app, &theme);
+        confirm::draw_confirm(frame, &r);
     }
-
-    // Command palette overlay (renders on top of everything).
-    if app.show_palette {
-        palette::draw_palette(frame, app, &theme);
-    }
-}
-
-/// Render the header line: app name, version, and optional remote indicator.
-fn draw_header(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
-    let version = env!("CARGO_PKG_VERSION");
-    let mut spans = vec![
-        Span::styled(
-            " muxtop ",
-            Style::default()
-                .bg(theme.accent_primary)
-                .fg(theme.bg)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" v{version} "),
-            Style::default().bg(theme.header_bg).fg(theme.fg),
-        ),
-    ];
-
-    if let ConnectionMode::Remote {
-        ref hostname,
-        ref addr,
-    } = app.connection_mode
-    {
-        spans.push(Span::styled(
-            format!(" → remote:{hostname}:{} ", addr.port()),
-            Style::default()
-                .bg(theme.header_bg)
-                .fg(theme.accent_secondary),
-        ));
-    }
-
-    let header = Paragraph::new(Line::from(spans));
-    frame.render_widget(header, area);
-}
-
-/// Render the tab bar with active highlight and future tabs.
-fn draw_tabbar(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
-    let active_idx = Tab::ALL.iter().position(|&t| t == app.tab).unwrap_or(0);
-
-    let mut titles: Vec<Line<'_>> = Tab::ALL.iter().map(|t| Line::from(t.label())).collect();
-
-    for &future in FUTURE_TABS {
-        titles.push(Line::styled(future, Style::default().fg(theme.text_dim)));
-    }
-
-    let tabs = Tabs::new(titles)
-        .select(active_idx)
-        .highlight_style(
-            Style::default()
-                .fg(theme.accent_primary)
-                .add_modifier(Modifier::BOLD),
-        )
-        .style(Style::default().fg(theme.text_dim))
-        .divider(" | ")
-        .block(
-            Block::default()
-                .borders(Borders::BOTTOM)
-                .border_type(ratatui::widgets::BorderType::Rounded),
-        );
-
-    frame.render_widget(tabs, area);
 }
 
 /// Render the content area based on the active tab.
-fn draw_content(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
-    match app.tab {
-        Tab::General => general::draw_general_tab(frame, area, app, theme),
-        Tab::Processes => processes::draw_processes_tab(frame, area, app, theme),
-        Tab::Network => network::draw_network_tab(frame, area, app, theme),
-        Tab::Containers => containers::draw_containers_tab(frame, area, app, theme),
-        Tab::Kube => kube::draw_kube_tab(frame, area, app, theme),
-        Tab::Gpu => gpu::draw_gpu_tab(frame, area, app, theme),
-    }
-}
-
-/// Render the footer with context-aware shortcut hints or a status message.
-fn draw_footer(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
-    // Status message takes priority over shortcuts.
-    if let Some(status) = app.active_status() {
-        let style = if status.contains("failed") || status.contains("denied") {
-            Style::default().fg(theme.bg).bg(theme.danger)
-        } else {
-            Style::default().fg(theme.bg).bg(theme.success)
-        };
-        let footer = Paragraph::new(Line::from(Span::styled(format!(" {status} "), style)));
-        frame.render_widget(footer, area);
+fn draw_content(frame: &mut Frame, area: ratatui::layout::Rect, r: &Render<'_>) {
+    if area.height == 0 || area.width == 0 {
         return;
     }
-
-    let shortcuts = match app.tab {
-        Tab::General => vec![
-            key_hint("q", "Quit", theme),
-            Span::raw(" "),
-            key_hint("Tab", "Switch", theme),
-            Span::raw(" "),
-            key_hint("/", "Filter", theme),
-            Span::raw(" "),
-            key_hint("t", "Tree", theme),
-            Span::raw(" "),
-            key_hint("^P", "Palette", theme),
-        ],
-        Tab::Processes => {
-            let mut hints = vec![
-                key_hint("q", "Quit", theme),
-                Span::raw(" "),
-                key_hint("/", "Filter", theme),
-                Span::raw(" "),
-                key_hint("s", "Sort", theme),
-                Span::raw(" "),
-                key_hint("t", "Tree", theme),
-            ];
-            // Hide kill/renice hints in remote mode.
-            if !app.is_remote() {
-                hints.push(Span::raw(" "));
-                hints.push(key_hint("F9", "Kill", theme));
-                hints.push(Span::raw(" "));
-                hints.push(key_hint("F7/F8", "Nice", theme));
-            }
-            hints.push(Span::raw(" "));
-            hints.push(key_hint("^P", "Palette", theme));
-            hints
-        }
-        Tab::Network => vec![
-            key_hint("q", "Quit", theme),
-            Span::raw(" "),
-            key_hint("j/k", "Select", theme),
-            Span::raw(" "),
-            key_hint("/", "Filter", theme),
-            Span::raw(" "),
-            key_hint("s", "Sort", theme),
-            Span::raw(" "),
-            key_hint("^P", "Palette", theme),
-        ],
-        Tab::Containers => {
-            let mut hints = vec![
-                key_hint("q", "Quit", theme),
-                Span::raw(" "),
-                key_hint("j/k", "Select", theme),
-                Span::raw(" "),
-                key_hint("/", "Filter", theme),
-                Span::raw(" "),
-                key_hint("s", "Sort", theme),
-            ];
-            if !app.is_remote() {
-                hints.push(Span::raw(" "));
-                hints.push(key_hint("F9", "Stop", theme));
-                hints.push(Span::raw(" "));
-                hints.push(key_hint("F10", "Kill", theme));
-                hints.push(Span::raw(" "));
-                hints.push(key_hint("F11", "Restart", theme));
-            }
-            hints.push(Span::raw(" "));
-            hints.push(key_hint("^P", "Palette", theme));
-            hints
-        }
-        Tab::Kube => vec![
-            key_hint("q", "Quit", theme),
-            Span::raw(" "),
-            key_hint("P/N/D", "View", theme),
-            Span::raw(" "),
-            key_hint("j/k", "Select", theme),
-            Span::raw(" "),
-            key_hint("/", "Filter", theme),
-            Span::raw(" "),
-            key_hint("s", "Sort", theme),
-            Span::raw(" "),
-            key_hint("^P", "Palette", theme),
-        ],
-        Tab::Gpu => vec![
-            key_hint("q", "Quit", theme),
-            Span::raw(" "),
-            key_hint("D/P", "View", theme),
-            Span::raw(" "),
-            key_hint("j/k", "Select", theme),
-            Span::raw(" "),
-            key_hint("/", "Filter", theme),
-            Span::raw(" "),
-            key_hint("s", "Sort", theme),
-            Span::raw(" "),
-            key_hint("^P", "Palette", theme),
-        ],
-    };
-    let footer = Paragraph::new(Line::from(shortcuts)).style(Style::default().bg(theme.header_bg));
-    frame.render_widget(footer, area);
-}
-
-/// Create a styled key hint: bold key + dim description.
-fn key_hint<'a>(key: &'a str, desc: &'a str, theme: &Theme) -> Span<'a> {
-    Span::styled(
-        format!(" {key} {desc} "),
-        Style::default().fg(theme.fg).bg(theme.selection_bg),
-    )
+    match r.app.tab {
+        Tab::General => general::draw_general_tab(frame, area, r),
+        Tab::Processes => processes::draw_processes_tab(frame, area, r),
+        Tab::Network => network::draw_network_tab(frame, area, r),
+        Tab::Containers => containers::draw_containers_tab(frame, area, r),
+        Tab::Kube => kube::draw_kube_tab(frame, area, r),
+        Tab::Gpu => gpu::draw_gpu_tab(frame, area, r),
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_support {
+    use crate::app::AppState;
+    use crate::terminal::{ColorSupport, TermCaps};
     use ratatui::{Terminal, backend::TestBackend};
 
-    fn render_with(app: &AppState, width: u16, height: u16) -> ratatui::buffer::Buffer {
+    /// Render an app state at a given size and return the buffer.
+    pub fn render_with(app: &AppState, width: u16, height: u16) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_root(frame, app)).unwrap();
+        terminal.draw(|frame| super::draw_root(frame, app)).unwrap();
         terminal.backend().buffer().clone()
     }
 
-    fn buffer_line_text(buf: &ratatui::buffer::Buffer, row: u16) -> String {
+    /// Render under an explicit capability profile — the whole point of the
+    /// degradation work is that all of them keep working.
+    pub fn render_caps(
+        app: &mut AppState,
+        width: u16,
+        height: u16,
+        color: ColorSupport,
+        unicode: bool,
+    ) -> ratatui::buffer::Buffer {
+        app.term_caps = TermCaps {
+            color_support: color,
+            unicode,
+            mouse: false,
+            width,
+            height,
+        };
+        render_with(app, width, height)
+    }
+
+    pub fn line_text(buf: &ratatui::buffer::Buffer, row: u16) -> String {
         let width = buf.area.width;
         (0..width)
             .map(|col| buf.cell((col, row)).map(|c| c.symbol()).unwrap_or(" "))
@@ -272,342 +153,64 @@ mod tests {
             .to_string()
     }
 
-    fn buffer_contains(buf: &ratatui::buffer::Buffer, needle: &str) -> bool {
-        let height = buf.area.height;
-        (0..height).any(|row| buffer_line_text(buf, row).contains(needle))
+    pub fn contains(buf: &ratatui::buffer::Buffer, needle: &str) -> bool {
+        (0..buf.area.height).any(|row| line_text(buf, row).contains(needle))
     }
 
-    // -- STORY-02: Layout zones --
-
-    #[test]
-    fn test_draw_root_is_callable() {
-        let app = AppState::new();
-        let _buf = render_with(&app, 80, 24);
+    pub fn all_text(buf: &ratatui::buffer::Buffer) -> String {
+        (0..buf.area.height)
+            .map(|row| line_text(buf, row))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
-    #[test]
-    fn test_layout_zones_correct_heights() {
-        let app = AppState::new();
-        let buf = render_with(&app, 80, 24);
-        // Header = row 0, TabBar = rows 1-2, Content = rows 3-22, Footer = row 23
-        // Verify header row is non-empty
-        let header_text = buffer_line_text(&buf, 0);
-        assert!(!header_text.is_empty(), "Header should not be empty");
-        // Verify footer row is non-empty
-        let footer_text = buffer_line_text(&buf, 23);
-        assert!(!footer_text.is_empty(), "Footer should not be empty");
-    }
-
-    #[test]
-    fn test_layout_resize_reflows() {
-        let app = AppState::new();
-        // Small terminal
-        let buf_small = render_with(&app, 80, 24);
-        assert_eq!(buf_small.area.height, 24);
-        // Large terminal
-        let buf_large = render_with(&app, 120, 40);
-        assert_eq!(buf_large.area.height, 40);
-        // Header and footer should still be in first/last rows
-        let header_small = buffer_line_text(&buf_small, 0);
-        let header_large = buffer_line_text(&buf_large, 0);
-        assert!(header_small.contains("muxtop"));
-        assert!(header_large.contains("muxtop"));
-    }
-
-    #[test]
-    fn test_layout_minimal_terminal_no_panic() {
-        let app = AppState::new();
-        // Only 4 rows — content area would be 0 rows
-        let _buf = render_with(&app, 80, 4);
-        // Just verify no panic
-    }
-
-    // Guard G-08: extreme terminal sizes
-    #[test]
-    fn test_layout_extreme_sizes_no_panic() {
-        let app = AppState::new();
-        let _buf = render_with(&app, 1, 1);
-        let _buf = render_with(&app, 80, 2);
-        let _buf = render_with(&app, 10, 5);
-    }
-
-    // -- STORY-03: Header --
-
-    #[test]
-    fn test_header_renders_name_and_version() {
-        let app = AppState::new();
-        let buf = render_with(&app, 80, 24);
-        let header = buffer_line_text(&buf, 0);
-        assert!(header.contains("muxtop"), "Header should contain 'muxtop'");
-        assert!(
-            header.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
-            "Header should contain version"
-        );
-    }
-
-    // -- STORY-04: TabBar --
-
-    #[test]
-    fn test_tabbar_renders_tab_names() {
-        let app = AppState::new();
-        let buf = render_with(&app, 80, 24);
-        // Tab names should appear in rows 1-2 (tabbar area)
-        let tabbar_text = format!(
-            "{} {}",
-            buffer_line_text(&buf, 1),
-            buffer_line_text(&buf, 2)
-        );
-        assert!(
-            tabbar_text.contains("General"),
-            "TabBar should show General"
-        );
-        assert!(
-            tabbar_text.contains("Processes"),
-            "TabBar should show Processes"
-        );
-    }
-
-    #[test]
-    fn test_tabbar_active_tab_has_teal_style() {
-        let app = AppState::new(); // default: General
-        let buf = render_with(&app, 80, 24);
-        // Find "General" in the tabbar row and check its style
-        let row = 1; // first row of tabbar (tab titles rendered here)
-        let line = buffer_line_text(&buf, row);
-        if let Some(start) = line.find('G') {
-            let cell = buf.cell((start as u16, row)).unwrap();
-            // The FG color should match accent_primary
-            let theme = theme::Theme::new(crate::terminal::ColorSupport::TrueColor);
-            assert_eq!(
-                cell.fg, theme.accent_primary,
-                "Active tab 'General' should have accent foreground"
-            );
-        }
-    }
-
-    #[test]
-    fn test_tabbar_inactive_tab_no_teal() {
-        let app = AppState::new(); // default: General active
-        let buf = render_with(&app, 80, 24);
-        let row = 1;
-        let line = buffer_line_text(&buf, row);
-        // Find "Processes" — it should NOT be accent_primary
-        if let Some(start) = line.find('P') {
-            let cell = buf.cell((start as u16, row)).unwrap();
-            let theme = theme::Theme::new(crate::terminal::ColorSupport::TrueColor);
-            assert_ne!(
-                cell.fg, theme.accent_primary,
-                "Inactive tab 'Processes' should NOT have accent foreground"
-            );
-        }
-    }
-
-    /// Every real tab is advertised in the bar, and nothing is left marked
-    /// `[soon]`. v0.5 emptied `FUTURE_TABS` by shipping the GPU tab; a stale
-    /// placeholder alongside the real tab would be worse than none.
-    #[test]
-    fn test_tabbar_lists_every_real_tab_and_no_stale_placeholder() {
-        let app = AppState::new();
-        let buf = render_with(&app, 140, 24); // wide enough to fit all tabs
-        for tab in Tab::ALL {
-            assert!(
-                buffer_contains(&buf, tab.label()),
-                "TabBar should show the {} tab",
-                tab.label()
-            );
-        }
-        assert!(
-            !buffer_contains(&buf, "[soon]"),
-            "no tab should still be marked [soon] while it is implemented"
-        );
-    }
-
-    #[test]
-    fn test_gpu_tab_renders_and_shows_hints() {
-        let mut app = AppState::new();
-        app.tab = Tab::Gpu;
-        let buf = render_with(&app, 100, 24);
-        assert!(
-            buffer_contains(&buf, "Waiting for GPU data"),
-            "GPU tab should show the waiting message before the first snapshot"
-        );
-        let footer = buffer_line_text(&buf, 23);
-        assert!(footer.contains("Quit"), "GPU footer should contain Quit");
-        assert!(footer.contains("Sort"), "GPU footer should contain Sort");
-        assert!(footer.contains("View"), "GPU footer should contain View");
-    }
-
-    #[test]
-    fn test_gpu_tab_renders_at_extreme_sizes() {
-        let mut app = AppState::new();
-        app.tab = Tab::Gpu;
-        let _buf = render_with(&app, 1, 1);
-        let _buf = render_with(&app, 80, 2);
-        let _buf = render_with(&app, 10, 5);
-    }
-
-    // -- STORY-05: Content stubs --
-
-    #[test]
-    fn test_content_dispatches_by_tab() {
+    /// A snapshot with enough in it that every tab has something to draw.
+    pub fn snapshot() -> muxtop_core::system::SystemSnapshot {
+        use muxtop_core::network::{NetworkInterfaceSnapshot, NetworkSnapshot};
         use muxtop_core::process::ProcessInfo;
         use muxtop_core::system::*;
 
-        // Provide a snapshot so tabs render distinct content (not both "Waiting for data...")
-        let snap = SystemSnapshot {
+        let cores = (0..4)
+            .map(|i| CoreSnapshot {
+                name: format!("cpu{i}"),
+                usage: 10.0 * (i as f32 + 1.0),
+                frequency: 3600,
+            })
+            .collect();
+
+        let processes = (0..40)
+            .map(|i| ProcessInfo {
+                pid: 1000 + i,
+                parent_pid: (i > 0).then_some(1000),
+                name: format!("proc{i}"),
+                command: format!("/usr/bin/proc{i} --serve"),
+                user: "lucas".to_string(),
+                cpu_percent: 40.0 - i as f32,
+                memory_bytes: 1_000_000 * u64::from(i + 1),
+                memory_percent: 0.5 * (i as f32 + 1.0),
+                status: if i % 3 == 0 { "Running" } else { "Sleeping" }.to_string(),
+            })
+            .collect();
+
+        SystemSnapshot {
             cpu: CpuSnapshot {
-                global_usage: 25.0,
-                cores: vec![CoreSnapshot {
-                    name: "cpu0".to_string(),
-                    usage: 25.0,
-                    frequency: 3600,
-                }],
+                global_usage: 42.5,
+                cores,
             },
             memory: MemorySnapshot {
                 total: 16_000_000_000,
                 used: 8_000_000_000,
                 available: 8_000_000_000,
-                swap_total: 0,
-                swap_used: 0,
+                swap_total: 4_000_000_000,
+                swap_used: 1_000_000_000,
             },
             load: LoadSnapshot {
-                one: 1.0,
-                five: 0.8,
-                fifteen: 0.5,
-                uptime_secs: 3600,
+                one: 2.31,
+                five: 1.87,
+                fifteen: 1.42,
+                uptime_secs: 90_061,
             },
-            processes: vec![ProcessInfo {
-                pid: 1,
-                parent_pid: None,
-                name: "proc".to_string(),
-                command: "/usr/bin/proc".to_string(),
-                user: "user".to_string(),
-                cpu_percent: 10.0,
-                memory_bytes: 1000,
-                memory_percent: 1.0,
-                status: "Running".to_string(),
-            }],
-            networks: muxtop_core::network::NetworkSnapshot {
-                interfaces: vec![],
-                total_rx: 0,
-                total_tx: 0,
-            },
-            containers: None,
-            kube: None,
-            gpu: None,
-            timestamp_ms: 0,
-        };
-
-        let mut app = AppState::new();
-        app.apply_snapshot(snap);
-
-        app.tab = Tab::General;
-        let buf_general = render_with(&app, 80, 24);
-
-        app.tab = Tab::Processes;
-        let buf_processes = render_with(&app, 80, 24);
-
-        // Content area rows 3..22 should differ
-        let general_content = buffer_line_text(&buf_general, 3);
-        let processes_content = buffer_line_text(&buf_processes, 3);
-        assert_ne!(
-            general_content, processes_content,
-            "Content should differ between tabs"
-        );
-    }
-
-    // -- STORY-06: Footer --
-
-    #[test]
-    fn test_footer_renders_general_shortcuts() {
-        let mut app = AppState::new();
-        app.tab = Tab::General;
-        let buf = render_with(&app, 80, 24);
-        let footer = buffer_line_text(&buf, 23);
-        assert!(
-            footer.contains("Quit"),
-            "General footer should contain Quit hint"
-        );
-    }
-
-    #[test]
-    fn test_footer_renders_processes_shortcuts() {
-        let mut app = AppState::new();
-        app.tab = Tab::Processes;
-        let buf = render_with(&app, 80, 24);
-        let footer = buffer_line_text(&buf, 23);
-        assert!(
-            footer.contains("Sort"),
-            "Processes footer should contain Sort hint"
-        );
-        assert!(
-            footer.contains("Tree"),
-            "Processes footer should contain Tree hint"
-        );
-    }
-
-    // -- Network tab tests (Epic 12) --
-
-    #[test]
-    fn test_tabbar_shows_network() {
-        let app = AppState::new();
-        let buf = render_with(&app, 120, 24);
-        let tabbar_text = format!(
-            "{} {}",
-            buffer_line_text(&buf, 1),
-            buffer_line_text(&buf, 2)
-        );
-        assert!(
-            tabbar_text.contains("Network"),
-            "TabBar should show Network"
-        );
-    }
-
-    #[test]
-    fn test_network_tab_waiting_for_data() {
-        let mut app = AppState::new();
-        app.tab = Tab::Network;
-        let buf = render_with(&app, 80, 24);
-        assert!(
-            buffer_contains(&buf, "Waiting for data"),
-            "Network tab should show waiting message when no snapshot"
-        );
-    }
-
-    #[test]
-    fn test_network_tab_renders_no_panic() {
-        let mut app = AppState::new();
-        app.tab = Tab::Network;
-        // No snapshot — should not panic
-        let _buf = render_with(&app, 80, 24);
-        let _buf = render_with(&app, 1, 1);
-        let _buf = render_with(&app, 10, 5);
-    }
-
-    #[test]
-    fn test_network_tab_with_interfaces() {
-        use muxtop_core::network::{NetworkInterfaceSnapshot, NetworkSnapshot};
-        use muxtop_core::system::*;
-
-        let snap = SystemSnapshot {
-            cpu: CpuSnapshot {
-                global_usage: 25.0,
-                cores: vec![],
-            },
-            memory: MemorySnapshot {
-                total: 16_000_000_000,
-                used: 8_000_000_000,
-                available: 8_000_000_000,
-                swap_total: 0,
-                swap_used: 0,
-            },
-            load: LoadSnapshot {
-                one: 1.0,
-                five: 0.8,
-                fifteen: 0.5,
-                uptime_secs: 3600,
-            },
-            processes: vec![],
+            processes,
             networks: NetworkSnapshot {
                 interfaces: vec![
                     NetworkInterfaceSnapshot {
@@ -639,156 +242,286 @@ mod tests {
             containers: None,
             kube: None,
             gpu: None,
-            timestamp_ms: 0,
-        };
-
-        let mut app = AppState::new();
-        app.tab = Tab::Network;
-        app.apply_snapshot(snap);
-        let buf = render_with(&app, 100, 24);
-        assert!(
-            buffer_contains(&buf, "eth0"),
-            "Network tab should show eth0 interface"
-        );
-        assert!(
-            buffer_contains(&buf, "lo"),
-            "Network tab should show lo interface"
-        );
+            timestamp_ms: 1_700_000_000_000,
+        }
     }
 
-    #[test]
-    fn test_network_footer_shows_hints() {
+    /// An app with data loaded, ready to render.
+    pub fn app_with_data() -> AppState {
         let mut app = AppState::new();
-        app.tab = Tab::Network;
+        app.apply_snapshot(snapshot());
+        app
+    }
+
+    pub fn all_profiles() -> Vec<(ColorSupport, bool)> {
+        vec![
+            (ColorSupport::TrueColor, true),
+            (ColorSupport::Colors256, true),
+            (ColorSupport::Basic, false),
+            (ColorSupport::NoColor, false),
+        ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::*;
+    use super::*;
+    use crate::terminal::ColorSupport;
+
+    // -- Layout --
+
+    #[test]
+    fn root_renders_at_the_classic_terminal_size() {
+        let app = app_with_data();
         let buf = render_with(&app, 80, 24);
-        let footer = buffer_line_text(&buf, 23);
+        assert!(!line_text(&buf, 0).is_empty(), "header must not be empty");
         assert!(
-            footer.contains("Quit"),
-            "Network footer should contain Quit"
-        );
-        assert!(
-            footer.contains("Sort"),
-            "Network footer should contain Sort"
-        );
-        assert!(
-            footer.contains("Filter"),
-            "Network footer should contain Filter"
+            !line_text(&buf, 23).is_empty(),
+            "status bar must not be empty"
         );
     }
 
     #[test]
-    fn test_network_tab_summary_bar() {
-        use muxtop_core::network::{NetworkInterfaceSnapshot, NetworkSnapshot};
-        use muxtop_core::system::*;
+    fn root_never_panics_at_any_size() {
+        let app = app_with_data();
+        for (w, h) in [
+            (1, 1),
+            (2, 2),
+            (10, 5),
+            (40, 6),
+            (60, 20),
+            (80, 2),
+            (80, 24),
+            (200, 60),
+            (400, 100),
+        ] {
+            let _ = render_with(&app, w, h);
+        }
+    }
 
-        let snap = SystemSnapshot {
-            cpu: CpuSnapshot {
-                global_usage: 0.0,
-                cores: vec![],
-            },
-            memory: MemorySnapshot {
-                total: 0,
-                used: 0,
-                available: 0,
-                swap_total: 0,
-                swap_used: 0,
-            },
-            load: LoadSnapshot {
-                one: 0.0,
-                five: 0.0,
-                fifteen: 0.0,
-                uptime_secs: 0,
-            },
-            processes: vec![],
-            networks: NetworkSnapshot {
-                interfaces: vec![NetworkInterfaceSnapshot {
-                    name: "eth0".to_string(),
-                    bytes_rx: 1000,
-                    bytes_tx: 500,
-                    packets_rx: 10,
-                    packets_tx: 5,
-                    errors_rx: 0,
-                    errors_tx: 0,
-                    mac_address: "00:00:00:00:00:00".to_string(),
-                    is_up: true,
-                }],
-                total_rx: 1000,
-                total_tx: 500,
-            },
-            containers: None,
-            kube: None,
-            gpu: None,
-            timestamp_ms: 0,
-        };
-
+    #[test]
+    fn root_never_panics_on_any_tab_without_data() {
+        // The first frames arrive before any snapshot does.
         let mut app = AppState::new();
-        app.tab = Tab::Network;
-        app.apply_snapshot(snap);
+        for &tab in Tab::ALL {
+            app.tab = tab;
+            for (w, h) in [(1, 1), (40, 10), (80, 24), (200, 50)] {
+                let _ = render_with(&app, w, h);
+            }
+        }
+    }
+
+    #[test]
+    fn root_renders_under_every_capability_profile() {
+        // Degradation is the feature: a Linux console over serial and a kitty
+        // window must both produce a usable frame.
+        for &tab in Tab::ALL {
+            for (color, unicode) in all_profiles() {
+                let mut app = app_with_data();
+                app.tab = tab;
+                let _ = render_caps(&mut app, 80, 24, color, unicode);
+            }
+        }
+    }
+
+    #[test]
+    fn ascii_profile_emits_no_multibyte_characters() {
+        // A terminal we decided is ASCII-only must never receive UTF-8, or it
+        // paints tofu where the table should be.
+        for &tab in Tab::ALL {
+            let mut app = app_with_data();
+            app.tab = tab;
+            let buf = render_caps(&mut app, 100, 30, ColorSupport::Basic, false);
+            let text = all_text(&buf);
+            assert!(
+                text.is_ascii(),
+                "non-ASCII output on {tab:?} in ASCII mode:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn ascii_profile_stays_ascii_in_every_overlay() {
+        for overlay in [
+            Overlay::Palette,
+            Overlay::Help,
+            Overlay::Log,
+            Overlay::Actions,
+            Overlay::Inspector,
+        ] {
+            let mut app = app_with_data();
+            app.tab = Tab::Processes;
+            app.overlay = overlay;
+            let buf = render_caps(&mut app, 100, 30, ColorSupport::Basic, false);
+            let text = all_text(&buf);
+            assert!(text.is_ascii(), "non-ASCII in {overlay:?}:\n{text}");
+        }
+    }
+
+    // -- Header --
+
+    #[test]
+    fn header_shows_identity_and_version() {
+        let app = app_with_data();
         let buf = render_with(&app, 100, 24);
+        let header = line_text(&buf, 0);
+        assert!(header.contains("muxtop"));
+        assert!(header.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
+    }
+
+    #[test]
+    fn header_shows_the_paused_state() {
+        let mut app = app_with_data();
+        assert!(!contains(&render_with(&app, 100, 24), "PAUSED"));
+        app.paused = true;
         assert!(
-            buffer_contains(&buf, "Total"),
-            "Network tab should show summary bar with Total"
-        );
-        assert!(
-            buffer_contains(&buf, "Interfaces"),
-            "Network tab should show interface count"
+            contains(&render_with(&app, 100, 24), "PAUSED"),
+            "a frozen view must say so"
         );
     }
 
     #[test]
-    fn test_network_tab_shows_header_columns() {
-        use muxtop_core::network::{NetworkInterfaceSnapshot, NetworkSnapshot};
-        use muxtop_core::system::*;
-
-        let snap = SystemSnapshot {
-            cpu: CpuSnapshot {
-                global_usage: 0.0,
-                cores: vec![],
-            },
-            memory: MemorySnapshot {
-                total: 0,
-                used: 0,
-                available: 0,
-                swap_total: 0,
-                swap_used: 0,
-            },
-            load: LoadSnapshot {
-                one: 0.0,
-                five: 0.0,
-                fifteen: 0.0,
-                uptime_secs: 0,
-            },
-            processes: vec![],
-            networks: NetworkSnapshot {
-                interfaces: vec![NetworkInterfaceSnapshot {
-                    name: "eth0".to_string(),
-                    bytes_rx: 0,
-                    bytes_tx: 0,
-                    packets_rx: 0,
-                    packets_tx: 0,
-                    errors_rx: 0,
-                    errors_tx: 0,
-                    mac_address: "00:00:00:00:00:00".to_string(),
-                    is_up: true,
-                }],
-                total_rx: 0,
-                total_tx: 0,
-            },
-            containers: None,
-            kube: None,
-            gpu: None,
-            timestamp_ms: 0,
+    fn header_marks_a_remote_connection() {
+        let mut app = app_with_data();
+        app.connection_mode = crate::ConnectionMode::Remote {
+            hostname: "prod-01".to_string(),
+            addr: "10.0.0.1:4242".parse().unwrap(),
         };
-
-        let mut app = AppState::new();
-        app.tab = Tab::Network;
-        app.apply_snapshot(snap);
-        let buf = render_with(&app, 100, 24);
+        let buf = render_with(&app, 120, 24);
+        assert!(contains(&buf, "prod-01"));
         assert!(
-            buffer_contains(&buf, "INTERFACE"),
-            "Should show INTERFACE header"
+            contains(&buf, "read-only"),
+            "remote mode must announce that actions are unavailable"
         );
-        assert!(buffer_contains(&buf, "RX/s"), "Should show RX/s header");
-        assert!(buffer_contains(&buf, "TX/s"), "Should show TX/s header");
+    }
+
+    // -- Tab bar --
+
+    #[test]
+    fn tabbar_lists_every_tab() {
+        let app = app_with_data();
+        let buf = render_with(&app, 120, 24);
+        let row = line_text(&buf, 1);
+        for &tab in Tab::ALL {
+            assert!(row.contains(tab.label()), "missing tab {tab:?} in `{row}`");
+        }
+    }
+
+    #[test]
+    fn tabbar_shows_live_counts() {
+        let app = app_with_data();
+        let buf = render_with(&app, 120, 24);
+        let row = line_text(&buf, 1);
+        // 40 processes and 2 interfaces are in the fixture.
+        assert!(row.contains("40"), "process count missing from `{row}`");
+    }
+
+    #[test]
+    fn tabbar_has_no_placeholder_tabs() {
+        // 0.4 advertised a hardcoded `GPU [soon]` entry that did nothing.
+        let app = app_with_data();
+        let buf = render_with(&app, 120, 24);
+        assert!(!contains(&buf, "[soon]"));
+    }
+
+    // -- Status bar --
+
+    #[test]
+    fn statusbar_shows_sort_state() {
+        let mut app = app_with_data();
+        app.tab = Tab::Processes;
+        let buf = render_with(&app, 120, 24);
+        let status = line_text(&buf, 23);
+        assert!(
+            status.contains("sort cpu"),
+            "the active sort must be visible: `{status}`"
+        );
+    }
+
+    #[test]
+    fn statusbar_shows_filter_and_match_count() {
+        let mut app = app_with_data();
+        app.tab = Tab::Processes;
+        app.set_filter("proc1");
+        let buf = render_with(&app, 120, 24);
+        let status = line_text(&buf, 23);
+        assert!(
+            status.contains("filter \"proc1\""),
+            "an active filter must be visible: `{status}`"
+        );
+    }
+
+    #[test]
+    fn statusbar_shows_position() {
+        let mut app = app_with_data();
+        app.tab = Tab::Processes;
+        app.selected = 6;
+        let buf = render_with(&app, 120, 24);
+        assert!(
+            line_text(&buf, 23).contains("7/40"),
+            "cursor position must be visible"
+        );
+    }
+
+    #[test]
+    fn statusbar_shows_a_toast_with_its_severity() {
+        let mut app = app_with_data();
+        app.notify(theme::Level::Error, "Kill failed: permission denied");
+        let buf = render_with(&app, 120, 24);
+        assert!(contains(&buf, "Kill failed"));
+    }
+
+    #[test]
+    fn statusbar_hides_local_only_hints_in_remote_mode() {
+        let mut app = app_with_data();
+        app.tab = Tab::Processes;
+        app.connection_mode = crate::ConnectionMode::Remote {
+            hostname: "prod".to_string(),
+            addr: "10.0.0.1:4242".parse().unwrap(),
+        };
+        let status = line_text(&render_with(&app, 200, 24), 23);
+        assert!(
+            !status.contains("SIGTERM"),
+            "must not offer a kill we cannot perform: `{status}`"
+        );
+    }
+
+    #[test]
+    fn statusbar_never_overflows_its_row() {
+        // The 0.4 footer was a fixed list that silently ran off an 80-column
+        // terminal; segments now stop at the edge.
+        for width in [40u16, 60, 80, 100, 200] {
+            let mut app = app_with_data();
+            app.tab = Tab::Containers;
+            let buf = render_with(&app, width, 24);
+            let status = line_text(&buf, 23);
+            assert!(
+                status.chars().count() <= width as usize,
+                "status bar overflowed at width {width}"
+            );
+        }
+    }
+
+    // -- Content dispatch --
+
+    #[test]
+    fn content_differs_between_tabs() {
+        let mut app = app_with_data();
+        app.tab = Tab::General;
+        let general = all_text(&render_with(&app, 100, 30));
+        app.tab = Tab::Processes;
+        let processes = all_text(&render_with(&app, 100, 30));
+        assert_ne!(general, processes);
+    }
+
+    #[test]
+    fn compact_terminals_get_one_row_of_chrome() {
+        let app = app_with_data();
+        let buf = render_with(&app, 50, 20);
+        let first = line_text(&buf, 0);
+        assert!(first.contains("muxtop"));
+        // The active tab is named on the same row as the brand.
+        assert!(first.contains("General"));
     }
 }

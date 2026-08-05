@@ -1,704 +1,341 @@
-// Network tab — interface table with bandwidth rates, sparklines, and summary bar.
+// Network tab.
 
-use std::collections::HashMap;
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
 
-use ratatui::{
-    Frame,
-    layout::{Alignment, Constraint, Layout, Rect},
-    style::{Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Sparkline},
-};
-
+use super::Render;
+use super::filter_bar;
 use super::sanitize::scrub_ctrl;
-use super::theme::Theme;
-use crate::app::{AppState, NetworkSortField};
+use super::widgets::columns::{Align, Column, PRIO_ESSENTIAL, PRIO_HIGH, PRIO_LOW, PRIO_MEDIUM};
+use super::widgets::empty::{self, EmptyState};
+use super::widgets::table::{self, Cell, Row, Spec};
+use super::widgets::{badge, meter, spark};
+use crate::app::NetworkSortField;
+use crate::ui::theme::Level;
 use muxtop_core::network::NetworkInterfaceSnapshot;
 use muxtop_core::process::SortOrder;
 
-/// Map from interface name to (rx_bps, tx_bps).
-///
-/// PERF-M4: pre-computed once per `draw_network_tab` so the sort comparator
-/// (called O(N log N) times, each previously linear-scanning the history
-/// rings twice) becomes O(N log N · 1) instead of O(N² log N).
-type BandwidthMap<'a> = HashMap<&'a str, (f64, f64)>;
+const COL_NAME: usize = 0;
+const COL_RX: usize = 2;
+const COL_TX: usize = 3;
+const COL_TOTAL_RX: usize = 4;
+const COL_TOTAL_TX: usize = 5;
+const COL_ERRORS: usize = 6;
 
-// Fixed column widths.
-const COL_IFACE: usize = 14;
-const COL_STATUS: usize = 5;
-const COL_RX_RATE: usize = 12;
-const COL_TX_RATE: usize = 12;
-const COL_TOTAL_RX: usize = 10;
-const COL_TOTAL_TX: usize = 10;
-const COL_ERRORS: usize = 8;
+const COLUMNS: &[Column] = &[
+    Column::flex("INTERFACE", 12, PRIO_ESSENTIAL),
+    Column::fixed("S", 2, Align::Left, PRIO_LOW),
+    Column::fixed("RX/s", 12, Align::Right, PRIO_ESSENTIAL),
+    Column::fixed("TX/s", 12, Align::Right, PRIO_ESSENTIAL),
+    Column::fixed("TOTAL RX", 10, Align::Right, PRIO_MEDIUM),
+    Column::fixed("TOTAL TX", 10, Align::Right, PRIO_MEDIUM),
+    Column::fixed("ERR", 7, Align::Right, PRIO_HIGH),
+];
 
-/// Render the Network tab content area.
-pub fn draw_network_tab(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
-    let snapshot = match &app.last_snapshot {
-        Some(s) => s,
-        None => {
-            let para = Paragraph::new("Waiting for data...").alignment(Alignment::Center);
-            frame.render_widget(para, area);
-            return;
-        }
-    };
+/// Rows reserved for the traffic graph under the table.
+const GRAPH_HEIGHT: u16 = 4;
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
-        .border_style(Style::default().fg(theme.text_dim));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    if inner.height == 0 || inner.width == 0 {
+pub fn draw_network_tab(frame: &mut Frame, area: Rect, r: &Render<'_>) {
+    let app = r.app;
+    if app.last_snapshot.is_none() {
+        let waiting = r.ellipsis("Waiting for data");
+        empty::render(frame, area, &EmptyState::waiting(&waiting), r.theme);
         return;
     }
 
-    // PERF-M4: build the bandwidth lookup once. `bandwidth_rx`/`_tx` walk
-    // the history ring per call; the sort comparator below would otherwise
-    // call them twice per comparison and turn the sort into O(N² log N).
-    let bw_map: BandwidthMap<'_> = snapshot
-        .networks
-        .interfaces
-        .iter()
-        .map(|iface| {
-            let key = iface.name.as_str();
-            (
-                key,
-                (
-                    app.network_history.bandwidth_rx(key),
-                    app.network_history.bandwidth_tx(key),
-                ),
-            )
-        })
-        .collect();
-
-    // Layout: summary(1) + table(fill) + sparklines(4 optional) + filter(0|1)
-    let filter_h = u16::from(app.net_filter_active);
-    let sparkline_h = if app.net_selected < app.net_interface_count() {
-        4
+    let interfaces = sorted_interfaces(r);
+    let filter_h = u16::from(app.filter_editing());
+    // The graph needs a selected interface and enough vertical room to be worth
+    // the space it costs.
+    let graph_h = if !interfaces.is_empty() && area.height >= 12 {
+        GRAPH_HEIGHT
     } else {
         0
     };
-    let constraints = if sparkline_h > 0 {
-        vec![
-            Constraint::Length(1),
-            Constraint::Fill(1),
-            Constraint::Length(sparkline_h),
-            Constraint::Length(filter_h),
-        ]
-    } else {
-        vec![
-            Constraint::Length(1),
-            Constraint::Fill(1),
-            Constraint::Length(filter_h),
-        ]
+
+    let [summary_area, table_area, graph_area, filter_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Fill(1),
+        Constraint::Length(graph_h),
+        Constraint::Length(filter_h),
+    ])
+    .areas(area);
+
+    draw_summary(frame, summary_area, r, &interfaces);
+
+    let filtered = !app.net_filter_input.is_empty();
+    let spec = Spec {
+        columns: COLUMNS,
+        sort_col: sort_column(app.net_sort_field),
+        descending: matches!(app.net_sort_order, SortOrder::Desc),
+        total: interfaces.len(),
+        selected: app.net_selected,
+        scroll: app.net_scroll_offset,
+        col_scroll: app.col_scroll,
+        empty: if filtered {
+            EmptyState::no_match("No matching interfaces")
+        } else {
+            EmptyState::empty(
+                "No network interfaces",
+                Some("Nothing is reporting traffic."),
+            )
+        },
     };
-    let areas = Layout::vertical(constraints).split(inner);
 
-    draw_summary_bar(frame, areas[0], app, theme, &bw_map);
+    table::draw(frame, table_area, r, &spec, |idx| {
+        match interfaces.get(idx) {
+            Some(iface) => interface_row(iface, r),
+            None => Row::new(Vec::new()),
+        }
+    });
 
-    if areas[1].height >= 2 {
-        let [header_area, body_area] =
-            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(areas[1]);
-        draw_header(frame, header_area, app, theme);
-        draw_body(frame, body_area, app, theme, &bw_map);
+    if graph_h > 0 {
+        draw_graph(frame, graph_area, r, &interfaces);
     }
-
-    if sparkline_h > 0 && areas.len() > 2 {
-        draw_sparklines(frame, areas[2], app, theme);
-    }
-
-    if app.net_filter_active {
-        let filter_area = areas[areas.len() - 1];
-        draw_filter_bar(frame, filter_area, app, theme);
+    if filter_h > 0 {
+        filter_bar::draw(frame, filter_area, r, "Filter interfaces");
     }
 }
 
-/// Summary bar: total bandwidth and interface count.
-fn draw_summary_bar(
-    frame: &mut Frame,
-    area: Rect,
-    app: &AppState,
-    theme: &Theme,
-    bw_map: &BandwidthMap<'_>,
-) {
-    let snapshot = match &app.last_snapshot {
-        Some(s) => s,
-        None => return,
-    };
+fn sort_column(field: NetworkSortField) -> Option<usize> {
+    Some(match field {
+        NetworkSortField::Name => COL_NAME,
+        NetworkSortField::RxRate => COL_RX,
+        NetworkSortField::TxRate => COL_TX,
+        NetworkSortField::TotalRx => COL_TOTAL_RX,
+        NetworkSortField::TotalTx => COL_TOTAL_TX,
+        NetworkSortField::Errors => COL_ERRORS,
+    })
+}
 
-    let active = snapshot
-        .networks
-        .interfaces
-        .iter()
-        .filter(|i| i.is_up)
-        .count();
-    let total = snapshot.networks.interfaces.len();
+/// Filter + sort the interfaces exactly as the table shows them.
+fn sorted_interfaces(r: &Render<'_>) -> Vec<NetworkInterfaceSnapshot> {
+    let app = r.app;
+    let mut rows = app.visible_interfaces();
+    let history = &app.network_history;
 
-    // PERF-M4: total bandwidth pulls directly from the pre-computed map
-    // instead of re-walking the history ring per interface.
-    let (mut total_rx_rate, mut total_tx_rate) = (0.0_f64, 0.0_f64);
-    for iface in &snapshot.networks.interfaces {
-        if let Some((rx, tx)) = bw_map.get(iface.name.as_str()) {
-            total_rx_rate += *rx;
-            total_tx_rate += *tx;
+    match app.net_sort_field {
+        NetworkSortField::Name => rows.sort_by(|a, b| a.name.cmp(&b.name)),
+        NetworkSortField::RxRate => rows.sort_by(|a, b| {
+            history
+                .bandwidth_rx(&b.name)
+                .partial_cmp(&history.bandwidth_rx(&a.name))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
+        NetworkSortField::TxRate => rows.sort_by(|a, b| {
+            history
+                .bandwidth_tx(&b.name)
+                .partial_cmp(&history.bandwidth_tx(&a.name))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
+        NetworkSortField::TotalRx => rows.sort_by_key(|i| std::cmp::Reverse(i.bytes_rx)),
+        NetworkSortField::TotalTx => rows.sort_by_key(|i| std::cmp::Reverse(i.bytes_tx)),
+        NetworkSortField::Errors => {
+            rows.sort_by_key(|i| std::cmp::Reverse(i.errors_rx + i.errors_tx))
         }
     }
-
-    let line = Line::from(vec![
-        Span::styled(
-            " Total: ",
-            Style::default()
-                .fg(theme.accent_primary)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("{} {}/s", DOWN_ARROW, format_rate(total_rx_rate as u64)),
-            Style::default().fg(theme.success),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!("{} {}/s", UP_ARROW, format_rate(total_tx_rate as u64)),
-            Style::default().fg(theme.warning),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!("| Interfaces: {active} active / {total} total"),
-            Style::default().fg(theme.text_dim),
-        ),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
-}
-
-const DOWN_ARROW: &str = "\u{2193}";
-const UP_ARROW: &str = "\u{2191}";
-
-/// Render the column header row with sort indicator.
-fn draw_header(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
-    let arrow = if matches!(app.net_sort_order, SortOrder::Desc) {
-        "\u{25bc}"
-    } else {
-        "\u{25b2}"
-    };
-    let style = Style::default()
-        .fg(theme.accent_primary)
-        .bg(theme.header_bg)
-        .add_modifier(Modifier::BOLD);
-
-    let header = format!(
-        "{}{}{}{}{}{}{}",
-        col_text(
-            &sort_label(
-                "INTERFACE",
-                NetworkSortField::Name,
-                app.net_sort_field,
-                arrow
-            ),
-            COL_IFACE,
-        ),
-        col_text("STATE", COL_STATUS),
-        col_text(
-            &sort_label("RX/s", NetworkSortField::RxRate, app.net_sort_field, arrow),
-            COL_RX_RATE,
-        ),
-        col_text(
-            &sort_label("TX/s", NetworkSortField::TxRate, app.net_sort_field, arrow),
-            COL_TX_RATE,
-        ),
-        col_text(
-            &sort_label(
-                "TOTAL RX",
-                NetworkSortField::TotalRx,
-                app.net_sort_field,
-                arrow
-            ),
-            COL_TOTAL_RX,
-        ),
-        col_text(
-            &sort_label(
-                "TOTAL TX",
-                NetworkSortField::TotalTx,
-                app.net_sort_field,
-                arrow
-            ),
-            COL_TOTAL_TX,
-        ),
-        col_text(
-            &sort_label(
-                "ERRORS",
-                NetworkSortField::Errors,
-                app.net_sort_field,
-                arrow
-            ),
-            COL_ERRORS,
-        ),
-    );
-
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(header, style))),
-        area,
-    );
-}
-
-/// Render the interface rows with virtualized scrolling.
-fn draw_body(
-    frame: &mut Frame,
-    area: Rect,
-    app: &AppState,
-    theme: &Theme,
-    bw_map: &BandwidthMap<'_>,
-) {
-    let vis_h = area.height as usize;
-    if vis_h == 0 {
-        return;
+    // `Name` sorts ascending by nature; the others descend by nature.
+    let ascending = matches!(app.net_sort_order, SortOrder::Asc);
+    let natural_ascending = matches!(app.net_sort_field, NetworkSortField::Name);
+    if ascending != natural_ascending {
+        rows.reverse();
     }
+    rows
+}
 
-    let interfaces = sorted_filtered_interfaces(app, bw_map);
-    if interfaces.is_empty() {
-        let msg = if app.net_filter_input.is_empty() {
-            "No network interfaces found"
+fn interface_row(iface: &NetworkInterfaceSnapshot, r: &Render<'_>) -> Row {
+    let history = &r.app.network_history;
+    let rx = history.bandwidth_rx(&iface.name) as u64;
+    let tx = history.bandwidth_tx(&iface.name) as u64;
+    let errors = iface.errors_rx + iface.errors_tx;
+    let level = if iface.is_up {
+        Level::Success
+    } else {
+        Level::Neutral
+    };
+
+    Row::new(vec![
+        Cell::new(scrub_ctrl(&iface.name).into_owned()),
+        Cell::colored(badge::marker(level, r.glyphs), r.theme.level_color(level)),
+        Cell::new(format!("{} {}", r.glyphs.arrow_down, meter::human_rate(rx))),
+        Cell::new(format!("{} {}", r.glyphs.arrow_up, meter::human_rate(tx))),
+        Cell::new(meter::human_bytes(iface.bytes_rx)),
+        Cell::new(meter::human_bytes(iface.bytes_tx)),
+        // Errors are the reason this column exists; a non-zero value must never
+        // look like every other number on the row.
+        if errors > 0 {
+            Cell::colored(errors.to_string(), r.theme.danger)
         } else {
-            "No interfaces match filter"
-        };
-        let para = Paragraph::new(msg)
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(theme.text_dim));
-        frame.render_widget(para, area);
-        return;
-    }
-
-    let scroll = effective_scroll(app.net_selected, app.net_scroll_offset, vis_h);
-    let end = (scroll + vis_h).min(interfaces.len());
-
-    let lines: Vec<Line<'static>> = (scroll..end)
-        .map(|i| {
-            let iface = &interfaces[i];
-            // PERF-M4: read pre-computed rates from the map.
-            let (rx_rate, tx_rate) = bw_map
-                .get(iface.name.as_str())
-                .copied()
-                .unwrap_or((0.0, 0.0));
-            interface_row(iface, rx_rate, tx_rate, i == app.net_selected, theme, i)
-        })
-        .collect();
-
-    frame.render_widget(Paragraph::new(lines), area);
-}
-
-/// Format a single interface row with fixed-width columns.
-fn interface_row(
-    iface: &NetworkInterfaceSnapshot,
-    rx_rate: f64,
-    tx_rate: f64,
-    selected: bool,
-    theme: &Theme,
-    row_idx: usize,
-) -> Line<'static> {
-    let bg = if selected {
-        theme.selection_bg
-    } else if row_idx % 2 == 1 {
-        theme.surface
-    } else {
-        theme.bg
-    };
-    let fg = if selected {
-        theme.selection_fg
-    } else if iface.is_up {
-        theme.fg
-    } else {
-        theme.text_dim
-    };
-    let base = if selected {
-        Style::default().bg(bg).fg(fg).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().bg(bg).fg(fg)
-    };
-
-    let status_str = if iface.is_up { "UP" } else { "DOWN" };
-    let status_style = if selected {
-        base
-    } else if iface.is_up {
-        Style::default().fg(theme.success).bg(bg)
-    } else {
-        Style::default().fg(theme.text_dim).bg(bg)
-    };
-
-    let rx_style = if selected {
-        base
-    } else {
-        Style::default().fg(theme.success).bg(bg)
-    };
-    let tx_style = if selected {
-        base
-    } else {
-        Style::default().fg(theme.warning).bg(bg)
-    };
-
-    let total_errors = iface.errors_rx + iface.errors_tx;
-    let err_style = if selected {
-        base
-    } else if total_errors > 0 {
-        Style::default().fg(theme.danger).bg(bg)
-    } else {
-        base
-    };
-
-    // Interface name comes from sysinfo / /proc/net/dev — defensively
-    // scrubbed (MED-S5) in case a non-default network namespace exposes a
-    // name with embedded control bytes.
-    let safe_iface_name = scrub_ctrl(&iface.name);
-
-    Line::from(vec![
-        Span::styled(col_text(&safe_iface_name, COL_IFACE), base),
-        Span::styled(col_text(status_str, COL_STATUS), status_style),
-        Span::styled(
-            col_text(&format!("{}/s", format_rate(rx_rate as u64)), COL_RX_RATE),
-            rx_style,
-        ),
-        Span::styled(
-            col_text(&format!("{}/s", format_rate(tx_rate as u64)), COL_TX_RATE),
-            tx_style,
-        ),
-        Span::styled(col_text(&format_bytes(iface.bytes_rx), COL_TOTAL_RX), base),
-        Span::styled(col_text(&format_bytes(iface.bytes_tx), COL_TOTAL_TX), base),
-        Span::styled(col_text(&total_errors.to_string(), COL_ERRORS), err_style),
+            Cell::new("0")
+        },
     ])
 }
 
-/// Draw RX/TX sparklines for the selected interface.
-fn draw_sparklines(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
-    // Sparkline path is single-shot per render (only the selected row), so a
-    // dedicated `bw_map` here would cost more than it saves. We continue to
-    // call `bandwidth_*` directly for the two values needed.
-    let Some(snapshot) = app.last_snapshot.as_ref() else {
-        return;
-    };
-    let bw_map: BandwidthMap<'_> = snapshot
-        .networks
-        .interfaces
+fn draw_summary(
+    frame: &mut Frame,
+    area: Rect,
+    r: &Render<'_>,
+    interfaces: &[NetworkInterfaceSnapshot],
+) {
+    let history = &r.app.network_history;
+    let rx: f64 = interfaces
         .iter()
-        .map(|iface| {
-            let key = iface.name.as_str();
-            (
-                key,
-                (
-                    app.network_history.bandwidth_rx(key),
-                    app.network_history.bandwidth_tx(key),
-                ),
-            )
-        })
-        .collect();
+        .map(|i| history.bandwidth_rx(&i.name))
+        .sum();
+    let tx: f64 = interfaces
+        .iter()
+        .map(|i| history.bandwidth_tx(&i.name))
+        .sum();
+    let up = interfaces.iter().filter(|i| i.is_up).count();
 
-    let interfaces = sorted_filtered_interfaces(app, &bw_map);
-    let selected_iface = match interfaces.get(app.net_selected) {
-        Some(iface) => &iface.name,
-        None => return,
-    };
-
-    let (rx_rate, tx_rate) = bw_map
-        .get(selected_iface.as_str())
-        .copied()
-        .unwrap_or((0.0, 0.0));
-
-    let points = area.width as usize;
-    let rx_data = app.network_history.sparkline_rx(selected_iface, points);
-    let tx_data = app.network_history.sparkline_tx(selected_iface, points);
-
-    let [rx_area, tx_area] =
-        Layout::vertical([Constraint::Length(2), Constraint::Length(2)]).areas(area);
-
-    // RX sparkline
-    let rx_label = format!("{} RX {}/s", DOWN_ARROW, format_rate(rx_rate as u64));
-    let rx_sparkline = Sparkline::default()
-        .data(&rx_data)
-        .style(Style::default().fg(theme.accent_primary))
-        .block(
-            Block::default()
-                .title(Span::styled(
-                    rx_label,
-                    Style::default()
-                        .fg(theme.success)
-                        .add_modifier(Modifier::BOLD),
-                ))
-                .borders(Borders::NONE),
-        );
-    frame.render_widget(rx_sparkline, rx_area);
-
-    // TX sparkline
-    let tx_label = format!("{} TX {}/s", UP_ARROW, format_rate(tx_rate as u64));
-    let tx_sparkline = Sparkline::default()
-        .data(&tx_data)
-        .style(Style::default().fg(theme.accent_secondary))
-        .block(
-            Block::default()
-                .title(Span::styled(
-                    tx_label,
-                    Style::default()
-                        .fg(theme.warning)
-                        .add_modifier(Modifier::BOLD),
-                ))
-                .borders(Borders::NONE),
-        );
-    frame.render_widget(tx_sparkline, tx_area);
-}
-
-/// Render the filter input bar.
-fn draw_filter_bar(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
-    let cursor = if app.term_caps.unicode {
-        "\u{2588}"
-    } else {
-        "_"
-    };
     let line = Line::from(vec![
+        Span::styled(" Network ", r.theme.accent_fill()),
         Span::styled(
-            "Filter: ",
-            Style::default()
-                .fg(theme.accent_primary)
-                .add_modifier(Modifier::BOLD),
+            format!("  Interfaces {up}/{}", interfaces.len()),
+            r.theme.dim(),
         ),
         Span::styled(
-            format!("{}{cursor}", app.net_filter_input),
-            Style::default().fg(theme.fg),
+            format!(
+                "   Total {} {}   {} {}",
+                r.glyphs.arrow_down,
+                meter::human_rate(rx as u64),
+                r.glyphs.arrow_up,
+                meter::human_rate(tx as u64)
+            ),
+            r.theme.body(),
         ),
     ]);
     frame.render_widget(Paragraph::new(line), area);
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Get sorted and filtered interfaces from the current snapshot.
-///
-/// PERF-M4: the sort comparator looks up rates from `bw_map` rather than
-/// re-walking the history ring, so the comparator stays O(1) and the sort
-/// itself stays O(N log N) overall.
-fn sorted_filtered_interfaces(
-    app: &AppState,
-    bw_map: &BandwidthMap<'_>,
-) -> Vec<NetworkInterfaceSnapshot> {
-    let Some(ref snapshot) = app.last_snapshot else {
-        return Vec::new();
+/// Traffic history for the selected interface.
+fn draw_graph(
+    frame: &mut Frame,
+    area: Rect,
+    r: &Render<'_>,
+    interfaces: &[NetworkInterfaceSnapshot],
+) {
+    let Some(iface) = interfaces.get(r.app.net_selected) else {
+        return;
     };
-
-    let mut interfaces: Vec<NetworkInterfaceSnapshot> = if app.net_filter_input.is_empty() {
-        snapshot.networks.interfaces.clone()
-    } else {
-        let filter = app.net_filter_input.to_lowercase();
-        snapshot
-            .networks
-            .interfaces
-            .iter()
-            .filter(|i| i.name.to_lowercase().contains(&filter))
-            .cloned()
-            .collect()
-    };
-
-    let lookup = |name: &str| bw_map.get(name).copied().unwrap_or((0.0, 0.0));
-    match app.net_sort_field {
-        NetworkSortField::Name => {
-            interfaces.sort_by(|a, b| a.name.cmp(&b.name));
-        }
-        NetworkSortField::RxRate => {
-            interfaces.sort_by(|a, b| {
-                let ra = lookup(a.name.as_str()).0;
-                let rb = lookup(b.name.as_str()).0;
-                rb.partial_cmp(&ra).unwrap_or(std::cmp::Ordering::Equal)
-            });
-        }
-        NetworkSortField::TxRate => {
-            interfaces.sort_by(|a, b| {
-                let ta = lookup(a.name.as_str()).1;
-                let tb = lookup(b.name.as_str()).1;
-                tb.partial_cmp(&ta).unwrap_or(std::cmp::Ordering::Equal)
-            });
-        }
-        NetworkSortField::TotalRx => {
-            interfaces.sort_by_key(|b| std::cmp::Reverse(b.bytes_rx));
-        }
-        NetworkSortField::TotalTx => {
-            interfaces.sort_by_key(|b| std::cmp::Reverse(b.bytes_tx));
-        }
-        NetworkSortField::Errors => {
-            interfaces.sort_by(|a, b| {
-                let ea = a.errors_rx + a.errors_tx;
-                let eb = b.errors_rx + b.errors_tx;
-                eb.cmp(&ea)
-            });
-        }
-    }
-
-    // Default sort is descending for numeric, ascending for Name.
-    // Reverse when user asks for the opposite direction.
-    let is_asc = matches!(app.net_sort_order, SortOrder::Asc);
-    let is_name = matches!(app.net_sort_field, NetworkSortField::Name);
-    if is_asc != is_name {
-        interfaces.reverse();
-    }
-
-    interfaces
-}
-
-/// Build the column header label, appending a sort arrow when this column is active.
-fn sort_label(
-    name: &str,
-    field: NetworkSortField,
-    active: NetworkSortField,
-    arrow: &str,
-) -> String {
-    if std::mem::discriminant(&field) == std::mem::discriminant(&active) {
-        format!("{name}{arrow}")
-    } else {
-        name.to_string()
-    }
-}
-
-/// Pad (left-aligned) or truncate a string to exactly `width` characters.
-fn col_text(s: &str, width: usize) -> String {
+    let width = area.width.saturating_sub(14);
     if width == 0 {
-        return String::new();
+        return;
     }
-    let truncated: String = s.chars().take(width).collect();
-    format!("{truncated:<width$}")
-}
+    let history = &r.app.network_history;
+    let rx = history.sparkline_rx(&iface.name, width as usize);
+    let tx = history.sparkline_tx(&iface.name, width as usize);
+    // One scale for both series, so the two lines are comparable rather than
+    // each being normalised to its own maximum.
+    let scale = rx
+        .iter()
+        .chain(tx.iter())
+        .copied()
+        .max()
+        .unwrap_or(1)
+        .max(1);
 
-/// Compute the effective scroll offset so that `selected` is always visible.
-fn effective_scroll(selected: usize, scroll_offset: usize, visible_height: usize) -> usize {
-    if visible_height == 0 {
-        return 0;
+    let mut lines = vec![Line::from(Span::styled(
+        format!(" {} ", scrub_ctrl(&iface.name)),
+        r.theme.accent(),
+    ))];
+    for (arrow, data, color) in [
+        (r.glyphs.arrow_down, rx, r.theme.success),
+        (r.glyphs.arrow_up, tx, r.theme.info),
+    ] {
+        let mut spans = vec![Span::styled(format!(" {arrow} "), r.theme.dim())];
+        spans.extend(
+            spark::line(
+                &data,
+                width,
+                Some(scale),
+                spark::Tint::Flat,
+                color,
+                r.theme,
+                r.glyphs,
+            )
+            .spans,
+        );
+        lines.push(Line::from(spans));
     }
-    if selected < scroll_offset {
-        selected
-    } else if selected >= scroll_offset + visible_height {
-        selected.saturating_sub(visible_height - 1)
-    } else {
-        scroll_offset
-    }
-}
-
-/// Format bytes/s as human-readable rate (B, KB, MB, GB).
-fn format_rate(bytes_per_sec: u64) -> String {
-    let rate = bytes_per_sec as f64;
-    if rate < 1024.0 {
-        format!("{:.0}B", rate)
-    } else if rate < 1024.0 * 1024.0 {
-        format!("{:.1}KB", rate / 1024.0)
-    } else if rate < 1024.0 * 1024.0 * 1024.0 {
-        format!("{:.1}MB", rate / (1024.0 * 1024.0))
-    } else {
-        format!("{:.1}GB", rate / (1024.0 * 1024.0 * 1024.0))
-    }
-}
-
-/// Format total bytes as human-readable.
-fn format_bytes(bytes: u64) -> String {
-    let b = bytes as f64;
-    if b < 1024.0 {
-        format!("{:.0}B", b)
-    } else if b < 1024.0 * 1024.0 {
-        format!("{:.1}KB", b / 1024.0)
-    } else if b < 1024.0 * 1024.0 * 1024.0 {
-        format!("{:.1}MB", b / (1024.0 * 1024.0))
-    } else if b < 1024.0 * 1024.0 * 1024.0 * 1024.0 {
-        format!("{:.1}GB", b / (1024.0 * 1024.0 * 1024.0))
-    } else {
-        format!("{:.1}TB", b / (1024.0 * 1024.0 * 1024.0 * 1024.0))
-    }
+    lines.push(Line::from(Span::styled(
+        format!(" peak {}", meter::human_rate(scale)),
+        r.theme.subtle(),
+    )));
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::app::{AppState, Tab};
+    use crate::ui::test_support::*;
 
-    #[test]
-    fn test_format_rate_bytes() {
-        assert_eq!(format_rate(0), "0B");
-        assert_eq!(format_rate(512), "512B");
-        assert_eq!(format_rate(1023), "1023B");
+    fn app() -> AppState {
+        let mut app = app_with_data();
+        app.tab = Tab::Network;
+        app
     }
 
     #[test]
-    fn test_format_rate_kilobytes() {
-        assert_eq!(format_rate(1024), "1.0KB");
-        assert_eq!(format_rate(1536), "1.5KB");
+    fn table_lists_interfaces_with_rates() {
+        let text = all_text(&render_with(&app(), 120, 24));
+        assert!(text.contains("INTERFACE"));
+        assert!(text.contains("RX/s"));
+        assert!(text.contains("TX/s"));
+        assert!(text.contains("eth0"));
+        assert!(text.contains("lo"));
     }
 
     #[test]
-    fn test_format_rate_megabytes() {
-        assert_eq!(format_rate(1024 * 1024), "1.0MB");
-        assert_eq!(format_rate(10 * 1024 * 1024), "10.0MB");
+    fn summary_shows_totals_and_interface_count() {
+        let text = all_text(&render_with(&app(), 120, 24));
+        assert!(text.contains("Interfaces"));
+        assert!(text.contains("Total"));
     }
 
     #[test]
-    fn test_format_rate_gigabytes() {
-        assert_eq!(format_rate(1024 * 1024 * 1024), "1.0GB");
+    fn graph_shows_the_selected_interface() {
+        let text = all_text(&render_with(&app(), 120, 30));
+        assert!(text.contains("peak"), "traffic graph missing:\n{text}");
     }
 
     #[test]
-    fn test_format_bytes_total() {
-        assert_eq!(format_bytes(0), "0B");
-        assert_eq!(format_bytes(500), "500B");
-        assert_eq!(format_bytes(1024), "1.0KB");
-        assert_eq!(format_bytes(1024 * 1024), "1.0MB");
-        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0GB");
-        assert_eq!(format_bytes(1024u64 * 1024 * 1024 * 1024), "1.0TB");
+    fn graph_is_dropped_on_short_terminals_rather_than_squashed() {
+        let text = all_text(&render_with(&app(), 120, 11));
+        assert!(!text.contains("peak"));
+        // The table still renders.
+        assert!(text.contains("eth0"));
     }
 
     #[test]
-    fn test_col_text_pad() {
-        assert_eq!(col_text("hi", 5), "hi   ");
+    fn errors_are_shown() {
+        let mut snap = snapshot();
+        snap.networks.interfaces[0].errors_rx = 12;
+        let mut app = AppState::new();
+        app.tab = Tab::Network;
+        app.apply_snapshot(snap);
+        let text = all_text(&render_with(&app, 120, 24));
+        assert!(text.contains("12"));
     }
 
     #[test]
-    fn test_col_text_truncate() {
-        assert_eq!(col_text("hello world", 5), "hello");
+    fn empty_filter_result_explains_itself() {
+        let mut app = app();
+        app.set_filter("zzzz");
+        let text = all_text(&render_with(&app, 100, 24));
+        assert!(text.contains("No matching interfaces"));
     }
 
     #[test]
-    fn test_col_text_zero() {
-        assert_eq!(col_text("hello", 0), "");
-    }
-
-    #[test]
-    fn test_effective_scroll_selected_above() {
-        assert_eq!(effective_scroll(2, 5, 10), 2);
-    }
-
-    #[test]
-    fn test_effective_scroll_selected_below() {
-        assert_eq!(effective_scroll(15, 0, 10), 6);
-    }
-
-    #[test]
-    fn test_effective_scroll_selected_visible() {
-        assert_eq!(effective_scroll(5, 3, 10), 3);
-    }
-
-    #[test]
-    fn test_effective_scroll_zero_height() {
-        assert_eq!(effective_scroll(5, 3, 0), 0);
-    }
-
-    #[test]
-    fn test_sort_label_active() {
-        let label = sort_label(
-            "RX/s",
-            NetworkSortField::RxRate,
-            NetworkSortField::RxRate,
-            "▼",
-        );
-        assert_eq!(label, "RX/s▼");
-    }
-
-    #[test]
-    fn test_sort_label_inactive() {
-        let label = sort_label(
-            "TX/s",
-            NetworkSortField::TxRate,
-            NetworkSortField::RxRate,
-            "▼",
-        );
-        assert_eq!(label, "TX/s");
+    fn renders_under_every_profile_and_size() {
+        let mut app = app();
+        for (w, h) in [(1u16, 1u16), (40, 8), (80, 24), (200, 50)] {
+            let _ = render_with(&app, w, h);
+        }
+        for (color, unicode) in all_profiles() {
+            let _ = render_caps(&mut app, 100, 30, color, unicode);
+        }
     }
 }

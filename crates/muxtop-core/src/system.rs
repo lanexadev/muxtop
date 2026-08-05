@@ -10,6 +10,16 @@ use crate::kube::KubeSnapshot;
 use crate::network::NetworkSnapshot;
 use crate::process::ProcessInfo;
 
+/// The machine's host name, resolved once.
+///
+/// The TUI header shows it so that three muxtop panes in a tmux window are
+/// distinguishable. Cached because the value cannot change during the process
+/// lifetime and the syscall behind it is not free on every platform.
+pub fn host_name() -> Option<&'static str> {
+    static HOST_NAME: OnceLock<Option<String>> = OnceLock::new();
+    HOST_NAME.get_or_init(sysinfo::System::host_name).as_deref()
+}
+
 /// Interned per-core name table (PERF-L2).
 ///
 /// `format!("cpu{i}")` previously ran on every collector tick for every core,

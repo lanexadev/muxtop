@@ -68,15 +68,18 @@ cargo build --release
 | **Containers tab** | Docker/Podman via [bollard](https://github.com/fussybeaver/bollard) — CPU/memory/network/IO table, CPU+RX sparklines, `F9` stop / `F10` kill / `F11` restart actions, automatic socket detection |
 | **Kubernetes tab** | Read-only Pods / Nodes / Deployments via [kube-rs](https://github.com/kube-rs/kube) — switch sub-views with `P` / `N` / `D`, sort with `s`, filter with `/`. Auto-detects `$KUBECONFIG` / `~/.kube/config` / in-cluster ServiceAccount; graceful fallback when `metrics-server` is absent (CPU/MEM render `—`). Lists cluster-wide by default; `--kube-namespace <NS>` scopes Pods and Deployments to one namespace so a namespace-bound Role is enough, and `A` toggles between the two at runtime (see [Kubernetes permissions](#kubernetes-permissions)) |
 | **GPU tab** | Read-only NVIDIA (via NVML) and AMD (via `amdgpu` sysfs) — utilisation, VRAM, temperature, power, clocks, fan, NVENC/NVDEC. Switch sub-views with `D` / `P`, sort with `s`, filter with `/`. Multiple vendors are merged into one list, and any metric a driver cannot report renders `—` rather than a misleading `0` (see [GPU support](#gpu-support)) |
-| **Command palette** | `Ctrl+P` — `kill firefox`, `sort memory`, `stop nginx`, `restart postgres`, etc. |
-| **htop shortcuts** | `F1`–`F5` sort columns, `F7`/`F8` renice, `F9` kill, `F10` force kill |
+| **Command palette** | `Ctrl+P` fuzzy, `:` typed — `kill firefox`, `sort memory`, `stop nginx`, `restart postgres`, etc. |
+| **Help screen** | `?` — generated from the keymap, so it always matches the bindings |
+| **Inspector** | `Enter` on any row: full command line, image, pod node, GPU clocks, interface errors |
+| **htop shortcuts** | `F1` help, `F5` tree, `F6` sort, `F7`/`F8` renice, `F9` kill, `F10` force kill |
 | **Fuzzy search** | Powered by [nucleo](https://github.com/helix-editor/nucleo) (from the Helix editor) |
-| **Tree view** | `F5` toggles the parent/child hierarchical display |
-| **Renice** | `+` / `-` to adjust process priority |
+| **Tree view** | `t` / `F5` toggles the parent/child hierarchical display |
+| **Renice** | `+` / `-` or `F7` / `F8` to adjust process priority |
 | **Remote monitoring** | `--remote host:port` + `--token` to monitor a remote server over encrypted TLS |
 | **Native TLS** | rustls encryption (TLS 1.3-only since 0.3.1), self-signed cert auto-generation (`--tls-generate`), mandatory token auth |
 | **Async collection** | tokio-based — the UI never blocks, even at 3000+ processes |
-| **Tokyo Night theme** | Native TrueColor, automatic fallback for ANSI/16-color terminals |
+| **Tokyo Night theme** | TrueColor, 256-color and 16-color renditions, plus a light and a monochrome theme (`--theme`) |
+| **Degrades honestly** | ASCII glyph set on the Linux console, `NO_COLOR` honoured, mouse optional — see [Terminal compatibility](#terminal-compatibility) |
 | **Static binary** | Single musl binary, no system dependencies |
 | **Zero telemetry** | No client-side network calls, ever (see [Privacy](#privacy--telemetry)) |
 
@@ -174,6 +177,13 @@ muxtop --sort mem                   # sort by memory at startup
 muxtop --tree                       # start in tree view
 muxtop --about                      # version, license, privacy pledge
 
+# Presentation
+muxtop --theme tokyo-night-light    # light terminal background
+muxtop --theme mono                 # no hue at all
+muxtop --no-color                   # same as NO_COLOR=1
+muxtop --ascii                      # force the ASCII glyph set
+muxtop --no-mouse                   # keep the terminal's own text selection
+
 # Containers tab — by default muxtop checks $DOCKER_HOST, /var/run/docker.sock,
 # then the Podman sockets. Pass a path to force, or disable entirely:
 muxtop --docker-socket /var/run/docker.sock   # socket override
@@ -201,30 +211,58 @@ MUXTOP_TOKEN="my-secret-16chars" muxtop --remote host:port --tls-ca cert.pem
 
 ### Keyboard shortcuts
 
+**Press `?` inside muxtop** for the full, always-current reference — it is generated from the keymap
+itself, so it cannot drift from what the keys actually do. The table below is the short version.
+
 | Key | Action |
 |--------|--------|
-| `Ctrl+P` | Command palette |
+| `?` · `F1` | Help |
+| `Ctrl+P` · `Ctrl+K` | Command palette (fuzzy) |
+| `:` | Command mode — `kill firefox`, `sort mem`, `filter ngin`, `theme mono`, `tab gpu` |
+| `Tab` / `Shift+Tab` | Cycle to the next / previous tab |
 | `Alt+1` … `Alt+6` | Switch tab (General / Processes / Network / Containers / Kubernetes / GPU) |
-| `Tab` / `Shift+Tab` · `←` / `→` | Cycle to the next / previous tab |
 | `q` · `Ctrl+C` | Quit |
-| `j` / `k` · `↑` / `↓` | Navigation (vim-style) |
+| `j` / `k` · `↑` / `↓` | Move the row cursor |
+| `h` / `l` · `←` / `→` | Scroll columns (narrow terminals) |
 | `g` / `G` · `Home` / `End` | Jump to first / last row |
-| `PageUp` / `PageDown` | Scroll by 20 rows |
-| `/` | Filter (applies to the active tab) |
-| `Esc` | Clear the active filter |
-| `t` | Tree view (Processes) |
-| `s` | Cycle sort field (active tab) |
-| `S` / `I` | Toggle sort direction (active tab) |
-| `F1` … `F5` | Sort processes by PID / name / CPU / memory / user |
-| `F7` / `F8` | Renice — lower (+1) / raise (−1) priority, Processes tab, local mode |
+| `PageUp` / `PageDown` · `Ctrl+U` / `Ctrl+D` | Scroll by a page / half a page |
+| `Enter` · `i` | Inspect the selected row |
+| `x` | Contextual actions menu |
+| `y` | Copy the selected row's identifier (works over ssh, via OSC 52) |
+| `Space` | Pause / resume the view |
+| `Ctrl+L` | Message log |
+| `/` · `F3` / `F4` | Filter (applies to the active tab) |
+| `Esc` | One step back: close overlay → dismiss messages → leave the filter → clear it |
+| `s` · `F6` | Cycle sort field (active tab) |
+| `S` / `I` | Reverse sort direction (active tab) |
+| `t` · `F5` | Tree view (Processes) |
+| `F7` / `F8` · `-` / `+` | Renice — lower / raise priority (Processes, local mode) |
 | `F9` | Kill process, SIGTERM (Processes) · Stop container (Containers) |
 | `F10` | Force kill, SIGKILL (Processes) · Kill container (Containers) |
 | `F11` | Restart container (Containers) |
-| `P` / `N` / `D` | Switch Kube sub-view to **P**ods / **N**odes / **D**eployments (Kubernetes tab only) |
+| `P` / `N` / `D` · `[` / `]` | Switch Kube sub-view to **P**ods / **N**odes / **D**eployments |
 | `A` | Toggle namespace scope — one namespace ↔ **A**ll namespaces (Kubernetes tab, local mode) |
-| `D` / `P` | Switch GPU sub-view to **D**evices / **P**rocs (GPU tab only) |
+| `D` / `P` · `[` / `]` | Switch GPU sub-view to **D**evices / **P**rocs (GPU tab only) |
 
-> There is no built-in help screen yet — `Ctrl+P` lists every command with its shortcut.
+Tab-scoped keys only act on their own tab: pressing `F9` on the Network tab does nothing rather than
+silently killing a process you cannot see.
+
+### Terminal compatibility
+
+muxtop adapts to the terminal it finds, because a headless Ubuntu box reached over `ssh` and a kitty
+window are both first-class targets:
+
+| Detected | Behaviour |
+|---|---|
+| 24-bit colour (`$COLORTERM`, or a known terminal) | Full Tokyo Night |
+| 256 colours (`xterm-256color`, Terminal.app, tmux) | 256-colour Tokyo Night |
+| 16 colours (`TERM=linux`, `xterm`, serial console) | ANSI palette, the terminal's own colours |
+| `NO_COLOR`, `TERM=dumb` | No colour at all — hierarchy through bold / dim / reverse |
+| No UTF-8 locale, or `TERM=linux` | ASCII glyph set (the console font has no block or braille glyphs) |
+| No pointer (`TERM=linux`, `dumb`) | Mouse reporting stays off |
+
+Everything the mouse can do, the keyboard can do. Overrides: `--theme <name>` (`tokyo-night`,
+`tokyo-night-light`, `mono`), `--no-color`, `--ascii`, `--no-mouse`.
 
 ---
 
@@ -272,6 +310,9 @@ muxtop/
     │   └── src/amd_engine.rs    # AMD backend (amdgpu sysfs)
     ├── muxtop-tui/              # ratatui interface
     │   ├── src/app.rs           # State machine, event handling
+    │   ├── src/keymap.rs        # Single source of truth for bindings (drives dispatch + help)
+    │   ├── src/notify.rs        # Typed toast stack and message log
+    │   ├── src/ui/widgets/      # Shared table, meters, sparklines, badges, empty states
     │   └── src/ui/              # Tabs General/Processes/Network/Containers/Kube/GPU, palette, theme
     ├── muxtop-proto/            # Wire protocol and binary serialization
     └── muxtop-server/           # TCP daemon for remote monitoring

@@ -1,326 +1,331 @@
-// Command palette overlay rendering.
+// Command palette (`Ctrl+P`) and command line (`:`).
+//
+// Three things changed from 0.4. The list is context-aware, so the tab in front
+// of you ranks first. Matched characters are highlighted, so it is obvious why
+// a result is there. And argument forms work — `kill firefox`, `sort mem`,
+// `theme mono` — which the README had been advertising since 0.3 against a
+// command enum that could not carry an argument.
 
-use ratatui::{
-    Frame,
-    layout::{Constraint, Layout, Rect},
-    style::{Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
-};
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
 
-use super::theme::Theme;
-use crate::app::AppState;
+use crate::app::Command;
+use crate::ui::Render;
+use crate::ui::widgets::overlay;
 
-/// Render the command palette as a centered overlay.
-pub fn draw_palette(frame: &mut Frame, app: &AppState, theme: &Theme) {
+/// Preferred width of the palette.
+const WIDTH: u16 = 64;
+/// Most results shown at once.
+const MAX_RESULTS: usize = 12;
+
+pub fn draw_palette(frame: &mut Frame, r: &Render<'_>) {
+    let app = r.app;
     let area = frame.area();
 
-    // Palette dimensions: 60 wide (or area width - 4), up to 16 tall.
-    let width = 60.min(area.width.saturating_sub(4));
-    let max_results = 10;
-    // 3 = border top + input line + border bottom, +1 for each result row
-    let result_rows = app.palette.filtered.len().min(max_results);
-    let height = (3
-        + result_rows as u16
-        + if app.palette.filtered.is_empty() {
-            1
-        } else {
-            0
-        })
-    .min(area.height.saturating_sub(2));
+    let result_rows = app.palette.filtered.len().clamp(1, MAX_RESULTS) as u16;
+    // border(2) + input(1) + separator(1) + results + hint(1)
+    let height = (result_rows + 5).min(area.height);
+    let width = WIDTH.min(area.width.saturating_sub(2)).max(20);
+    let popup = overlay::centered(width, height, area);
 
-    if width < 10 || height < 3 {
-        return; // Terminal too small for palette
-    }
-
-    let popup = centered_rect(width, height, area);
-
-    // Clear the area behind the popup.
-    frame.render_widget(Clear, popup);
-
-    let block = Block::default()
-        .title(" Command Palette ")
-        .title_style(
-            Style::default()
-                .fg(theme.bg)
-                .bg(theme.accent_primary)
-                .add_modifier(Modifier::BOLD),
-        )
-        .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
-        .border_style(Style::default().fg(theme.accent_primary).bg(theme.bg));
-
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-
+    let title = if app.command_mode() {
+        "Command"
+    } else {
+        "Command Palette"
+    };
+    let inner = overlay::popup(frame, popup, title, r.theme, r.glyphs);
     if inner.height == 0 || inner.width == 0 {
         return;
     }
 
-    // Split inner into input line + results area.
-    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).split(inner);
-    let input_area = chunks[0];
-    let results_area = chunks[1];
+    let [input_area, results_area, hint_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Fill(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
 
-    // Render input line with cursor.
-    let input_text = format!("> {}\u{2588}", app.palette.input); // block cursor
-    let input_line = Paragraph::new(Line::from(Span::styled(
-        input_text,
-        Style::default().fg(theme.fg),
-    )));
-    frame.render_widget(input_line, input_area);
+    draw_input(frame, input_area, r);
 
-    // Render results.
     if app.palette.filtered.is_empty() {
-        if results_area.height > 0 {
-            let no_match = Paragraph::new(Line::from(Span::styled(
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![Span::styled(
                 "  No matches",
-                Style::default().fg(theme.text_dim),
-            )));
-            frame.render_widget(no_match, results_area);
-        }
-        return;
+                r.theme.dim(),
+            )])),
+            results_area,
+        );
+    } else {
+        draw_results(frame, results_area, r);
     }
 
-    let visible_count = (results_area.height as usize).min(app.palette.filtered.len());
-    // Scroll so selected item is always visible.
-    let scroll_offset = if app.palette.selected >= visible_count {
-        app.palette.selected - visible_count + 1
-    } else {
-        0
-    };
+    draw_hint(frame, hint_area, r);
+}
 
-    for (i, &(cmd, _score)) in app
+fn draw_input(frame: &mut Frame, area: Rect, r: &Render<'_>) {
+    let app = r.app;
+    let prompt = if app.command_mode() { ":" } else { ">" };
+    let mut spans = vec![
+        Span::styled(format!("{prompt} "), r.theme.accent()),
+        Span::styled(app.palette.input.clone(), r.theme.body()),
+        Span::styled(r.glyphs.cursor.to_string(), r.theme.accent()),
+    ];
+    // Show the parsed argument so `kill firefox` visibly became a target.
+    if let Some(arg) = app.palette.arg.as_ref()
+        && !arg.is_empty()
+    {
+        spans.push(Span::styled(
+            format!("   {} {arg}", r.glyphs.chevron),
+            r.theme.subtle(),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn draw_results(frame: &mut Frame, area: Rect, r: &Render<'_>) {
+    let app = r.app;
+    let visible = (area.height as usize).min(app.palette.filtered.len());
+    if visible == 0 {
+        return;
+    }
+    // Keep the cursor on screen.
+    let scroll = app
+        .palette
+        .selected
+        .saturating_sub(visible.saturating_sub(1));
+
+    for (i, &(cmd, _)) in app
         .palette
         .filtered
         .iter()
-        .skip(scroll_offset)
+        .skip(scroll)
+        .take(visible)
         .enumerate()
-        .take(visible_count)
     {
-        let list_idx = scroll_offset + i;
-        let is_selected = list_idx == app.palette.selected;
-
-        let row_area = Rect {
-            x: results_area.x,
-            y: results_area.y + i as u16,
-            width: results_area.width,
+        let selected = scroll + i == app.palette.selected;
+        let row = Rect {
+            x: area.x,
+            y: area.y + i as u16,
+            width: area.width,
             height: 1,
         };
-
-        let label = cmd.label();
-        let shortcut = cmd.shortcut();
-
-        // Right-align the shortcut.
-        let (label_style, shortcut_style) = if is_selected {
-            (
-                Style::default()
-                    .fg(theme.selection_fg)
-                    .add_modifier(Modifier::BOLD)
-                    .bg(theme.selection_bg),
-                Style::default()
-                    .fg(theme.selection_fg)
-                    .bg(theme.selection_bg),
-            )
-        } else {
-            (
-                Style::default().fg(theme.fg),
-                Style::default().fg(theme.text_dim),
-            )
-        };
-
-        // Build the line: "  label" + padding + "shortcut  "
-        let label_str = format!("  {}", label);
-        let shortcut_str = format!("  {}", shortcut);
-        let padding_len = row_area
-            .width
-            .saturating_sub(label_str.len() as u16 + shortcut_str.len() as u16);
-        let padding = " ".repeat(padding_len as usize);
-
-        let line = Line::from(vec![
-            Span::styled(label_str, label_style),
-            Span::styled(
-                padding,
-                if is_selected {
-                    Style::default().bg(theme.selection_bg)
-                } else {
-                    Style::default()
-                },
-            ),
-            Span::styled(shortcut_str, shortcut_style),
-        ]);
-
-        // For selected row, fill the background.
-        if is_selected {
-            let bg = Paragraph::new(Line::from(" ".repeat(row_area.width as usize)))
-                .style(Style::default().bg(theme.selection_bg));
-            frame.render_widget(bg, row_area);
-        }
-
-        frame.render_widget(Paragraph::new(line), row_area);
+        frame.render_widget(
+            Paragraph::new(result_line(cmd, selected, row.width, r)),
+            row,
+        );
     }
 }
 
-/// Create a centered `Rect` of given size within `area`.
-fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
-    let x = area.x + (area.width.saturating_sub(width)) / 2;
-    let y = area.y + (area.height.saturating_sub(height)) / 2;
-    Rect::new(x, y, width.min(area.width), height.min(area.height))
+fn result_line(cmd: Command, selected: bool, width: u16, r: &Render<'_>) -> Line<'static> {
+    let theme = r.theme;
+    let base = if selected {
+        theme.selected_row()
+    } else {
+        theme.body()
+    };
+    let shortcut = cmd.shortcut();
+    let label = cmd.label();
+
+    // Layout: edge + label + padding + shortcut.
+    let edge_w = 2usize;
+    let shortcut_w = shortcut.chars().count() + 2;
+    let label_w = (width as usize).saturating_sub(edge_w + shortcut_w);
+
+    let mut spans = Vec::with_capacity(6);
+    spans.push(Span::styled(
+        if selected {
+            format!("{} ", r.glyphs.sel_edge)
+        } else {
+            "  ".to_string()
+        },
+        if selected {
+            theme.level_style(crate::ui::theme::Level::Info)
+        } else {
+            base
+        },
+    ));
+
+    // Highlight the characters the query matched, so the ranking is explainable.
+    let query = if r.app.palette.arg.is_some() {
+        String::new()
+    } else {
+        r.app.palette.input.to_lowercase()
+    };
+    let highlight = base.fg(theme.accent_primary);
+    let truncated = r.glyphs.truncate(label, label_w);
+    let mut rendered = 0usize;
+    let mut q = query.chars().peekable();
+    let mut run = String::new();
+    let mut run_hit = false;
+    for ch in truncated.chars() {
+        let hit = q
+            .peek()
+            .is_some_and(|c| c.eq_ignore_ascii_case(&ch.to_ascii_lowercase()));
+        if hit {
+            q.next();
+        }
+        if hit != run_hit && !run.is_empty() {
+            spans.push(Span::styled(
+                std::mem::take(&mut run),
+                if run_hit { highlight } else { base },
+            ));
+        }
+        run_hit = hit;
+        run.push(ch);
+        rendered += 1;
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(run, if run_hit { highlight } else { base }));
+    }
+    spans.push(Span::styled(
+        " ".repeat(label_w.saturating_sub(rendered)),
+        base,
+    ));
+    spans.push(Span::styled(
+        format!("{shortcut:>w$}  ", w = shortcut_w.saturating_sub(2)),
+        if selected { base } else { theme.subtle() },
+    ));
+    Line::from(spans)
+}
+
+fn draw_hint(frame: &mut Frame, area: Rect, r: &Render<'_>) {
+    let hint = if r.app.command_mode() {
+        Line::from(vec![
+            Span::styled(" try ", r.theme.subtle()),
+            Span::styled("kill firefox", r.theme.dim()),
+            Span::styled("  ", r.theme.subtle()),
+            Span::styled("sort mem", r.theme.dim()),
+            Span::styled("  ", r.theme.subtle()),
+            Span::styled("theme mono", r.theme.dim()),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(" Enter ", r.theme.key()),
+            Span::styled(" run  ", r.theme.key_desc()),
+            Span::styled(" : ", r.theme.key()),
+            Span::styled(" command with arguments  ", r.theme.key_desc()),
+            Span::styled(" Esc ", r.theme.key()),
+            Span::styled(" close ", r.theme.key_desc()),
+        ])
+    };
+    frame.render_widget(Paragraph::new(hint), area);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::app::AppState;
-    use ratatui::{Terminal, backend::TestBackend};
+    use crate::app::{AppState, Overlay, Tab};
+    use crate::terminal::ColorSupport;
+    use crate::ui::test_support::*;
 
-    fn render_with(app: &AppState, width: u16, height: u16) -> ratatui::buffer::Buffer {
-        let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| {
-                crate::ui::draw_root(frame, app);
-            })
-            .unwrap();
-        terminal.backend().buffer().clone()
+    fn palette_text(app: &AppState) -> String {
+        all_text(&render_with(app, 100, 30))
     }
 
-    fn buffer_contains(buf: &ratatui::buffer::Buffer, needle: &str) -> bool {
-        let height = buf.area.height;
-        (0..height).any(|row| {
-            let width = buf.area.width;
-            let line: String = (0..width)
-                .map(|col| buf.cell((col, row)).map(|c| c.symbol()).unwrap_or(" "))
-                .collect();
-            line.contains(needle)
-        })
+    fn open(input: &str) -> AppState {
+        let mut app = app_with_data();
+        app.overlay = Overlay::Palette;
+        app.palette.input = input.to_string();
+        app.palette.refilter_ctx(&[], Some(app.tab));
+        app
     }
 
-    fn buffer_line_text(buf: &ratatui::buffer::Buffer, row: u16) -> String {
-        let width = buf.area.width;
-        (0..width)
-            .map(|col| buf.cell((col, row)).map(|c| c.symbol()).unwrap_or(" "))
-            .collect::<String>()
-            .trim_end()
-            .to_string()
-    }
-
-    // AC-10: Palette renders centered overlay
     #[test]
-    fn test_palette_renders_overlay() {
-        let mut app = AppState::new();
-        app.show_palette = true;
-        app.palette.refilter();
-        let buf = render_with(&app, 80, 24);
+    fn palette_renders_and_names_itself() {
+        let app = open("");
+        assert!(palette_text(&app).contains("Command Palette"));
+    }
+
+    #[test]
+    fn palette_lists_commands_with_their_shortcuts() {
+        let app = open("");
+        let text = palette_text(&app);
+        assert!(text.contains("Quit"));
+        assert!(text.contains("Help"));
+    }
+
+    #[test]
+    fn palette_says_when_nothing_matches() {
+        let app = open("zzzzzz");
+        assert!(palette_text(&app).contains("No matches"));
+    }
+
+    #[test]
+    fn palette_hides_argument_forms_until_their_verb_is_typed() {
+        let empty = palette_text(&open(""));
         assert!(
-            buffer_contains(&buf, "Command Palette"),
-            "Palette title should be visible"
+            !empty.contains("Kill process by name"),
+            "an argument command with no argument is noise"
+        );
+        let typed = palette_text(&open("kill firefox"));
+        assert!(typed.contains("Kill process by name"));
+    }
+
+    #[test]
+    fn palette_shows_the_parsed_argument() {
+        let text = palette_text(&open("kill firefox"));
+        assert!(
+            text.contains("firefox"),
+            "the target must be visible before Enter:\n{text}"
         );
     }
 
-    // AC-12: Empty input shows all commands
     #[test]
-    fn test_palette_shows_all_commands_when_empty() {
-        let mut app = AppState::new();
-        app.show_palette = true;
-        app.palette.refilter();
-        let buf = render_with(&app, 80, 24);
-        assert!(buffer_contains(&buf, "Quit"), "Should show Quit command");
+    fn command_mode_advertises_the_argument_forms() {
+        let mut app = open("");
+        app.overlay = Overlay::Command;
+        let text = palette_text(&app);
+        assert!(text.contains("Command"));
+        assert!(text.contains("kill firefox"), "usage hint missing:\n{text}");
+    }
+
+    #[test]
+    fn palette_ranks_the_active_tab_first() {
+        let mut app = app_with_data();
+        app.tab = Tab::Containers;
+        app.overlay = Overlay::Palette;
+        app.palette.input = "sort".to_string();
+        app.palette.refilter_ctx(&[], Some(Tab::Containers));
+        let first = app.palette.filtered.first().map(|&(c, _)| c.label());
         assert!(
-            buffer_contains(&buf, "Toggle tree view"),
-            "Should show Toggle tree view"
+            first.is_some_and(|l| l.contains("container")),
+            "on the Containers tab, a sort query should surface container sorts first, got {first:?}"
         );
     }
 
-    // AC-11: Shortcut hints shown
     #[test]
-    fn test_palette_shows_shortcuts() {
-        let mut app = AppState::new();
-        app.show_palette = true;
-        app.palette.refilter();
-        let buf = render_with(&app, 80, 24);
-        // "q" is the shortcut for Quit — but it could also be part of text
-        // Check for a more distinct shortcut
+    fn palette_offers_the_kube_commands_that_had_no_entry_before() {
+        let app = open("kube");
+        let text = palette_text(&app);
         assert!(
-            buffer_contains(&buf, "F3"),
-            "Should show F3 shortcut for Sort by CPU"
+            text.contains("namespace scope") || text.contains("Pods"),
+            "kube sub-views were unreachable from the 0.4 palette:\n{text}"
         );
     }
 
-    // AC-13: No matches message
     #[test]
-    fn test_palette_no_matches() {
-        let mut app = AppState::new();
-        app.show_palette = true;
-        app.palette.input = "zzzzz".to_string();
-        app.palette.refilter();
-        let buf = render_with(&app, 80, 24);
-        assert!(
-            buffer_contains(&buf, "No matches"),
-            "Should show 'No matches' message"
-        );
-    }
-
-    // AC-10: Centered rendering check
-    #[test]
-    fn test_palette_centered() {
-        let mut app = AppState::new();
-        app.show_palette = true;
-        app.palette.refilter();
-        let buf = render_with(&app, 80, 24);
-        // The palette should NOT start at column 0 (it's centered)
-        // Find the "Command Palette" title row
-        for row in 0..24 {
-            let line = buffer_line_text(&buf, row);
-            if line.contains("Command Palette") {
-                // Should have leading whitespace (centered)
-                assert!(
-                    line.starts_with(' '),
-                    "Palette should be centered, not left-aligned"
-                );
-                break;
-            }
+    fn palette_survives_tiny_terminals_and_ascii() {
+        let mut app = open("s");
+        for (w, h) in [(1u16, 1u16), (10, 4), (24, 8), (40, 12)] {
+            let _ = render_with(&app, w, h);
         }
-    }
-
-    // Palette does not render when show_palette is false
-    #[test]
-    fn test_palette_not_shown_when_closed() {
-        let app = AppState::new();
-        let buf = render_with(&app, 80, 24);
-        assert!(
-            !buffer_contains(&buf, "Command Palette"),
-            "Palette should not be visible when closed"
-        );
-    }
-
-    // Minimal terminal: no panic
-    #[test]
-    fn test_palette_minimal_terminal_no_panic() {
-        let mut app = AppState::new();
-        app.show_palette = true;
-        app.palette.refilter();
-        let _buf = render_with(&app, 10, 5);
-        let _buf = render_with(&app, 1, 1);
-    }
-
-    // centered_rect unit test
-    #[test]
-    fn test_centered_rect() {
-        let area = Rect::new(0, 0, 80, 24);
-        let r = centered_rect(60, 16, area);
-        assert_eq!(r.x, 10);
-        assert_eq!(r.y, 4);
-        assert_eq!(r.width, 60);
-        assert_eq!(r.height, 16);
+        let buf = render_caps(&mut app, 80, 24, ColorSupport::Basic, false);
+        assert!(all_text(&buf).is_ascii());
     }
 
     #[test]
-    fn test_centered_rect_small_area() {
-        let area = Rect::new(0, 0, 20, 10);
-        let r = centered_rect(60, 16, area);
-        // Width clamped to area width
-        assert_eq!(r.width, 20);
-        assert_eq!(r.height, 10);
+    fn palette_scrolls_to_keep_the_selection_visible() {
+        let mut app = open("");
+        app.palette.selected = app.palette.filtered.len() - 1;
+        let text = palette_text(&app);
+        let last = app.palette.filtered.last().unwrap().0.label();
+        assert!(text.contains(last), "selection scrolled out of view");
+    }
+
+    #[test]
+    fn palette_is_absent_when_closed() {
+        let app = app_with_data();
+        assert!(!palette_text(&app).contains("Command Palette"));
     }
 }
