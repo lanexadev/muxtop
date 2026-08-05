@@ -55,6 +55,8 @@ cargo build --release
 
 > MSRV: Rust **1.88**
 
+> **Platforms.** Linux and macOS (x86_64 and aarch64) are the supported targets — those are what the release pipeline publishes. The workspace also builds and passes its tests on Windows so the project can be developed there, but no Windows binaries are published and the process actions (`F7`/`F8` renice, `F9`/`F10` kill) are POSIX-only and return an error.
+
 ---
 
 ## Features
