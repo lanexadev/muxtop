@@ -26,6 +26,14 @@ k8s-openapi = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 
+# NVML has no macOS build (NVIDIA dropped Apple after Kepler), so the NVIDIA
+# backend — and its dependency — exist only where the library can be loaded.
+# The `amd_engine` module deliberately stays un-gated: it is plain file I/O,
+# and keeping it compiled everywhere keeps its parser tests running on every
+# CI target (cf. the v0.4.2 Windows build break).
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+nvml-wrapper = { workspace = true }
+
 [dev-dependencies]
 criterion = { workspace = true }
 tempfile = "3"
@@ -48,4 +56,8 @@ harness = false
 
 [[bench]]
 name = "kube_bench"
+harness = false
+
+[[bench]]
+name = "gpu_bench"
 harness = false

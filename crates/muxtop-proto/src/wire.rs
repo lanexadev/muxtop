@@ -252,6 +252,7 @@ mod tests {
             },
             containers: None,
             kube: None,
+            gpu: None,
             timestamp_ms: 1_713_200_000_000,
         }
     }
@@ -278,6 +279,99 @@ mod tests {
         // And the decoded value is bit-for-bit identical.
         let decoded = WireMessage::from_frame(&borrow_frame).unwrap();
         assert_eq!(decoded, WireMessage::Snapshot(snap));
+    }
+
+    /// The v0.5 wire break: a snapshot carrying GPU telemetry must survive
+    /// encode → decode with every `Option` intact. `None` silently becoming
+    /// `Some(0)` would make a remote client render a confident zero for a
+    /// metric the server could not measure.
+    #[test]
+    fn test_wire_snapshot_with_gpu_roundtrip() {
+        use muxtop_core::gpu::{
+            GpuBackend, GpuDeviceSnapshot, GpuProcessKind, GpuProcessSnapshot, GpuVendor,
+            GpusSnapshot,
+        };
+
+        let mut snap = make_test_snapshot();
+        snap.gpu = Some(GpusSnapshot {
+            backends: vec![GpuBackend::Nvml, GpuBackend::AmdSysfs],
+            available: true,
+            devices: vec![
+                GpuDeviceSnapshot {
+                    index: 0,
+                    vendor: GpuVendor::Nvidia,
+                    backend: GpuBackend::Nvml,
+                    name: "NVIDIA GeForce RTX 4090".into(),
+                    bus_id: "0000:01:00.0".into(),
+                    driver_version: Some("560.35.03".into()),
+                    utilization_pct: Some(73.0),
+                    mem_utilization_pct: Some(41.0),
+                    mem_used_bytes: Some(6_000_000_000),
+                    mem_total_bytes: Some(24_000_000_000),
+                    temperature_c: Some(64.0),
+                    power_watts: Some(210.5),
+                    power_limit_watts: Some(450.0),
+                    graphics_clock_mhz: Some(2520),
+                    memory_clock_mhz: Some(10501),
+                    fan_pct: Some(38.0),
+                    encoder_pct: Some(0.0),
+                    decoder_pct: Some(12.0),
+                    supports_process_stats: true,
+                },
+                // An AMD device with the metrics sysfs cannot report — the
+                // `None`s here are the point of the test.
+                GpuDeviceSnapshot {
+                    index: 1,
+                    vendor: GpuVendor::Amd,
+                    backend: GpuBackend::AmdSysfs,
+                    name: "AMD Radeon RX 7900 XTX".into(),
+                    bus_id: "0000:03:00.0".into(),
+                    driver_version: None,
+                    utilization_pct: Some(12.0),
+                    mem_utilization_pct: None,
+                    mem_used_bytes: Some(1_000_000_000),
+                    mem_total_bytes: Some(25_000_000_000),
+                    temperature_c: Some(45.0),
+                    power_watts: None,
+                    power_limit_watts: None,
+                    graphics_clock_mhz: None,
+                    memory_clock_mhz: None,
+                    fan_pct: None,
+                    encoder_pct: None,
+                    decoder_pct: None,
+                    supports_process_stats: false,
+                },
+            ],
+            processes: vec![GpuProcessSnapshot {
+                pid: 4242,
+                device_index: 0,
+                name: "ollama".into(),
+                kind: GpuProcessKind::Both,
+                mem_bytes: None,
+            }],
+            detail: String::new(),
+        });
+
+        let msg = WireMessage::Snapshot(snap.clone());
+        let frame = msg.to_frame().unwrap();
+        let decoded = WireMessage::from_frame(&frame).unwrap();
+        assert_eq!(msg, decoded);
+
+        // Spot-check the degradation contract explicitly, so a future change
+        // that defaults `None` to zero fails here with a clear message rather
+        // than only through the whole-struct equality above.
+        let WireMessage::Snapshot(out) = decoded else {
+            panic!("expected a Snapshot frame");
+        };
+        let gpu = out.gpu.expect("gpu survived the wire");
+        assert_eq!(gpu.devices[1].power_watts, None);
+        assert_eq!(gpu.devices[1].fan_pct, None);
+        assert_eq!(gpu.devices[1].driver_version, None);
+        assert!(!gpu.devices[1].supports_process_stats);
+        assert_eq!(
+            gpu.processes[0].mem_bytes, None,
+            "WDDM's 'memory unavailable' must not become 0 across the wire"
+        );
     }
 
     #[test]

@@ -253,6 +253,7 @@ mod tests {
             },
             containers: None,
             kube: None,
+            gpu: None,
             timestamp_ms: 0,
         }
     }

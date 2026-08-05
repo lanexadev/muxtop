@@ -10,7 +10,7 @@ panic = "abort"
 
 [workspace.package]
 edition = "2024"
-version = "0.4.2"
+version = "0.5.0"
 authors = ["Lucas Schimmel"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lucasschimmel/muxtop"
@@ -23,6 +23,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signa
 
 # System information
 sysinfo = "0.34"
+
+# NVIDIA GPU telemetry (v0.5). Loads libnvidia-ml.so / nvml.dll dynamically at
+# runtime via libloading, so muxtop builds and runs unchanged on hosts with no
+# NVIDIA driver. Target-gated in muxtop-core: NVML has no macOS build.
+nvml-wrapper = "0.12"
 
 # TUI
 ratatui = "0.30"
@@ -88,9 +93,9 @@ rcgen = "0.14"
 ring = "0.17"
 
 # Internal crates
-muxtop-core = { path = "crates/muxtop-core", version = "0.4.2" }
-muxtop-tui = { path = "crates/muxtop-tui", version = "0.4.2" }
-muxtop-proto = { path = "crates/muxtop-proto", version = "0.4.2" }
+muxtop-core = { path = "crates/muxtop-core", version = "0.5.0" }
+muxtop-tui = { path = "crates/muxtop-tui", version = "0.5.0" }
+muxtop-proto = { path = "crates/muxtop-proto", version = "0.5.0" }
 
 [package]
 name = "muxtop"

@@ -3,6 +3,7 @@
 mod confirm;
 mod containers;
 mod general;
+mod gpu;
 mod kube;
 mod network;
 mod palette;
@@ -23,7 +24,11 @@ use crate::app::{AppState, Tab};
 use theme::Theme;
 
 /// Labels for future tabs (not yet implemented).
-const FUTURE_TABS: &[&str] = &["GPU [soon]"];
+///
+/// Empty since v0.5 promoted GPU from placeholder to a real tab. Kept rather
+/// than deleted: the mechanism is how the tab bar advertises what is coming,
+/// and v0.6 will refill it.
+const FUTURE_TABS: &[&str] = &[];
 
 /// Render the full application layout: Header, TabBar, Content, Footer.
 pub fn draw_root(frame: &mut Frame, app: &AppState) {
@@ -123,6 +128,7 @@ fn draw_content(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
         Tab::Network => network::draw_network_tab(frame, area, app, theme),
         Tab::Containers => containers::draw_containers_tab(frame, area, app, theme),
         Tab::Kube => kube::draw_kube_tab(frame, area, app, theme),
+        Tab::Gpu => gpu::draw_gpu_tab(frame, area, app, theme),
     }
 }
 
@@ -210,6 +216,19 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
             key_hint("q", "Quit", theme),
             Span::raw(" "),
             key_hint("P/N/D", "View", theme),
+            Span::raw(" "),
+            key_hint("j/k", "Select", theme),
+            Span::raw(" "),
+            key_hint("/", "Filter", theme),
+            Span::raw(" "),
+            key_hint("s", "Sort", theme),
+            Span::raw(" "),
+            key_hint("^P", "Palette", theme),
+        ],
+        Tab::Gpu => vec![
+            key_hint("q", "Quit", theme),
+            Span::raw(" "),
+            key_hint("D/P", "View", theme),
             Span::raw(" "),
             key_hint("j/k", "Select", theme),
             Span::raw(" "),
@@ -383,14 +402,48 @@ mod tests {
         }
     }
 
+    /// Every real tab is advertised in the bar, and nothing is left marked
+    /// `[soon]`. v0.5 emptied `FUTURE_TABS` by shipping the GPU tab; a stale
+    /// placeholder alongside the real tab would be worse than none.
     #[test]
-    fn test_tabbar_future_tabs_shown_grayed() {
+    fn test_tabbar_lists_every_real_tab_and_no_stale_placeholder() {
         let app = AppState::new();
-        let buf = render_with(&app, 120, 24); // wider to fit all tabs
+        let buf = render_with(&app, 140, 24); // wide enough to fit all tabs
+        for tab in Tab::ALL {
+            assert!(
+                buffer_contains(&buf, tab.label()),
+                "TabBar should show the {} tab",
+                tab.label()
+            );
+        }
         assert!(
-            buffer_contains(&buf, "[soon]"),
-            "TabBar should show '[soon]' for future tabs"
+            !buffer_contains(&buf, "[soon]"),
+            "no tab should still be marked [soon] while it is implemented"
         );
+    }
+
+    #[test]
+    fn test_gpu_tab_renders_and_shows_hints() {
+        let mut app = AppState::new();
+        app.tab = Tab::Gpu;
+        let buf = render_with(&app, 100, 24);
+        assert!(
+            buffer_contains(&buf, "Waiting for GPU data"),
+            "GPU tab should show the waiting message before the first snapshot"
+        );
+        let footer = buffer_line_text(&buf, 23);
+        assert!(footer.contains("Quit"), "GPU footer should contain Quit");
+        assert!(footer.contains("Sort"), "GPU footer should contain Sort");
+        assert!(footer.contains("View"), "GPU footer should contain View");
+    }
+
+    #[test]
+    fn test_gpu_tab_renders_at_extreme_sizes() {
+        let mut app = AppState::new();
+        app.tab = Tab::Gpu;
+        let _buf = render_with(&app, 1, 1);
+        let _buf = render_with(&app, 80, 2);
+        let _buf = render_with(&app, 10, 5);
     }
 
     // -- STORY-05: Content stubs --
@@ -441,6 +494,7 @@ mod tests {
             },
             containers: None,
             kube: None,
+            gpu: None,
             timestamp_ms: 0,
         };
 
@@ -584,6 +638,7 @@ mod tests {
             },
             containers: None,
             kube: None,
+            gpu: None,
             timestamp_ms: 0,
         };
 
@@ -662,6 +717,7 @@ mod tests {
             },
             containers: None,
             kube: None,
+            gpu: None,
             timestamp_ms: 0,
         };
 
@@ -720,6 +776,7 @@ mod tests {
             },
             containers: None,
             kube: None,
+            gpu: None,
             timestamp_ms: 0,
         };
 
