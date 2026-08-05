@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The workspace compiles on Windows again (`muxtop-core`)** — `actions.rs` called `libc::kill`, `libc::setpriority`, `libc::getpriority`, `libc::SIGKILL`, `libc::PRIO_PROCESS` and `libc::id_t` with no `cfg(unix)` gate. None of those exist in `libc` on Windows, so the whole of `muxtop-core` failed to build there and took every dependent crate with it — no `cargo check`, no `cargo test`, no way to work on any part of muxtop from a Windows machine. The POSIX implementations are now gated behind `cfg(unix)`, with `cfg(not(unix))` stubs of identical signature that fail with `ErrorKind::Unsupported`. PID validation was extracted into a shared `validate_pid` that runs *before* the platform split, so the safety guarantees (no `kill(-1, …)`, no `kill(0, …)`) hold and stay tested on every platform.
+
+  This is a build fix, not Windows support: `release.yml` still publishes musl and darwin binaries only, and F7/F8/F9/F10 return an error there rather than acting.
+
+### Changed
+
+- **CI runs the test suite on `windows-latest`** as a regression guard. The break above survived two releases precisely because nothing in the pipeline ever compiled the workspace on Windows.
+
 ### Added
 
 - **Real namespace scoping for the Kubernetes tab (`muxtop-core`, `muxtop-tui`, `muxtop`, `muxtop-server`)** — `--kube-namespace <NS>` now scopes the actual API calls: Pods and Deployments are listed through `Api::namespaced` instead of `Api::all`, and pod metrics move to `/apis/metrics.k8s.io/v1beta1/namespaces/{ns}/pods`. A `Role` bound to one namespace is now sufficient to use the tab — previously muxtop required cluster-scoped `list` on all three resources, which locked out anyone without cluster-wide RBAC. Without the flag the behaviour is unchanged (cluster-wide), so existing setups are unaffected.
