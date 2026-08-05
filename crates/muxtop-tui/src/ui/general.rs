@@ -398,6 +398,50 @@ fn draw_workloads(frame: &mut Frame, area: Rect, r: &Render<'_>, snapshot: &Syst
         }
     });
 
+    // The GPU line is a genuine summary rather than a device count: on a
+    // single-card host the utilisation is the thing worth glancing at.
+    lines.push(match snapshot.gpu.as_ref() {
+        None => row("GPU", "not probed".into(), Level::Neutral, r),
+        Some(g) if !g.available => row("GPU", "none detected".into(), Level::Neutral, r),
+        Some(g) => match g.devices.as_slice() {
+            [] => row("GPU", "none detected".into(), Level::Neutral, r),
+            [only] => row(
+                "GPU",
+                format!(
+                    "{} {} {}",
+                    scrub_ctrl(&only.name),
+                    r.glyphs.sep,
+                    super::gpu::device_summary(only, r.glyphs)
+                ),
+                super::gpu::device_level(only),
+                r,
+            ),
+            many => {
+                // Several cards: report the busiest, since that is the one
+                // that would explain a slowdown.
+                let busiest = many
+                    .iter()
+                    .max_by(|a, b| {
+                        a.utilization_pct
+                            .unwrap_or(-1.0)
+                            .total_cmp(&b.utilization_pct.unwrap_or(-1.0))
+                    })
+                    .expect("non-empty");
+                row(
+                    "GPU",
+                    format!(
+                        "{} devices {} busiest {}",
+                        many.len(),
+                        r.glyphs.sep,
+                        super::gpu::device_summary(busiest, r.glyphs)
+                    ),
+                    super::gpu::device_level(busiest),
+                    r,
+                )
+            }
+        },
+    });
+
     let visible: Vec<Line<'static>> = lines.into_iter().take(inner.height as usize).collect();
     frame.render_widget(Paragraph::new(visible), inner);
 }

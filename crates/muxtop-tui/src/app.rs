@@ -1811,6 +1811,9 @@ impl AppState {
             // -- kubernetes --
             Action::KubeSubview(sv) => self.switch_kube_subview(sv),
             Action::ToggleKubeScope => self.toggle_kube_scope(),
+
+            // -- gpu --
+            Action::GpuSubview(sv) => self.switch_gpu_subview(sv),
         }
     }
 
@@ -1839,20 +1842,31 @@ impl AppState {
     /// `[` / `]` — walk the active tab's sub-views. Only Kubernetes has any
     /// today; the action exists so future tabs inherit the binding for free.
     fn cycle_subview(&mut self, delta: isize) {
-        if self.tab != Tab::Kube {
-            return;
+        match self.tab {
+            Tab::Kube => {
+                const ORDER: [KubeSubview; 3] = [
+                    KubeSubview::Pods,
+                    KubeSubview::Nodes,
+                    KubeSubview::Deployments,
+                ];
+                let idx = ORDER
+                    .iter()
+                    .position(|&s| s == self.kube_subview)
+                    .unwrap_or(0) as isize;
+                let next = (idx + delta).rem_euclid(ORDER.len() as isize) as usize;
+                self.switch_kube_subview(ORDER[next]);
+            }
+            Tab::Gpu => {
+                const ORDER: [GpuSubview; 2] = [GpuSubview::Devices, GpuSubview::Procs];
+                let idx = ORDER
+                    .iter()
+                    .position(|&s| s == self.gpu_subview)
+                    .unwrap_or(0) as isize;
+                let next = (idx + delta).rem_euclid(ORDER.len() as isize) as usize;
+                self.switch_gpu_subview(ORDER[next]);
+            }
+            _ => {}
         }
-        const ORDER: [KubeSubview; 3] = [
-            KubeSubview::Pods,
-            KubeSubview::Nodes,
-            KubeSubview::Deployments,
-        ];
-        let idx = ORDER
-            .iter()
-            .position(|&s| s == self.kube_subview)
-            .unwrap_or(0) as isize;
-        let next = (idx + delta).rem_euclid(ORDER.len() as isize) as usize;
-        self.switch_kube_subview(ORDER[next]);
     }
 
     /// Move the cursor by `delta` rows, clamped to the list.
@@ -1899,6 +1913,7 @@ impl AppState {
     /// Whether the active tab's filter input has the keyboard.
     pub fn filter_editing(&self) -> bool {
         match self.tab {
+            Tab::Gpu => self.gpu_filter_active,
             Tab::Network => self.net_filter_active,
             Tab::Containers => self.containers_filter_active,
             Tab::Kube => self.kube_filter_active,
@@ -1909,6 +1924,7 @@ impl AppState {
     /// The active tab's filter text.
     pub fn filter_text(&self) -> &str {
         match self.tab {
+            Tab::Gpu => &self.gpu_filter_input,
             Tab::Network => &self.net_filter_input,
             Tab::Containers => &self.containers_filter_input,
             Tab::Kube => &self.kube_filter_input,
@@ -1918,6 +1934,7 @@ impl AppState {
 
     fn set_filter_editing(&mut self, on: bool) {
         match self.tab {
+            Tab::Gpu => self.gpu_filter_active = on,
             Tab::Network => self.net_filter_active = on,
             Tab::Containers => self.containers_filter_active = on,
             Tab::Kube => self.kube_filter_active = on,
@@ -1927,6 +1944,7 @@ impl AppState {
 
     fn filter_text_mut(&mut self) -> &mut String {
         match self.tab {
+            Tab::Gpu => &mut self.gpu_filter_input,
             Tab::Network => &mut self.net_filter_input,
             Tab::Containers => &mut self.containers_filter_input,
             Tab::Kube => &mut self.kube_filter_input,
@@ -1954,8 +1972,7 @@ impl AppState {
     fn after_filter_change(&mut self, immediate: bool) {
         match self.tab {
             Tab::Containers => self.recompute_containers_view(),
-            Tab::Kube => {}
-            Tab::Network => {}
+            Tab::Kube | Tab::Gpu | Tab::Network => {}
             _ => {
                 if immediate {
                     self.last_filter_change = None;
@@ -2020,6 +2037,11 @@ impl AppState {
                 self.kube_selected = 0;
                 self.kube_scroll_offset = 0;
             }
+            Tab::Gpu => {
+                self.gpu_sort_field = next_gpu_sort_field(self.gpu_sort_field, self.gpu_subview);
+                self.gpu_selected = 0;
+                self.gpu_scroll_offset = 0;
+            }
             _ => {
                 self.sort_field = next_sort_field(self.sort_field);
                 self.recompute_visible();
@@ -2039,6 +2061,7 @@ impl AppState {
                 self.recompute_containers_view();
             }
             Tab::Kube => self.kube_sort_order = flip(self.kube_sort_order),
+            Tab::Gpu => self.gpu_sort_order = flip(self.gpu_sort_order),
             _ => {
                 self.sort_order = flip(self.sort_order);
                 self.recompute_visible();
@@ -2063,6 +2086,7 @@ impl AppState {
                 .get(self.containers_selected)
                 .map(|c| c.id_full.clone()),
             Tab::Kube => self.selected_kube_name(),
+            Tab::Gpu => self.selected_gpu_name(),
             _ => self.selected_process().map(|p| p.pid.to_string()),
         }
     }
@@ -2108,6 +2132,27 @@ impl AppState {
                 .filter(|d| matches(&d.name, &d.namespace))
                 .nth(self.kube_selected)
                 .map(|d| d.name.clone()),
+        }
+    }
+
+    /// Identifier of the selected GPU row: the device's name, or the PID of
+    /// the process holding VRAM.
+    fn selected_gpu_name(&self) -> Option<String> {
+        let snap = self.last_snapshot.as_ref()?.gpu.as_ref()?;
+        let f = self.gpu_filter_input.to_lowercase();
+        match self.gpu_subview {
+            GpuSubview::Devices => snap
+                .devices
+                .iter()
+                .filter(|d| f.is_empty() || d.name.to_lowercase().contains(&f))
+                .nth(self.gpu_selected)
+                .map(|d| d.name.clone()),
+            GpuSubview::Procs => snap
+                .processes
+                .iter()
+                .filter(|p| f.is_empty() || p.name.to_lowercase().contains(&f))
+                .nth(self.gpu_selected)
+                .map(|p| p.pid.to_string()),
         }
     }
 
@@ -3410,7 +3455,11 @@ mod tests {
         app.handle_key_event(key(KeyCode::BackTab));
         assert_eq!(app.tab, Tab::General);
         app.handle_key_event(key(KeyCode::BackTab));
-        assert_eq!(app.tab, Tab::Kube, "cycling wraps");
+        assert_eq!(
+            app.tab,
+            *Tab::ALL.last().unwrap(),
+            "cycling wraps to the last tab, whatever it is"
+        );
     }
 
     // -- Mouse handling (STORY-04) --

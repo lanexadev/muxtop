@@ -11,7 +11,7 @@
 
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use crate::app::{KubeSubview, Tab};
+use crate::app::{GpuSubview, KubeSubview, Tab};
 use muxtop_core::actions::Signal;
 
 /// Everything the user can ask muxtop to do.
@@ -67,6 +67,9 @@ pub enum Action {
     // -- kubernetes --
     KubeSubview(KubeSubview),
     ToggleKubeScope,
+
+    // -- gpu --
+    GpuSubview(GpuSubview),
 }
 
 impl Action {
@@ -349,6 +352,29 @@ pub const BINDINGS: &[Binding] = &[
         true,
         true
     ),
+    // ---------------- tab-scoped: GPU ----------------
+    b!(
+        KeyCode::Char('D'),
+        NONE,
+        Action::GpuSubview(GpuSubview::Devices),
+        Scope::Tab(Tab::Gpu),
+        Group::Navigation,
+        "D",
+        "Devices sub-view",
+        true,
+        true
+    ),
+    b!(
+        KeyCode::Char('P'),
+        NONE,
+        Action::GpuSubview(GpuSubview::Procs),
+        Scope::Tab(Tab::Gpu),
+        Group::Navigation,
+        "P",
+        "Processes sub-view",
+        false,
+        true
+    ),
     // ---------------- global: application ----------------
     b!(
         KeyCode::Char('q'),
@@ -535,6 +561,17 @@ pub const BINDINGS: &[Binding] = &[
         Group::Navigation,
         "Alt+5",
         "Kubernetes tab",
+        false,
+        true
+    ),
+    b!(
+        KeyCode::Char('6'),
+        ALT,
+        Action::GoTab(Tab::Gpu),
+        Scope::Global,
+        Group::Navigation,
+        "Alt+6",
+        "GPU tab",
         false,
         true
     ),

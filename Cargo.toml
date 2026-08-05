@@ -10,7 +10,7 @@ panic = "abort"
 
 [workspace.package]
 edition = "2024"
-version = "0.5.0"
+version = "0.5.1"
 authors = ["Lucas Schimmel"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lucasschimmel/muxtop"

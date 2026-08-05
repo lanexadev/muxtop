@@ -127,6 +127,113 @@ fn details(r: &Render<'_>) -> Option<(String, Vec<Row>)> {
         Tab::Network => network_details(app, r),
         Tab::Containers => container_details(app, r),
         Tab::Kube => kube_details(app, r),
+        Tab::Gpu => gpu_details(app, r),
+    }
+}
+
+/// Detail rows for the selected GPU device or process.
+///
+/// Every optional metric renders the "unavailable" dash rather than a zero:
+/// on GPUs those are genuinely different statements, and the inspector is
+/// where a user goes to find out which one they are looking at.
+fn gpu_details(app: &AppState, r: &Render<'_>) -> Option<(String, Vec<Row>)> {
+    use crate::app::GpuSubview;
+    let snap = app.last_snapshot.as_ref()?.gpu.as_ref()?;
+    let f = app.gpu_filter_input.to_lowercase();
+    let dash = || r.glyphs.none.to_string();
+
+    match app.gpu_subview {
+        GpuSubview::Devices => {
+            let d = snap
+                .devices
+                .iter()
+                .filter(|d| f.is_empty() || d.name.to_lowercase().contains(&f))
+                .nth(app.gpu_selected)?;
+            let mut rows = vec![
+                Row::Kv("Index".into(), d.index.to_string()),
+                Row::Kv("Bus".into(), scrub_ctrl(&d.bus_id).into_owned()),
+                Row::Kv(
+                    "Driver".into(),
+                    d.driver_version
+                        .as_deref()
+                        .map_or_else(dash, |v| scrub_ctrl(v).into_owned()),
+                ),
+                Row::Section("LOAD".into()),
+            ];
+            if let Some(p) = d.utilization_pct {
+                rows.push(Row::Meter("GPU".into(), f64::from(p), format!("{p:.0}%")));
+            } else {
+                rows.push(Row::Kv("GPU".into(), dash()));
+            }
+            match (d.mem_used_bytes, d.mem_total_bytes) {
+                (Some(used), Some(total)) if total > 0 => rows.push(Row::Meter(
+                    "VRAM".into(),
+                    used as f64 / total as f64 * 100.0,
+                    format!(
+                        "{} / {}",
+                        meter::human_bytes(used),
+                        meter::human_bytes(total)
+                    ),
+                )),
+                _ => rows.push(Row::Kv("VRAM".into(), dash())),
+            }
+            rows.push(Row::Section("PHYSICAL".into()));
+            rows.push(Row::Kv(
+                "Temperature".into(),
+                d.temperature_c.map_or_else(dash, |t| format!("{t:.0} C")),
+            ));
+            rows.push(Row::Kv(
+                "Power".into(),
+                match (d.power_watts, d.power_limit_watts) {
+                    (Some(w), Some(l)) => format!("{w:.0} W / {l:.0} W"),
+                    (Some(w), None) => format!("{w:.0} W"),
+                    _ => dash(),
+                },
+            ));
+            rows.push(Row::Kv(
+                "Fan".into(),
+                d.fan_pct.map_or_else(dash, |f| format!("{f:.0}%")),
+            ));
+            rows.push(Row::Kv(
+                "Graphics clock".into(),
+                d.graphics_clock_mhz
+                    .map_or_else(dash, |c| format!("{c} MHz")),
+            ));
+            rows.push(Row::Kv(
+                "Memory clock".into(),
+                d.memory_clock_mhz.map_or_else(dash, |c| format!("{c} MHz")),
+            ));
+            if !d.supports_process_stats {
+                rows.push(Row::Section("NOTE".into()));
+                rows.push(Row::Wrapped(
+                    "".into(),
+                    "This backend reports no per-process usage.".into(),
+                ));
+            }
+            Some((r.titled("GPU", &scrub_ctrl(&d.name)), rows))
+        }
+        GpuSubview::Procs => {
+            let p = snap
+                .processes
+                .iter()
+                .filter(|p| f.is_empty() || p.name.to_lowercase().contains(&f))
+                .nth(app.gpu_selected)?;
+            let rows = vec![
+                Row::Kv("PID".into(), p.pid.to_string()),
+                Row::Kv("Device".into(), p.device_index.to_string()),
+                Row::Kv("Type".into(), format!("{:?}", p.kind)),
+                Row::Kv(
+                    "VRAM".into(),
+                    p.mem_bytes.map_or_else(dash, meter::human_bytes),
+                ),
+            ];
+            let name = if p.name.is_empty() {
+                dash()
+            } else {
+                scrub_ctrl(&p.name).into_owned()
+            };
+            Some((r.titled("GPU process", &name), rows))
+        }
     }
 }
 

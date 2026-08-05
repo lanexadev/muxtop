@@ -185,6 +185,11 @@ fn tab_available(app: &AppState, tab: Tab) -> bool {
             .as_ref()
             .and_then(|s| s.kube.as_ref())
             .is_some_and(|k| k.reachable),
+        Tab::Gpu => app
+            .last_snapshot
+            .as_ref()
+            .and_then(|s| s.gpu.as_ref())
+            .is_some_and(|g| g.available),
         _ => true,
     }
 }
@@ -199,6 +204,7 @@ fn tab_count(app: &AppState, tab: Tab) -> Option<usize> {
         Tab::Network => Some(app.net_interface_count()),
         Tab::Containers => tab_available(app, tab).then(|| app.containers_count()),
         Tab::Kube => tab_available(app, tab).then(|| app.kube_count()),
+        Tab::Gpu => tab_available(app, tab).then(|| app.gpu_count()),
     }
 }
 
@@ -365,6 +371,7 @@ fn selection_of(app: &AppState) -> (usize, usize) {
         Tab::Network => (app.net_selected, app.net_scroll_offset),
         Tab::Containers => (app.containers_selected, app.containers_scroll_offset),
         Tab::Kube => (app.kube_selected, app.kube_scroll_offset),
+        Tab::Gpu => (app.gpu_selected, app.gpu_scroll_offset),
         _ => (app.selected, app.scroll_offset),
     }
 }
@@ -375,13 +382,14 @@ fn sort_descending(app: &AppState) -> bool {
         Tab::Network => app.net_sort_order,
         Tab::Containers => app.containers_sort_order,
         Tab::Kube => app.kube_sort_order,
+        Tab::Gpu => app.gpu_sort_order,
         _ => app.sort_order,
     };
     matches!(order, SortOrder::Desc)
 }
 
 fn sort_label(app: &AppState) -> &'static str {
-    use crate::app::{ContainerSortField, KubeSortField, NetworkSortField};
+    use crate::app::{ContainerSortField, GpuSortField, KubeSortField, NetworkSortField};
     use muxtop_core::process::SortField;
     match app.tab {
         Tab::Network => match app.net_sort_field {
@@ -399,6 +407,16 @@ fn sort_label(app: &AppState) -> &'static str {
             ContainerSortField::NetRx => "rx",
             ContainerSortField::NetTx => "tx",
             ContainerSortField::Uptime => "uptime",
+        },
+        Tab::Gpu => match app.gpu_sort_field {
+            GpuSortField::DeviceIndex => "index",
+            GpuSortField::DeviceName | GpuSortField::ProcName => "name",
+            GpuSortField::DeviceUtil => "util",
+            GpuSortField::DeviceMem | GpuSortField::ProcMem => "vram",
+            GpuSortField::DeviceTemp => "temp",
+            GpuSortField::DevicePower => "power",
+            GpuSortField::ProcPid => "pid",
+            GpuSortField::ProcDevice => "device",
         },
         Tab::Kube => match app.kube_sort_field {
             KubeSortField::PodName | KubeSortField::NodeName | KubeSortField::DeployName => "name",
