@@ -5,6 +5,7 @@ use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
 use crate::containers::ContainersSnapshot;
+use crate::gpu::GpusSnapshot;
 use crate::kube::KubeSnapshot;
 use crate::network::NetworkSnapshot;
 use crate::process::ProcessInfo;
@@ -79,11 +80,17 @@ pub struct LoadSnapshot {
 /// Once set, it is `Some(ContainersSnapshot::unavailable())` to report
 /// engine failure or `Some(..)` with the current fleet.
 ///
-/// `kube` follows the exact same convention for the v0.4 cluster engine.
+/// `kube` follows the exact same convention for the v0.4 cluster engine, and
+/// `gpu` for the v0.5 GPU engine.
 ///
 /// **Wire-protocol break (v0.4):** the `kube` field is appended to the
 /// struct after `containers`, before `timestamp_ms`. bincode is order-
 /// sensitive, so this is incompatible with v0.3.x clients.
+///
+/// **Wire-protocol break (v0.5):** the `gpu` field is appended after `kube`,
+/// still before `timestamp_ms`. Same consequence — a v0.4.x client decoding a
+/// v0.5 frame reads the GPU bytes as its `timestamp_ms` and fails. Client and
+/// server must match on the minor version.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct SystemSnapshot {
     pub cpu: CpuSnapshot,
@@ -93,6 +100,7 @@ pub struct SystemSnapshot {
     pub networks: NetworkSnapshot,
     pub containers: Option<ContainersSnapshot>,
     pub kube: Option<KubeSnapshot>,
+    pub gpu: Option<GpusSnapshot>,
     /// Milliseconds since Unix epoch.
     pub timestamp_ms: u64,
 }
@@ -103,11 +111,18 @@ impl SystemSnapshot {
     /// `containers` and `kube` are passed through verbatim: callers either
     /// supply the latest snapshot from their engines (via [`crate::Collector`])
     /// or `None` when running without one.
+    ///
+    /// `gpu` is the one exception — it is passed through *enriched*. GPU
+    /// backends report process IDs but no names, and this function already
+    /// holds a freshly-refreshed process table for the Processes tab, so
+    /// resolving PID → name here costs a hash lookup per GPU process instead
+    /// of a second full enumeration inside the backend.
     pub fn collect(
         sys: &sysinfo::System,
         networks: &sysinfo::Networks,
         containers: Option<ContainersSnapshot>,
         kube: Option<KubeSnapshot>,
+        gpu: Option<GpusSnapshot>,
     ) -> Self {
         use sysinfo::System as SysSystem;
 
@@ -192,6 +207,18 @@ impl SystemSnapshot {
 
         let networks = NetworkSnapshot::collect(networks);
 
+        // Resolve GPU process names against the table we just refreshed. The
+        // lookup goes through `sysinfo` rather than the `processes` vec above
+        // so it stays O(1) per PID instead of a linear scan of every process
+        // on the host for each GPU client.
+        let gpu = gpu.map(|mut g| {
+            g.resolve_process_names(|pid| {
+                sys.process(sysinfo::Pid::from_u32(pid))
+                    .map(|p| p.name().to_string_lossy().into_owned())
+            });
+            g
+        });
+
         Self {
             cpu,
             memory,
@@ -200,6 +227,7 @@ impl SystemSnapshot {
             networks,
             containers,
             kube,
+            gpu,
             timestamp_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system clock before Unix epoch")
@@ -232,7 +260,7 @@ mod tests {
         sys.refresh_all();
 
         let networks = sysinfo::Networks::new_with_refreshed_list();
-        let snap = SystemSnapshot::collect(&sys, &networks, None, None);
+        let snap = SystemSnapshot::collect(&sys, &networks, None, None, None);
         assert!(!snap.cpu.cores.is_empty(), "should have CPU cores");
         assert!(snap.memory.total > 0, "should have total memory");
         assert!(!snap.processes.is_empty(), "should have processes");
@@ -246,7 +274,7 @@ mod tests {
         sys.refresh_all();
 
         let networks = sysinfo::Networks::new_with_refreshed_list();
-        let snap = SystemSnapshot::collect(&sys, &networks, None, None);
+        let snap = SystemSnapshot::collect(&sys, &networks, None, None, None);
         assert!(
             snap.cpu.global_usage >= 0.0 && snap.cpu.global_usage <= 100.0,
             "global CPU usage should be 0..=100, got {}",
@@ -268,7 +296,7 @@ mod tests {
         sys.refresh_all();
 
         let networks = sysinfo::Networks::new_with_refreshed_list();
-        let snap = SystemSnapshot::collect(&sys, &networks, None, None);
+        let snap = SystemSnapshot::collect(&sys, &networks, None, None, None);
         assert!(snap.memory.total > 0, "total memory should be positive");
         // used + available can slightly exceed total due to kernel accounting
         // but total should be >= used
@@ -288,7 +316,7 @@ mod tests {
         sys.refresh_all();
         let networks = sysinfo::Networks::new_with_refreshed_list();
 
-        let snap = SystemSnapshot::collect(&sys, &networks, None, None);
+        let snap = SystemSnapshot::collect(&sys, &networks, None, None, None);
         assert!(
             !snap.networks.interfaces.is_empty(),
             "should have network interfaces"
@@ -314,6 +342,45 @@ mod tests {
         assert_eq!(core_name(0), "cpu0");
         assert_eq!(core_name(7), "cpu7");
         assert_eq!(core_name(0), "cpu0"); // hits the fast path
+    }
+
+    #[test]
+    fn test_collect_resolves_gpu_process_names() {
+        use crate::gpu::{GpuProcessKind, GpuProcessSnapshot, GpusSnapshot};
+        use sysinfo::System;
+
+        let mut sys = System::new_all();
+        sys.refresh_all();
+        let networks = sysinfo::Networks::new_with_refreshed_list();
+
+        // Our own PID is guaranteed to be in the table we just refreshed.
+        let own_pid = std::process::id();
+        let mut gpu = GpusSnapshot::unavailable();
+        gpu.processes.push(GpuProcessSnapshot {
+            pid: own_pid,
+            device_index: 0,
+            name: String::new(),
+            kind: GpuProcessKind::Compute,
+            mem_bytes: Some(4096),
+        });
+
+        let snap = SystemSnapshot::collect(&sys, &networks, None, None, Some(gpu));
+        let resolved = snap.gpu.expect("gpu passed through");
+        assert!(
+            !resolved.processes[0].name.is_empty(),
+            "collect() should have named the current process"
+        );
+    }
+
+    #[test]
+    fn test_collect_without_gpu_keeps_field_none() {
+        use sysinfo::System;
+        let mut sys = System::new_all();
+        sys.refresh_all();
+        let networks = sysinfo::Networks::new_with_refreshed_list();
+
+        let snap = SystemSnapshot::collect(&sys, &networks, None, None, None);
+        assert!(snap.gpu.is_none());
     }
 
     #[test]

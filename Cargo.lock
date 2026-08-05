@@ -1828,6 +1828,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52ff2c0fe9bc6cb6b14a0592c2ff4fa9ceb83eea9db979b0487cd054946a2b8f"
 
 [[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "libredox"
 version = "0.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1968,7 +1978,7 @@ dependencies = [
 
 [[package]]
 name = "muxtop"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1988,7 +1998,7 @@ dependencies = [
 
 [[package]]
 name = "muxtop-core"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "bincode",
@@ -2000,6 +2010,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "libc",
+ "nvml-wrapper",
  "serde",
  "serde_json",
  "sysinfo",
@@ -2012,7 +2023,7 @@ dependencies = [
 
 [[package]]
 name = "muxtop-proto"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "bincode",
  "criterion",
@@ -2031,7 +2042,7 @@ dependencies = [
 
 [[package]]
 name = "muxtop-server"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2057,7 +2068,7 @@ dependencies = [
 
 [[package]]
 name = "muxtop-tui"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "criterion",
  "crossterm",
@@ -2186,6 +2197,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c7398b9c8b70908f6371f47ed36737907c87c52af34c268fed0bf0ceb92ead9"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "nvml-wrapper"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f049ae562349fefb8e837eb15443da1e7c6dcbd8a11f52a228f92220c2e5c85e"
+dependencies = [
+ "bitflags 2.11.0",
+ "libloading",
+ "nvml-wrapper-sys",
+ "static_assertions",
+ "thiserror 1.0.69",
+ "wrapcenum-derive",
+]
+
+[[package]]
+name = "nvml-wrapper-sys"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b4d594420fcda43b1c2c4bd44d48974aa3c7a9ab2cbf10dc18e35265767bf0b"
+dependencies = [
+ "libloading",
 ]
 
 [[package]]
@@ -4162,6 +4196,18 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
+]
+
+[[package]]
+name = "wrapcenum-derive"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a76ff259533532054cfbaefb115c613203c73707017459206380f03b3b3f266e"
+dependencies = [
+ "darling",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]

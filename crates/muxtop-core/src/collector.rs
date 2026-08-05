@@ -1,8 +1,8 @@
 // Async collection loop (tokio task).
 //
-// Three concurrent loops:
+// Four concurrent loops:
 //  - System loop (configurable tick, default 1 Hz) — produces `SystemSnapshot`s
-//    to the mpsc channel. Each tick reads the latest container + kube
+//    to the mpsc channel. Each tick reads the latest container + kube + gpu
 //    snapshots (if any) and embeds them into the emitted `SystemSnapshot`.
 //  - Container loop (0.5 Hz, only if an engine is provided) — calls
 //    `ContainerEngine::list_and_stats()` and writes the result into a shared
@@ -14,6 +14,10 @@
 //    `KubeSnapshot::unavailable()`. Note that the engine's own internal
 //    poll task drives kube-rs LIST/metrics traffic; this collector loop
 //    just samples the engine's already-cached state every 5 s.
+//  - GPU loop (1 Hz, only if a GPU engine is provided) — calls
+//    `GpuEngine::snapshot()` and writes the result into a shared
+//    `Arc<Mutex<Option<GpusSnapshot>>>`. On error, publishes
+//    `GpusSnapshot::unavailable()`.
 //
 // All loops share a single `CancellationToken`. Shutdown is cooperative.
 
@@ -28,6 +32,8 @@ use tokio_util::sync::CancellationToken;
 use crate::cluster_engine::ClusterEngine;
 use crate::container_engine::ContainerEngine;
 use crate::containers::ContainersSnapshot;
+use crate::gpu::GpusSnapshot;
+use crate::gpu_engine::GpuEngine;
 use crate::kube::KubeSnapshot;
 use crate::system::SystemSnapshot;
 
@@ -41,18 +47,30 @@ const CONTAINER_INTERVAL: Duration = Duration::from_secs(2);
 /// task interval (see ADR-05 v0.4 in `forge/32-v04-kubernetes-epics/`).
 const CLUSTER_INTERVAL: Duration = Duration::from_secs(5);
 
+/// GPU snapshot cadence — deliberately the fastest of the three engine loops.
+///
+/// NVML computes `utilization_rates` over an internal window of roughly one
+/// second. Sampling slower than that aliases the signal: a GPU pinned at
+/// 100 % renders as an erratic sawtooth because each poll lands on a
+/// different part of the driver's window. The cost is bounded — an NVML
+/// device query is sub-millisecond and the AMD backend reads a handful of
+/// small sysfs files — so matching the driver's own cadence is the cheap
+/// correct choice rather than a performance trade-off.
+const GPU_INTERVAL: Duration = Duration::from_secs(1);
+
 pub struct Collector {
     sys: sysinfo::System,
     networks: sysinfo::Networks,
     interval: Duration,
     container_engine: Option<Arc<dyn ContainerEngine + Send + Sync>>,
     cluster_engine: Option<Arc<dyn ClusterEngine + Send + Sync>>,
+    gpu_engine: Option<Arc<dyn GpuEngine + Send + Sync>>,
 }
 
 impl Collector {
     /// Create a collector that only gathers system snapshots.
     pub fn new(interval: Duration) -> Self {
-        Self::with_engines(interval, None, None)
+        Self::with_all_engines(interval, None, None, None)
     }
 
     /// Create a collector that also polls a container engine.
@@ -63,17 +81,33 @@ impl Collector {
         interval: Duration,
         container_engine: Option<Arc<dyn ContainerEngine + Send + Sync>>,
     ) -> Self {
-        Self::with_engines(interval, container_engine, None)
+        Self::with_all_engines(interval, container_engine, None, None)
     }
 
     /// Create a collector with both container and cluster engines.
     ///
     /// Either side can be `None` independently. The emitted snapshot's
     /// `containers` / `kube` fields stay `None` for the disabled side.
+    ///
+    /// Retained for callers predating v0.5; [`Self::with_all_engines`] is the
+    /// full constructor.
     pub fn with_engines(
         interval: Duration,
         container_engine: Option<Arc<dyn ContainerEngine + Send + Sync>>,
         cluster_engine: Option<Arc<dyn ClusterEngine + Send + Sync>>,
+    ) -> Self {
+        Self::with_all_engines(interval, container_engine, cluster_engine, None)
+    }
+
+    /// Create a collector with every optional engine attached (v0.5).
+    ///
+    /// Each engine is independently optional; the corresponding
+    /// `SystemSnapshot` field stays `None` for a disabled side.
+    pub fn with_all_engines(
+        interval: Duration,
+        container_engine: Option<Arc<dyn ContainerEngine + Send + Sync>>,
+        cluster_engine: Option<Arc<dyn ClusterEngine + Send + Sync>>,
+        gpu_engine: Option<Arc<dyn GpuEngine + Send + Sync>>,
     ) -> Self {
         Self {
             sys: sysinfo::System::new_all(),
@@ -81,6 +115,7 @@ impl Collector {
             interval,
             container_engine,
             cluster_engine,
+            gpu_engine,
         }
     }
 
@@ -131,6 +166,17 @@ impl Collector {
         };
         let last_kube: Arc<Mutex<Option<KubeSnapshot>>> = Arc::new(Mutex::new(initial_kube));
 
+        // Same three-state semantic for the GPU slot. `--no-gpu` and the
+        // remote client both arrive here with no engine, and seeding
+        // `Some(unavailable)` makes the tab say "no GPU" straight away
+        // instead of "Waiting…" forever.
+        let initial_gpu = if self.gpu_engine.is_some() {
+            None
+        } else {
+            Some(GpusSnapshot::unavailable())
+        };
+        let last_gpu: Arc<Mutex<Option<GpusSnapshot>>> = Arc::new(Mutex::new(initial_gpu));
+
         // Spawn the container polling loop if an engine is configured.
         let container_task = self.container_engine.take().map(|engine| {
             spawn_container_loop(engine, Arc::clone(&last_containers), token.clone())
@@ -140,6 +186,11 @@ impl Collector {
             .cluster_engine
             .take()
             .map(|engine| spawn_cluster_loop(engine, Arc::clone(&last_kube), token.clone()));
+        // Spawn the GPU polling loop if an engine is configured.
+        let gpu_task = self
+            .gpu_engine
+            .take()
+            .map(|engine| spawn_gpu_loop(engine, Arc::clone(&last_gpu), token.clone()));
 
         loop {
             tokio::select! {
@@ -160,8 +211,9 @@ impl Collector {
 
                     let containers = last_containers.lock().await.clone();
                     let kube = last_kube.lock().await.clone();
+                    let gpu = last_gpu.lock().await.clone();
                     let snapshot =
-                        SystemSnapshot::collect(&self.sys, &self.networks, containers, kube);
+                        SystemSnapshot::collect(&self.sys, &self.networks, containers, kube, gpu);
 
                     match tx.try_send(snapshot) {
                         Ok(()) => {}
@@ -181,7 +233,7 @@ impl Collector {
             }
         }
 
-        // Wait for the container + cluster tasks to wind down so the
+        // Wait for the container + cluster + GPU tasks to wind down so the
         // JoinHandle reflects total shutdown.
         if let Some(handle) = container_task {
             let _ = handle.await;
@@ -189,7 +241,46 @@ impl Collector {
         if let Some(handle) = cluster_task {
             let _ = handle.await;
         }
+        if let Some(handle) = gpu_task {
+            let _ = handle.await;
+        }
     }
+}
+
+/// Background loop polling the GPU engine at 1 Hz (see [`GPU_INTERVAL`]).
+/// Writes into the shared slot; publishes `GpusSnapshot::unavailable()` on
+/// failure so the UI renders the "no GPU" state rather than freezing on the
+/// last good sample.
+fn spawn_gpu_loop(
+    engine: Arc<dyn GpuEngine + Send + Sync>,
+    slot: Arc<Mutex<Option<GpusSnapshot>>>,
+    token: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(GPU_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    match engine.snapshot().await {
+                        Ok(snapshot) => {
+                            *slot.lock().await = Some(snapshot);
+                        }
+                        Err(err) => {
+                            tracing::warn!(target: "muxtop::gpu", error = %err, "GPU engine failed");
+                            *slot.lock().await =
+                                Some(GpusSnapshot::unavailable_with(err.to_string()));
+                        }
+                    }
+                }
+                _ = token.cancelled() => {
+                    tracing::debug!("gpu loop shutting down");
+                    break;
+                }
+            }
+        }
+    })
 }
 
 /// Background loop polling the cluster engine at 0.2 Hz (5 s). Writes into
@@ -545,6 +636,191 @@ mod tests {
         assert_eq!(cs.engine, EngineKind::Unknown);
         // Ensure the engine was actually called.
         assert!(engine.call_count.load(Ordering::Relaxed) >= 1);
+    }
+
+    // ─── GPU integration tests (v0.5) ─────────────────────────────────────
+
+    /// Test double for `GpuEngine`, mirroring `MockEngine` above.
+    struct MockGpuEngine {
+        call_count: AtomicUsize,
+        fail_mode: AtomicBool,
+    }
+
+    impl MockGpuEngine {
+        fn new() -> Self {
+            Self {
+                call_count: AtomicUsize::new(0),
+                fail_mode: AtomicBool::new(false),
+            }
+        }
+
+        fn sample_device() -> crate::gpu::GpuDeviceSnapshot {
+            crate::gpu::GpuDeviceSnapshot {
+                index: 0,
+                vendor: crate::gpu::GpuVendor::Nvidia,
+                backend: crate::gpu::GpuBackend::Nvml,
+                name: "Mock GPU".into(),
+                bus_id: "0000:01:00.0".into(),
+                driver_version: Some("999.99".into()),
+                utilization_pct: Some(50.0),
+                mem_utilization_pct: Some(20.0),
+                mem_used_bytes: Some(1024),
+                mem_total_bytes: Some(4096),
+                temperature_c: Some(55.0),
+                power_watts: Some(100.0),
+                power_limit_watts: Some(200.0),
+                graphics_clock_mhz: Some(1800),
+                memory_clock_mhz: Some(7000),
+                fan_pct: Some(30.0),
+                encoder_pct: None,
+                decoder_pct: None,
+                supports_process_stats: true,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl crate::gpu_engine::GpuEngine for MockGpuEngine {
+        async fn snapshot(&self) -> Result<crate::gpu::GpusSnapshot, crate::gpu_engine::GpuError> {
+            self.call_count.fetch_add(1, Ordering::Relaxed);
+            if self.fail_mode.load(Ordering::Relaxed) {
+                return Err(crate::gpu_engine::GpuError::Query("mock failure".into()));
+            }
+            Ok(crate::gpu::GpusSnapshot {
+                backends: vec![crate::gpu::GpuBackend::Nvml],
+                available: true,
+                devices: vec![Self::sample_device()],
+                processes: vec![crate::gpu::GpuProcessSnapshot {
+                    pid: std::process::id(),
+                    device_index: 0,
+                    name: String::new(),
+                    kind: crate::gpu::GpuProcessKind::Compute,
+                    mem_bytes: Some(512),
+                }],
+                detail: String::new(),
+            })
+        }
+
+        fn backend(&self) -> crate::gpu::GpuBackend {
+            crate::gpu::GpuBackend::Nvml
+        }
+    }
+
+    /// Drain snapshots until one satisfies `pred`, or the deadline passes.
+    async fn drain_until(
+        rx: &mut mpsc::Receiver<SystemSnapshot>,
+        secs: u64,
+        pred: impl Fn(&SystemSnapshot) -> bool,
+    ) -> Option<SystemSnapshot> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(snap)) if pred(&snap) => return Some(snap),
+                Ok(Some(_)) => continue,
+                Ok(None) | Err(_) => return None,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_collector_populates_gpu_with_engine() {
+        let engine: Arc<dyn crate::gpu_engine::GpuEngine + Send + Sync> =
+            Arc::new(MockGpuEngine::new());
+        let (tx, mut rx) = mpsc::channel(8);
+        let token = CancellationToken::new();
+        let collector =
+            Collector::with_all_engines(Duration::from_millis(300), None, None, Some(engine));
+        let handle = collector.spawn(tx, token.clone());
+
+        let populated = drain_until(&mut rx, 5, |s| s.gpu.is_some()).await;
+
+        token.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+
+        let snap = populated.expect("no snapshot with gpu populated within 5 s");
+        let gpu = snap.gpu.unwrap();
+        assert!(gpu.available);
+        assert_eq!(gpu.devices.len(), 1);
+        assert_eq!(gpu.devices[0].name, "Mock GPU");
+    }
+
+    /// The collector must name GPU processes from the process table it
+    /// already refreshed — the engine deliberately leaves `name` empty.
+    #[tokio::test]
+    async fn test_collector_resolves_gpu_process_names() {
+        let engine: Arc<dyn crate::gpu_engine::GpuEngine + Send + Sync> =
+            Arc::new(MockGpuEngine::new());
+        let (tx, mut rx) = mpsc::channel(8);
+        let token = CancellationToken::new();
+        let collector =
+            Collector::with_all_engines(Duration::from_millis(300), None, None, Some(engine));
+        let handle = collector.spawn(tx, token.clone());
+
+        let populated = drain_until(&mut rx, 5, |s| {
+            s.gpu.as_ref().is_some_and(|g| !g.processes.is_empty())
+        })
+        .await;
+
+        token.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+
+        let snap = populated.expect("no snapshot with gpu processes within 5 s");
+        let gpu = snap.gpu.unwrap();
+        assert!(
+            !gpu.processes[0].name.is_empty(),
+            "collector should have resolved the PID to a name"
+        );
+    }
+
+    /// A failing GPU engine publishes the `unavailable` sentinel carrying the
+    /// reason, not an absence — so the UI can explain itself.
+    #[tokio::test]
+    async fn test_collector_publishes_gpu_unavailable_on_engine_error() {
+        let engine = Arc::new(MockGpuEngine::new());
+        engine.fail_mode.store(true, Ordering::Relaxed);
+        let engine_dyn: Arc<dyn crate::gpu_engine::GpuEngine + Send + Sync> = engine.clone();
+        let (tx, mut rx) = mpsc::channel(8);
+        let token = CancellationToken::new();
+        let collector =
+            Collector::with_all_engines(Duration::from_millis(300), None, None, Some(engine_dyn));
+        let handle = collector.spawn(tx, token.clone());
+
+        let observed =
+            drain_until(&mut rx, 5, |s| s.gpu.as_ref().is_some_and(|g| !g.available)).await;
+
+        token.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+
+        let snap = observed.expect("no gpu-populated snapshot within 5 s");
+        let gpu = snap.gpu.unwrap();
+        assert!(!gpu.available);
+        assert!(gpu.devices.is_empty());
+        assert!(
+            gpu.detail.contains("mock failure"),
+            "the failure reason should reach the UI, got {:?}",
+            gpu.detail
+        );
+        assert!(engine.call_count.load(Ordering::Relaxed) >= 1);
+    }
+
+    /// Without a GPU engine the slot is seeded with the `unavailable`
+    /// sentinel so the tab renders "no GPU" immediately rather than sitting
+    /// on "Waiting…" forever (the `--no-gpu` and remote-client path).
+    #[tokio::test]
+    async fn test_collector_without_gpu_engine_seeds_unavailable() {
+        let (mut rx, handle, token) = make_collector(4);
+
+        let snap = tokio::time::timeout(Duration::from_secs(4), rx.recv())
+            .await
+            .expect("timeout waiting for snapshot")
+            .expect("channel closed before first snapshot");
+
+        token.cancel();
+        handle.await.expect("collector task panicked");
+
+        let gpu = snap.gpu.expect("gpu slot should be seeded, not None");
+        assert!(!gpu.available);
+        assert!(gpu.devices.is_empty());
     }
 
     /// Sanity: without an engine, the published snapshots keep `containers =

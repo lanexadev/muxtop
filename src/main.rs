@@ -136,6 +136,16 @@ struct Cli {
     #[arg(long, conflicts_with = "kube_context")]
     no_kube: bool,
 
+    /// Disable GPU detection entirely (GPU tab stays in "no GPU" state).
+    ///
+    /// muxtop probes NVIDIA (via NVML) and AMD (via amdgpu sysfs) at startup.
+    /// Detection is read-only and costs a library load plus a device count,
+    /// but this flag is there for hosts where waking a power-gated dGPU is
+    /// undesirable — probing a laptop's discrete GPU can pull it out of
+    /// runtime-D3 and cost battery.
+    #[arg(long)]
+    no_gpu: bool,
+
     /// [benchmark] Run the collector + apply snapshots through AppState for N
     /// seconds without rendering, then exit cleanly. Used by the macro
     /// benchmark to measure steady-state RSS without a TTY.
@@ -258,6 +268,20 @@ async fn run_app(cli: Cli) -> Result<()> {
             None
         };
 
+    // Build a GPU engine in local mode (opt-out via --no-gpu).
+    //
+    // Unlike the container and cluster engines, detection never fails: when
+    // no vendor backend initialises it returns a null engine carrying the
+    // reason, which the GPU tab renders under "No GPU detected". That is why
+    // this is `Some(..)` for every local run — the distinction between "no
+    // GPU" and "not looked for" is what `--no-gpu` expresses.
+    let gpu_engine: Option<Arc<dyn muxtop_core::gpu_engine::GpuEngine + Send + Sync>> =
+        if cli.remote.is_none() && !cli.no_gpu {
+            Some(muxtop_core::gpu_engine::detect_gpu_engines())
+        } else {
+            None
+        };
+
     // Determine connection mode and spawn appropriate collector.
     //
     // ADR-30-1: --remote accepts `host:port` where `host` may be an IP
@@ -316,10 +340,11 @@ async fn run_app(cli: Cli) -> Result<()> {
         );
         remote.spawn(tx, None, cancel.clone())
     } else {
-        let collector = Collector::with_engines(
+        let collector = Collector::with_all_engines(
             Duration::from_secs(cli.refresh),
             container_engine.clone(),
             cluster_engine.clone(),
+            gpu_engine.clone(),
         );
         collector.spawn(tx, cancel.clone())
     };

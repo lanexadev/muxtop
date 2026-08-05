@@ -60,6 +60,7 @@ fn make_snapshot(n: usize) -> SystemSnapshot {
         },
         containers: None,
         kube: None,
+        gpu: None,
         timestamp_ms: 0,
     }
 }
