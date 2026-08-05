@@ -138,10 +138,12 @@ struct Cli {
     #[arg(long, value_name = "NAME")]
     kube_context: Option<String>,
 
-    /// Override the default namespace the server uses for the Kube tab. This
-    /// sets the namespace reported to clients; Pods/Nodes/Deployments are
-    /// still listed cluster-wide (namespace scoping is not implemented yet).
-    #[arg(long, value_name = "NS")]
+    /// Scope the served Kube snapshots to a single namespace. Pods and
+    /// Deployments are listed from this namespace only, which works with a
+    /// Role bound to it — no cluster-wide permissions required. Without this
+    /// flag the server lists every namespace. Nodes are cluster-scoped in
+    /// Kubernetes and always need cluster-wide access.
+    #[arg(long, value_name = "NS", value_parser = muxtop_core::cluster_engine::parse_namespace)]
     kube_namespace: Option<String>,
 
     /// Disable cluster engine autodetection entirely. Remote clients see an

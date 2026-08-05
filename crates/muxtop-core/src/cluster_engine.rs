@@ -100,6 +100,89 @@ pub enum KubeconfigSource {
     None,
 }
 
+/// Which namespaces a [`ClusterEngine`] lists namespaced resources from.
+///
+/// Pods and Deployments honour this. **Nodes do not** — `Node` is a
+/// cluster-scoped resource in Kubernetes with no namespaced variant, so it
+/// is always listed cluster-wide and simply degrades to an empty list when
+/// RBAC denies it (see [`ClusterError::Forbidden`]).
+///
+/// [`Self::AllNamespaces`] needs cluster-scoped `list` on the resource;
+/// [`Self::Namespace`] works with a Role bound to that one namespace, which
+/// is the common case for a developer on a shared cluster.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum KubeScope {
+    /// List across every namespace (`Api::all`).
+    #[default]
+    AllNamespaces,
+    /// List a single namespace (`Api::namespaced`).
+    Namespace(String),
+}
+
+impl KubeScope {
+    /// The namespace this scope targets, or `None` when cluster-wide.
+    pub fn namespace(&self) -> Option<&str> {
+        match self {
+            Self::AllNamespaces => None,
+            Self::Namespace(ns) => Some(ns.as_str()),
+        }
+    }
+
+    /// Value for [`KubeSnapshot::current_namespace`]: the namespace name when
+    /// scoped, the empty string when cluster-wide.
+    ///
+    /// The empty string is the wire-level encoding of "all namespaces" — it
+    /// avoids adding a field to [`KubeSnapshot`], which would be a breaking
+    /// bincode change for a purely presentational distinction.
+    pub fn label(&self) -> &str {
+        self.namespace().unwrap_or("")
+    }
+
+    /// `true` when listing cluster-wide.
+    pub fn is_all_namespaces(&self) -> bool {
+        matches!(self, Self::AllNamespaces)
+    }
+}
+
+/// Validate a Kubernetes namespace name against the DNS-1123 label rules the
+/// API server enforces: 1–63 characters, lowercase alphanumeric or `-`,
+/// starting and ending alphanumeric.
+///
+/// Beyond rejecting names the API server would refuse anyway, this is a
+/// **security boundary**: the metrics-server poll interpolates the namespace
+/// into a request path (`/apis/metrics.k8s.io/v1beta1/namespaces/{ns}/pods`),
+/// and the namespace originates from `--kube-namespace` — user input. The
+/// character set admitted here contains no `/`, `.`, `?` or `%`, so a
+/// traversal or query-injection payload cannot reach the URI builder.
+pub fn is_valid_namespace(name: &str) -> bool {
+    if name.is_empty() || name.len() > 63 {
+        return false;
+    }
+    let bytes = name.as_bytes();
+    let is_alnum = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    if !is_alnum(bytes[0]) || !is_alnum(bytes[bytes.len() - 1]) {
+        return false;
+    }
+    bytes.iter().all(|&b| is_alnum(b) || b == b'-')
+}
+
+/// [`is_valid_namespace`] as a parser, for CLI argument validation.
+///
+/// Lives here rather than in the binaries so `muxtop` and `muxtop-server`
+/// reject the same inputs with the same wording. Takes no clap dependency —
+/// the signature is what clap's `value_parser` accepts, nothing more.
+pub fn parse_namespace(raw: &str) -> Result<String, String> {
+    if is_valid_namespace(raw) {
+        Ok(raw.to_string())
+    } else {
+        Err(format!(
+            "invalid namespace {raw:?}: expected a DNS-1123 label \
+             (1-63 chars, lowercase alphanumeric or '-', \
+             starting and ending alphanumeric)"
+        ))
+    }
+}
+
 /// Abstraction over a running Kubernetes cluster (Docker Desktop, kind,
 /// k3s, EKS, GKE, AKS, OpenShift, plain kubeadm, …).
 ///
@@ -135,6 +218,27 @@ pub trait ClusterEngine: Send + Sync {
     /// `serverVersion.gitVersion` from the discovery API. `None` until the
     /// initial probe succeeds.
     fn server_version(&self) -> Option<&str>;
+
+    /// The namespace scope currently applied to namespaced resources.
+    ///
+    /// Defaults to [`KubeScope::AllNamespaces`] so implementations without
+    /// runtime rescoping need not override it.
+    async fn scope(&self) -> KubeScope {
+        KubeScope::AllNamespaces
+    }
+
+    /// Flip between cluster-wide listing and the engine's configured
+    /// namespace, returning the scope now in effect.
+    ///
+    /// Bound to `A` in the Kube tab. The engine owns the flip rather than the
+    /// caller because only the engine knows which namespace to scope *to*
+    /// (`--kube-namespace` when given, otherwise the kubeconfig context's
+    /// default namespace) — a caller holding only a snapshot cannot tell.
+    ///
+    /// Defaults to a no-op reporting [`KubeScope::AllNamespaces`].
+    async fn toggle_scope(&self) -> KubeScope {
+        KubeScope::AllNamespaces
+    }
 }
 
 /// Pure, injectable kubeconfig detection — the real [`detect_kubeconfig`] is
@@ -346,6 +450,94 @@ mod tests {
         let _ = detect_kubeconfig();
     }
 
+    // -------- KubeScope --------
+
+    #[test]
+    fn scope_all_namespaces_has_no_namespace() {
+        let scope = KubeScope::AllNamespaces;
+        assert_eq!(scope.namespace(), None);
+        assert_eq!(scope.label(), "");
+        assert!(scope.is_all_namespaces());
+    }
+
+    #[test]
+    fn scope_namespace_exposes_it() {
+        let scope = KubeScope::Namespace("kube-system".into());
+        assert_eq!(scope.namespace(), Some("kube-system"));
+        assert_eq!(scope.label(), "kube-system");
+        assert!(!scope.is_all_namespaces());
+    }
+
+    #[test]
+    fn scope_defaults_to_all_namespaces() {
+        // The default must stay cluster-wide: it is what an engine built
+        // without `--kube-namespace` uses, and narrowing it would silently
+        // hide resources for every existing user.
+        assert_eq!(KubeScope::default(), KubeScope::AllNamespaces);
+    }
+
+    // -------- namespace validation --------
+
+    #[test]
+    fn valid_namespaces_are_accepted() {
+        for ns in [
+            "default",
+            "kube-system",
+            "a",
+            "1",
+            "my-app-2",
+            &"a".repeat(63),
+        ] {
+            assert!(is_valid_namespace(ns), "expected {ns:?} to be valid");
+        }
+    }
+
+    #[test]
+    fn invalid_namespaces_are_rejected() {
+        for ns in [
+            "",               // empty
+            &"a".repeat(64),  // one over the DNS-1123 limit
+            "Default",        // uppercase
+            "-leading",       // leading dash
+            "trailing-",      // trailing dash
+            "has_underscore", // underscore
+            "has.dot",        // dot
+            "has space",      // space
+            "ns/../other",    // path traversal
+            "ns/pods",        // extra path segment
+            "ns?watch=true",  // query injection
+            "ns%2f",          // percent-encoded slash
+            "ns\u{0000}",     // NUL
+            "ns\u{001b}[31m", // ANSI escape
+        ] {
+            assert!(!is_valid_namespace(ns), "expected {ns:?} to be rejected");
+        }
+    }
+
+    #[test]
+    fn namespace_rejection_blocks_uri_injection() {
+        // The metrics poll interpolates the namespace into
+        // `/apis/metrics.k8s.io/v1beta1/namespaces/{ns}/pods`. Every
+        // character the validator admits must be URI-path-safe, so no
+        // accepted namespace can add a segment or a query string.
+        for ns in ["default", "kube-system", "my-app-2"] {
+            assert!(is_valid_namespace(ns));
+            assert!(!ns.contains(['/', '?', '#', '%', '.', ':', '@']));
+        }
+    }
+
+    #[test]
+    fn parse_namespace_round_trips_valid_input() {
+        assert_eq!(parse_namespace("kube-system").unwrap(), "kube-system");
+    }
+
+    #[test]
+    fn parse_namespace_reports_why_it_failed() {
+        let err = parse_namespace("Bad NS").unwrap_err();
+        assert!(err.contains("DNS-1123"), "unhelpful message: {err}");
+        assert!(err.contains("Bad NS"), "message omits the input: {err}");
+    }
+
     // -------- ClusterError --------
 
     #[test]
@@ -419,6 +611,15 @@ mod tests {
 
         // Build through the dyn pointer — proves dyn-safety end-to-end.
         let _boxed: Box<dyn ClusterEngine + Send + Sync> = Box::new(StubCluster);
+    }
+
+    #[tokio::test]
+    async fn cluster_engine_scope_defaults_are_cluster_wide() {
+        // `StubCluster` overrides neither method — the defaults must be
+        // usable, so adding scope support did not break third-party impls.
+        let stub: Box<dyn ClusterEngine + Send + Sync> = Box::new(StubCluster);
+        assert_eq!(stub.scope().await, KubeScope::AllNamespaces);
+        assert_eq!(stub.toggle_scope().await, KubeScope::AllNamespaces);
     }
 
     #[tokio::test]

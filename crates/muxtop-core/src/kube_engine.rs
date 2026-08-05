@@ -36,7 +36,9 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::cluster_engine::{ClusterEngine, ClusterError, KubeconfigSource};
+use crate::cluster_engine::{
+    ClusterEngine, ClusterError, KubeScope, KubeconfigSource, is_valid_namespace,
+};
 use crate::kube::{
     ClusterKind, DeploymentSnapshot, DeploymentStrategy, KubeSnapshot, NodeSnapshot, NodeStatus,
     PodPhase, PodSnapshot, QosClass,
@@ -81,7 +83,14 @@ pub(crate) struct MetricsCache {
 pub struct KubeEngine {
     cluster_kind: ClusterKind,
     server_version: Option<String>,
-    current_namespace: String,
+    /// Namespace used whenever the engine is scoped: `--kube-namespace` when
+    /// the user passed one, otherwise the active kubeconfig context's default
+    /// namespace. This is what [`ClusterEngine::toggle_scope`] scopes *to*
+    /// when the engine is currently cluster-wide.
+    scoped_namespace: String,
+    /// Live scope shared with both poll loops — [`ClusterEngine::toggle_scope`]
+    /// writes it and the next tick reads it.
+    scope: Arc<RwLock<KubeScope>>,
     resources: Arc<RwLock<ResourceCache>>,
     metrics: Arc<RwLock<MetricsCache>>,
     /// Cancels the spawned poll task on drop.
@@ -108,6 +117,19 @@ impl KubeEngine {
         context: Option<&str>,
         namespace: Option<&str>,
     ) -> Result<Self, ClusterError> {
+        // Reject a malformed namespace before it can reach the metrics-server
+        // URI builder (see `is_valid_namespace`). The CLI validates too, but
+        // this is the library boundary and must not rely on its callers.
+        if let Some(ns) = namespace
+            && !is_valid_namespace(ns)
+        {
+            return Err(ClusterError::Other(format!(
+                "invalid namespace {ns:?}: expected a DNS-1123 label \
+                 (1-63 chars, lowercase alphanumeric or '-', \
+                 starting and ending alphanumeric)"
+            )));
+        }
+
         let config = build_config(source, context, namespace).await?;
         let resolved_namespace = config.default_namespace.clone();
 
@@ -126,20 +148,57 @@ impl KubeEngine {
         let metrics = Arc::new(RwLock::new(MetricsCache::default()));
         let cancel = CancellationToken::new();
 
+        // `--kube-namespace` scopes the engine; without it we keep the v0.4
+        // behaviour of listing cluster-wide, so upgrading changes nothing for
+        // users who never passed the flag.
+        let initial_scope = match namespace {
+            Some(ns) => KubeScope::Namespace(ns.to_string()),
+            None => KubeScope::AllNamespaces,
+        };
+        // Toggling from cluster-wide needs a namespace to land on: the flag
+        // when given, else whatever the kubeconfig context declares.
+        let scoped_namespace = namespace
+            .map(String::from)
+            .unwrap_or_else(|| resolved_namespace.clone());
+        let scope = Arc::new(RwLock::new(initial_scope));
+
         // Resource poll task.
-        let _resource_handle =
-            spawn_resource_loop(client.clone(), resources.clone(), cancel.clone());
+        let _resource_handle = spawn_resource_loop(
+            client.clone(),
+            resources.clone(),
+            scope.clone(),
+            cancel.clone(),
+        );
         // Metrics poll task.
-        let _metrics_handle = spawn_metrics_loop(client.clone(), metrics.clone(), cancel.clone());
+        let _metrics_handle = spawn_metrics_loop(
+            client.clone(),
+            metrics.clone(),
+            scope.clone(),
+            cancel.clone(),
+        );
 
         Ok(Self {
             cluster_kind,
             server_version,
-            current_namespace: resolved_namespace,
+            scoped_namespace,
+            scope,
             resources,
             metrics,
             cancel,
         })
+    }
+
+    /// Set the namespace scope directly. Inherent rather than part of
+    /// [`ClusterEngine`] because the trait only needs the toggle; tests and
+    /// future callers that know exactly which scope they want use this.
+    ///
+    /// Clears the pod and deployment caches so a scope-down never leaves
+    /// out-of-scope rows on screen until the next poll tick.
+    pub async fn set_scope(&self, scope: KubeScope) {
+        *self.scope.write().await = scope;
+        let mut cache = self.resources.write().await;
+        cache.pods.clear();
+        cache.deployments.clear();
     }
 
     /// Test constructor that bypasses the network entirely. The caches are
@@ -150,6 +209,9 @@ impl KubeEngine {
     /// implementation details — never exposed to consumers of muxtop-core.
     #[doc(hidden)]
     #[allow(dead_code)] // exercised by the in-module tests; will be used by collector tests in E4
+    /// `current_namespace` is interpreted the same way the wire field is: an
+    /// empty string means cluster-wide, anything else scopes to that
+    /// namespace.
     pub(crate) fn new_for_test(
         cluster_kind: ClusterKind,
         server_version: Option<String>,
@@ -157,10 +219,21 @@ impl KubeEngine {
         resources: ResourceCache,
         metrics: MetricsCache,
     ) -> Self {
+        let scope = if current_namespace.is_empty() {
+            KubeScope::AllNamespaces
+        } else {
+            KubeScope::Namespace(current_namespace.clone())
+        };
+        let scoped_namespace = if current_namespace.is_empty() {
+            "default".to_string()
+        } else {
+            current_namespace
+        };
         Self {
             cluster_kind,
             server_version,
-            current_namespace,
+            scoped_namespace,
+            scope: Arc::new(RwLock::new(scope)),
             resources: Arc::new(RwLock::new(resources)),
             metrics: Arc::new(RwLock::new(metrics)),
             cancel: CancellationToken::new(),
@@ -239,7 +312,7 @@ impl ClusterEngine for KubeEngine {
         Ok(KubeSnapshot {
             cluster_kind: self.cluster_kind,
             server_version: self.server_version.clone(),
-            current_namespace: self.current_namespace.clone(),
+            current_namespace: self.scope.read().await.label().to_string(),
             reachable,
             metrics_available: metrics.available,
             pods,
@@ -258,6 +331,19 @@ impl ClusterEngine for KubeEngine {
 
     fn server_version(&self) -> Option<&str> {
         self.server_version.as_deref()
+    }
+
+    async fn scope(&self) -> KubeScope {
+        self.scope.read().await.clone()
+    }
+
+    async fn toggle_scope(&self) -> KubeScope {
+        let next = match &*self.scope.read().await {
+            KubeScope::AllNamespaces => KubeScope::Namespace(self.scoped_namespace.clone()),
+            KubeScope::Namespace(_) => KubeScope::AllNamespaces,
+        };
+        self.set_scope(next.clone()).await;
+        next
     }
 }
 
@@ -676,15 +762,33 @@ async fn probe_version(client: &Client) -> Result<(ClusterKind, String), Cluster
 fn spawn_resource_loop(
     client: Client,
     cache: Arc<RwLock<ResourceCache>>,
+    scope: Arc<RwLock<KubeScope>>,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let pod_api: Api<Pod> = Api::all(client.clone());
+        // `Node` is cluster-scoped in Kubernetes — no namespaced variant
+        // exists — so this Api is built once and never rescoped. Under a
+        // namespace-only Role the list 403s and the Nodes sub-view degrades
+        // to empty, which is the documented behaviour.
         let node_api: Api<Node> = Api::all(client.clone());
-        let deployment_api: Api<Deployment> = Api::all(client.clone());
         let lp = ListParams::default().limit(5_000);
 
         loop {
+            // Rebuilt every tick because `A` can rescope the engine between
+            // ticks. `Api::all` / `Api::namespaced` only wrap the shared
+            // client in a request builder — no I/O, no handshake, so this is
+            // cheaper than any change-detection scheme would be.
+            let (pod_api, deployment_api) = match scope.read().await.namespace() {
+                Some(ns) => (
+                    Api::<Pod>::namespaced(client.clone(), ns),
+                    Api::<Deployment>::namespaced(client.clone(), ns),
+                ),
+                None => (
+                    Api::<Pod>::all(client.clone()),
+                    Api::<Deployment>::all(client.clone()),
+                ),
+            };
+
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 _ = tick_resources(&pod_api, &node_api, &deployment_api, &lp, &cache) => {}
@@ -757,13 +861,15 @@ async fn tick_resources(
 fn spawn_metrics_loop(
     client: Client,
     cache: Arc<RwLock<MetricsCache>>,
+    scope: Arc<RwLock<KubeScope>>,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
+            let current = scope.read().await.clone();
             tokio::select! {
                 _ = cancel.cancelled() => break,
-                _ = tick_metrics(&client, &cache) => {}
+                _ = tick_metrics(&client, &cache, &current) => {}
             }
             tokio::select! {
                 _ = cancel.cancelled() => break,
@@ -773,12 +879,26 @@ fn spawn_metrics_loop(
     })
 }
 
-async fn tick_metrics(client: &Client, cache: &Arc<RwLock<MetricsCache>>) {
-    let pod_metrics = fetch_metrics_text(client, "/apis/metrics.k8s.io/v1beta1/pods").await;
+async fn tick_metrics(client: &Client, cache: &Arc<RwLock<MetricsCache>>, scope: &KubeScope) {
+    // Pod metrics follow the resource scope: a namespace-only Role can read
+    // `namespaces/{ns}/pods` but not the cluster-wide collection, so an
+    // unscoped poll here would 403 and blank the CPU/MEM columns for exactly
+    // the users namespace scoping exists to serve.
+    //
+    // `ns` is a validated DNS-1123 label (see `is_valid_namespace`), so it
+    // cannot introduce path segments or a query string.
+    let pod_path = match scope.namespace() {
+        Some(ns) => format!("/apis/metrics.k8s.io/v1beta1/namespaces/{ns}/pods"),
+        None => "/apis/metrics.k8s.io/v1beta1/pods".to_string(),
+    };
+    let pod_metrics = fetch_metrics_text(client, &pod_path).await;
+    // Node metrics are cluster-scoped like the Node resource itself.
     let node_metrics = fetch_metrics_text(client, "/apis/metrics.k8s.io/v1beta1/nodes").await;
 
     // Treat any error on either path as "metrics-server unavailable". This
     // matches what k9s does — the user just sees `—` in the CPU/MEM cols.
+    // A scoped engine that can read pod metrics but not node metrics keeps
+    // `available = true` — the pod columns populate and the node ones don't.
     if pod_metrics.is_none() && node_metrics.is_none() {
         let mut w = cache.write().await;
         w.available = false;
@@ -1348,6 +1468,134 @@ mod tests {
         assert_eq!(snap.cluster_kind, ClusterKind::Kind);
         assert_eq!(snap.server_version.as_deref(), Some("v1.31.0"));
         assert_eq!(snap.current_namespace, "default");
+    }
+
+    // ─── namespace scoping ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn connect_rejects_invalid_namespace_before_touching_the_network() {
+        // Validation must run ahead of `build_config`, so an invalid
+        // namespace reports *why* instead of a misleading config error.
+        // `Source::None` would otherwise yield `KubeconfigNotFound`.
+        // `KubeEngine` is not `Debug`, so this cannot use `expect_err`.
+        match KubeEngine::connect(KubeconfigSource::None, None, Some("Bad/NS")).await {
+            Err(ClusterError::Other(msg)) => {
+                assert!(msg.contains("DNS-1123"), "unhelpful message: {msg}");
+                assert!(msg.contains("Bad/NS"), "message omits the input: {msg}");
+            }
+            Err(other) => panic!("expected ClusterError::Other, got {other:?}"),
+            Ok(_) => panic!("invalid namespace must be rejected"),
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_namespace_in_test_ctor_means_cluster_wide() {
+        let engine = empty_engine_for_test();
+        assert_eq!(engine.scope().await, KubeScope::AllNamespaces);
+        // The wire field encodes cluster-wide as the empty string.
+        assert_eq!(engine.snapshot().await.unwrap().current_namespace, "");
+    }
+
+    #[tokio::test]
+    async fn scoped_engine_reports_its_namespace_on_the_wire() {
+        let engine = KubeEngine::new_for_test(
+            ClusterKind::Kind,
+            None,
+            "kube-system".into(),
+            ResourceCache::default(),
+            MetricsCache::default(),
+        );
+        assert_eq!(
+            engine.scope().await,
+            KubeScope::Namespace("kube-system".into())
+        );
+        assert_eq!(
+            engine.snapshot().await.unwrap().current_namespace,
+            "kube-system"
+        );
+    }
+
+    #[tokio::test]
+    async fn toggle_scope_flips_between_namespace_and_cluster_wide() {
+        let engine = KubeEngine::new_for_test(
+            ClusterKind::Kind,
+            None,
+            "kube-system".into(),
+            ResourceCache::default(),
+            MetricsCache::default(),
+        );
+
+        // Scoped -> cluster-wide.
+        assert_eq!(engine.toggle_scope().await, KubeScope::AllNamespaces);
+        assert_eq!(engine.snapshot().await.unwrap().current_namespace, "");
+
+        // Cluster-wide -> back to the same namespace it started from.
+        assert_eq!(
+            engine.toggle_scope().await,
+            KubeScope::Namespace("kube-system".into())
+        );
+        assert_eq!(
+            engine.snapshot().await.unwrap().current_namespace,
+            "kube-system"
+        );
+    }
+
+    #[tokio::test]
+    async fn toggle_from_cluster_wide_uses_the_configured_namespace() {
+        // Built cluster-wide via the empty-string ctor: the toggle target
+        // falls back to "default", mirroring a kubeconfig with no explicit
+        // namespace.
+        let engine = empty_engine_for_test();
+        assert_eq!(
+            engine.toggle_scope().await,
+            KubeScope::Namespace("default".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn rescoping_drops_out_of_scope_rows_immediately() {
+        // Without this, scoping down would leave other namespaces' pods on
+        // screen for up to a full poll interval — showing the user exactly
+        // what they just asked to filter out.
+        let resources = ResourceCache {
+            pods: vec![pod_from_json(serde_json::json!({
+                "metadata": {"name": "a", "namespace": "other"},
+                "spec": {"nodeName": "n1"},
+                "status": {"phase": "Running"}
+            }))],
+            deployments: vec![deployment_from_json(serde_json::json!({
+                "metadata": {"name": "d", "namespace": "other"},
+                "spec": {"replicas": 1},
+                "status": {"readyReplicas": 1, "replicas": 1}
+            }))],
+            nodes: vec![node_from_json(serde_json::json!({
+                "metadata": {"name": "n1"},
+                "status": {"conditions": [{"type": "Ready", "status": "True"}]}
+            }))],
+            last_update_ms: 1,
+        };
+
+        let engine = KubeEngine::new_for_test(
+            ClusterKind::Kind,
+            None,
+            String::new(),
+            resources,
+            MetricsCache::default(),
+        );
+        assert_eq!(engine.snapshot().await.unwrap().pods.len(), 1);
+
+        engine.set_scope(KubeScope::Namespace("mine".into())).await;
+
+        let snap = engine.snapshot().await.unwrap();
+        assert!(snap.pods.is_empty(), "stale pods survived the rescope");
+        assert!(
+            snap.deployments.is_empty(),
+            "stale deployments survived the rescope"
+        );
+        // Nodes are cluster-scoped and unaffected by namespace scoping, so
+        // they must NOT be cleared.
+        assert_eq!(snap.nodes.len(), 1, "nodes must survive a rescope");
+        assert_eq!(snap.current_namespace, "mine");
     }
 
     // ─── real cluster integration ────────────────────────────────────────

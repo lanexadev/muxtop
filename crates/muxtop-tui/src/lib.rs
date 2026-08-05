@@ -60,11 +60,19 @@ impl Default for CliConfig {
 /// actions dispatched from the TUI hit the same daemon. Pass `None` to
 /// disable container actions (the UI surfaces a "not configured" status
 /// message instead of spawning work).
+///
+/// `cluster_engine` is shared the same way so the `A` key can rescope the
+/// Kube tab between a single namespace and all namespaces. Pass `None` in
+/// remote mode — the server owns the kubeconfig there — or when `--no-kube`
+/// is set.
 pub fn run(
     rx: mpsc::Receiver<SystemSnapshot>,
     config: CliConfig,
     container_engine: Option<
         std::sync::Arc<dyn muxtop_core::container_engine::ContainerEngine + Send + Sync>,
+    >,
+    cluster_engine: Option<
+        std::sync::Arc<dyn muxtop_core::cluster_engine::ClusterEngine + Send + Sync>,
     >,
 ) -> Result<(), TuiError> {
     install_panic_hook();
@@ -73,6 +81,9 @@ pub fn run(
     let mut app = app::AppState::with_config(config, term_caps);
     if let Some(engine) = container_engine {
         app.set_container_engine(engine);
+    }
+    if let Some(engine) = cluster_engine {
+        app.set_cluster_engine(engine);
     }
     let mut handler = EventHandler::new(rx);
 
