@@ -577,6 +577,11 @@ pub struct AppState {
     /// configured" status message rather than spawning a task.
     pub container_engine:
         Option<std::sync::Arc<dyn muxtop_core::container_engine::ContainerEngine + Send + Sync>>,
+    /// Local-mode cluster engine, shared with the Collector. `None` in remote
+    /// mode (the server owns the kubeconfig) and when `--no-kube` is set —
+    /// the `A` scope toggle surfaces a status message instead.
+    pub cluster_engine:
+        Option<std::sync::Arc<dyn muxtop_core::cluster_engine::ClusterEngine + Send + Sync>>,
     /// Channel sender for container action outcomes. Spawned tokio tasks
     /// send their status messages here; the TUI main loop drains them via
     /// [`pump_action_results`].
@@ -652,6 +657,7 @@ impl AppState {
             container_rx_hist: std::collections::HashMap::new(),
             sorted_filtered_containers_cache: Vec::new(),
             container_engine: None,
+            cluster_engine: None,
             action_tx,
             action_rx,
             connection_mode: ConnectionMode::default(),
@@ -873,6 +879,52 @@ impl AppState {
         engine: std::sync::Arc<dyn muxtop_core::container_engine::ContainerEngine + Send + Sync>,
     ) {
         self.container_engine = Some(engine);
+    }
+
+    /// Attach a concrete `ClusterEngine` so `A` can rescope it at runtime.
+    ///
+    /// Local mode only — in remote mode the engine lives on the server and
+    /// this stays `None`, mirroring how container actions are gated.
+    pub fn set_cluster_engine(
+        &mut self,
+        engine: std::sync::Arc<dyn muxtop_core::cluster_engine::ClusterEngine + Send + Sync>,
+    ) {
+        self.cluster_engine = Some(engine);
+    }
+
+    /// `A` — flip the Kube tab between the configured namespace and
+    /// all-namespaces.
+    ///
+    /// The engine decides which namespace to land on (it knows
+    /// `--kube-namespace` and the kubeconfig default; the snapshot alone does
+    /// not), so this only dispatches and reports. The new scope reaches the
+    /// UI on the next poll tick — up to 5 s later — and the engine clears its
+    /// pod/deployment caches immediately so no out-of-scope row survives the
+    /// switch.
+    pub fn toggle_kube_scope(&mut self) {
+        let Some(engine) = self.cluster_engine.clone() else {
+            self.set_status(
+                "Namespace scope is local-only (unavailable in remote mode / --no-kube)".into(),
+            );
+            return;
+        };
+        let tx = self.action_tx.clone();
+        let token = self.shutdown_token.clone();
+        tokio::spawn(async move {
+            let msg = tokio::select! {
+                biased;
+                _ = token.cancelled() => return,
+                scope = engine.toggle_scope() => match scope.namespace() {
+                    Some(ns) => format!("Kube scope: namespace {ns}"),
+                    None => "Kube scope: all namespaces".to_string(),
+                },
+            };
+            let _ = tx.send(msg);
+        });
+        // The row set is about to change out from under the cursor.
+        self.kube_selected = 0;
+        self.kube_scroll_offset = 0;
+        self.needs_redraw = true;
     }
 
     /// Selected container row (respects filter + sort), if any. Used by the
@@ -1379,6 +1431,10 @@ impl AppState {
             }
             KeyCode::Char('D') if self.tab == Tab::Kube => {
                 self.switch_kube_subview(KubeSubview::Deployments);
+            }
+            // Namespace scope toggle (Kube tab, local mode).
+            KeyCode::Char('A') if self.tab == Tab::Kube => {
+                self.toggle_kube_scope();
             }
 
             // F-key sort shortcuts
@@ -2063,6 +2119,39 @@ mod tests {
     }
 
     // -- AppState defaults (STORY-02) --
+
+    #[test]
+    fn kube_scope_toggle_without_engine_explains_itself() {
+        // Remote mode and `--no-kube` both leave `cluster_engine` as None.
+        // The key must report why nothing happened rather than no-op
+        // silently — and must not reach `tokio::spawn`, which would panic
+        // outside a runtime.
+        let mut app = AppState::new();
+        app.tab = Tab::Kube;
+        assert!(app.cluster_engine.is_none());
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT));
+
+        let msg = app
+            .status_message
+            .as_ref()
+            .map(|(m, _)| m.clone())
+            .expect("A on the Kube tab must set a status message");
+        assert!(
+            msg.contains("local-only"),
+            "message does not explain the limitation: {msg}"
+        );
+    }
+
+    #[test]
+    fn kube_scope_toggle_is_scoped_to_the_kube_tab() {
+        // `A` is a bare letter — it must not fire from other tabs, where it
+        // is free for future bindings.
+        let mut app = AppState::new();
+        app.tab = Tab::Processes;
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT));
+        assert!(app.status_message.is_none());
+    }
 
     #[test]
     fn test_app_state_defaults() {

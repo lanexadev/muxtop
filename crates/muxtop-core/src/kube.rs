@@ -151,7 +151,14 @@ pub struct KubeSnapshot {
     /// `Some(...)` when the API server `/version` endpoint responded; `None`
     /// when the cluster could not be reached.
     pub server_version: Option<String>,
-    /// Default namespace from the active kubeconfig context.
+    /// The namespace the engine is scoped to, or **the empty string when
+    /// listing cluster-wide**.
+    ///
+    /// This is the effective scope, not a cosmetic label: when non-empty,
+    /// `pods` and `deployments` contain only that namespace's objects. The
+    /// empty string encodes "all namespaces" so the distinction costs no
+    /// extra wire field. `nodes` is unaffected either way — `Node` is
+    /// cluster-scoped in Kubernetes.
     pub current_namespace: String,
     pub reachable: bool,
     pub metrics_available: bool,

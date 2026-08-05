@@ -122,10 +122,13 @@ struct Cli {
     #[arg(long, value_name = "NAME")]
     kube_context: Option<String>,
 
-    /// Override the default namespace from the kubeconfig context. This sets
-    /// the namespace shown in the Kube header; Pods/Nodes/Deployments are
-    /// still listed cluster-wide (namespace scoping is not implemented yet).
-    #[arg(long, value_name = "NS")]
+    /// Scope the Kube tab to a single namespace. Pods and Deployments are
+    /// listed from this namespace only, which works with a Role bound to it
+    /// — no cluster-wide permissions required. Without this flag muxtop lists
+    /// every namespace. Nodes are cluster-scoped in Kubernetes and always
+    /// need cluster-wide access. Press `A` in the Kube tab to switch between
+    /// the two at runtime.
+    #[arg(long, value_name = "NS", value_parser = muxtop_core::cluster_engine::parse_namespace)]
     kube_namespace: Option<String>,
 
     /// Disable cluster engine autodetection entirely (Kube tab stays in
@@ -356,9 +359,14 @@ async fn run_app(cli: Cli) -> Result<()> {
     // The container engine is shared (Arc) with the Collector so Stop/Kill/
     // Restart actions hit the same daemon.
     let tui_engine = container_engine.clone();
-    let tui_result = tokio::task::spawn_blocking(move || muxtop_tui::run(rx, config, tui_engine))
-        .await
-        .context("TUI thread panicked")?;
+    // Shared with the Collector so the `A` scope toggle rescopes the very
+    // engine the collector is polling.
+    let tui_cluster_engine = cluster_engine.clone();
+    let tui_result = tokio::task::spawn_blocking(move || {
+        muxtop_tui::run(rx, config, tui_engine, tui_cluster_engine)
+    })
+    .await
+    .context("TUI thread panicked")?;
 
     // After TUI exits, shut down the collector.
     cancel.cancel();
