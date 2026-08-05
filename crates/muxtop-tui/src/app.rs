@@ -15,9 +15,48 @@ use muxtop_core::process::{
 };
 use muxtop_core::system::SystemSnapshot;
 
+use crate::keymap::{self, Action};
+use crate::notify::Notifier;
 use crate::terminal::TermCaps;
 use crate::ui::sanitize::scrub_ctrl;
+use crate::ui::theme::{Level, ThemeKind};
+use crate::ui::widgets;
 use crate::{CliConfig, ConnectionMode};
+
+// ---------------------------------------------------------------------------
+// Modes
+// ---------------------------------------------------------------------------
+
+/// Which overlay, if any, currently owns the keyboard.
+///
+/// muxtop 0.4 tracked this as a handful of independent booleans, so "what does
+/// Esc do right now" had no single answer. One enum means one answer, and it is
+/// what makes `Esc` a predictable step backwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Overlay {
+    #[default]
+    None,
+    /// Fuzzy command palette (`Ctrl+P`).
+    Palette,
+    /// Typed command line with arguments (`:`).
+    Command,
+    /// Keymap reference (`?`).
+    Help,
+    /// Contextual actions for the selected row (`x`).
+    Actions,
+    /// Detail pane for the selected row (`Enter`).
+    Inspector,
+    /// Message history (`Ctrl+L`).
+    Log,
+}
+
+impl Overlay {
+    /// Whether this overlay captures text input, which decides how printable
+    /// characters are routed.
+    pub fn is_text_input(self) -> bool {
+        matches!(self, Overlay::Palette | Overlay::Command)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Confirm dialog
@@ -129,6 +168,32 @@ pub enum Command {
     RestartContainer,
     SwitchToKube,
     SwitchToGpu,
+    // -- added in 0.5.1: everything the keymap can do is reachable here too --
+    ShowHelp,
+    TogglePause,
+    RefreshNow,
+    ShowLog,
+    InspectRow,
+    CopyRowId,
+    KubePods,
+    KubeNodes,
+    KubeDeployments,
+    KubeToggleScope,
+    // -- verb commands: only offered once their verb has been typed --
+    /// `kill <name>` — the argument form the README has advertised since 0.3.
+    KillNamed,
+    /// `stop <name>`
+    StopNamed,
+    /// `restart <name>`
+    RestartNamed,
+    /// `sort <field>`
+    SortBy,
+    /// `filter <text>`
+    FilterBy,
+    /// `theme <name>`
+    SetTheme,
+    /// `tab <name>`
+    GoToTab,
 }
 
 impl Command {
@@ -167,7 +232,83 @@ impl Command {
         Command::RestartContainer,
         Command::SwitchToKube,
         Command::SwitchToGpu,
+        Command::ShowHelp,
+        Command::TogglePause,
+        Command::RefreshNow,
+        Command::ShowLog,
+        Command::InspectRow,
+        Command::CopyRowId,
+        Command::KubePods,
+        Command::KubeNodes,
+        Command::KubeDeployments,
+        Command::KubeToggleScope,
+        Command::KillNamed,
+        Command::StopNamed,
+        Command::RestartNamed,
+        Command::SortBy,
+        Command::FilterBy,
+        Command::SetTheme,
+        Command::GoToTab,
     ];
+
+    /// The verb that introduces this command's argument form, if it has one.
+    ///
+    /// `kill firefox`, `stop nginx`, `restart postgres`, `sort mem`,
+    /// `filter ngin`, `theme mono`, `tab kube`.
+    pub fn verb(self) -> Option<&'static str> {
+        match self {
+            Command::KillNamed => Some("kill"),
+            Command::StopNamed => Some("stop"),
+            Command::RestartNamed => Some("restart"),
+            Command::SortBy => Some("sort"),
+            Command::FilterBy => Some("filter"),
+            Command::SetTheme => Some("theme"),
+            Command::GoToTab => Some("tab"),
+            _ => None,
+        }
+    }
+
+    /// Whether this command is meaningless without an argument, and so must be
+    /// hidden from the palette until its verb has been typed.
+    pub fn is_verb_only(self) -> bool {
+        self.verb().is_some()
+    }
+
+    /// Which tab a command belongs to, for context-aware ranking. `None` means
+    /// it is useful everywhere.
+    pub fn home_tab(self) -> Option<Tab> {
+        match self {
+            Command::ToggleTreeView
+            | Command::SortByCpu
+            | Command::SortByMem
+            | Command::SortByPid
+            | Command::SortByName
+            | Command::SortByUser
+            | Command::KillProcess
+            | Command::ForceKillProcess
+            | Command::KillNamed
+            | Command::NiceDown
+            | Command::NiceUp => Some(Tab::Processes),
+            Command::SortNetByRx
+            | Command::SortNetByTx
+            | Command::SortNetByName
+            | Command::SortNetByErrors => Some(Tab::Network),
+            Command::SortContainersByCpu
+            | Command::SortContainersByMem
+            | Command::SortContainersByName
+            | Command::SortContainersByNetRx
+            | Command::StopContainer
+            | Command::KillContainer
+            | Command::RestartContainer
+            | Command::StopNamed
+            | Command::RestartNamed => Some(Tab::Containers),
+            Command::KubePods
+            | Command::KubeNodes
+            | Command::KubeDeployments
+            | Command::KubeToggleScope => Some(Tab::Kube),
+            _ => None,
+        }
+    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -205,6 +346,23 @@ impl Command {
             Command::RestartContainer => "Restart container",
             Command::SwitchToKube => "Switch to Kubernetes tab",
             Command::SwitchToGpu => "Switch to GPU tab",
+            Command::ShowHelp => "Help — keyboard reference",
+            Command::TogglePause => "Pause / resume refresh",
+            Command::RefreshNow => "Refresh now",
+            Command::ShowLog => "Message log",
+            Command::InspectRow => "Inspect selected row",
+            Command::CopyRowId => "Copy row identifier",
+            Command::KubePods => "Kube: Pods sub-view",
+            Command::KubeNodes => "Kube: Nodes sub-view",
+            Command::KubeDeployments => "Kube: Deployments sub-view",
+            Command::KubeToggleScope => "Kube: toggle namespace scope",
+            Command::KillNamed => "Kill process by name",
+            Command::StopNamed => "Stop container by name",
+            Command::RestartNamed => "Restart container by name",
+            Command::SortBy => "Sort by field",
+            Command::FilterBy => "Filter by text",
+            Command::SetTheme => "Switch theme",
+            Command::GoToTab => "Switch tab by name",
         }
     }
 
@@ -244,6 +402,23 @@ impl Command {
             Command::RestartContainer => "F11",
             Command::SwitchToKube => "Alt+5",
             Command::SwitchToGpu => "Alt+6",
+            Command::ShowHelp => "?",
+            Command::TogglePause => "Space",
+            Command::RefreshNow => "r",
+            Command::ShowLog => "Ctrl+L",
+            Command::InspectRow => "Enter",
+            Command::CopyRowId => "y",
+            Command::KubePods => "P",
+            Command::KubeNodes => "N",
+            Command::KubeDeployments => "D",
+            Command::KubeToggleScope => "A",
+            Command::KillNamed => "kill <name>",
+            Command::StopNamed => "stop <name>",
+            Command::RestartNamed => "restart <name>",
+            Command::SortBy => "sort <field>",
+            Command::FilterBy => "filter <text>",
+            Command::SetTheme => "theme <name>",
+            Command::GoToTab => "tab <name>",
         }
     }
 
@@ -277,6 +452,12 @@ pub struct PaletteState {
     pub selected: usize,
     /// Filtered commands with match scores (higher = better).
     pub filtered: Vec<(Command, Option<u16>)>,
+    /// Argument parsed out of a `verb rest` input, e.g. `firefox` in
+    /// `kill firefox`. `None` when the input is a plain fuzzy query.
+    pub arg: Option<String>,
+    /// Commands run this session, most recent first. Session-only: muxtop
+    /// writes no state to disk, and that is a feature.
+    history: Vec<Command>,
     /// Reusable nucleo matcher (PERF-M3). Created lazily on the first call to
     /// [`Self::refilter_excluding`] with a non-empty input. Constructing a
     /// `Matcher` allocates several internal scratch buffers, so reusing the
@@ -292,29 +473,96 @@ impl Default for PaletteState {
 
 impl PaletteState {
     pub fn new() -> Self {
-        let filtered = Command::ALL.iter().map(|&cmd| (cmd, None)).collect();
+        let filtered = Command::ALL
+            .iter()
+            .copied()
+            .filter(|c| !c.is_verb_only())
+            .map(|cmd| (cmd, None))
+            .collect();
         Self {
             input: String::new(),
             selected: 0,
             filtered,
+            arg: None,
+            history: Vec::new(),
             matcher: None,
         }
+    }
+
+    /// Record an executed command so it floats to the top next time.
+    pub fn remember(&mut self, cmd: Command) {
+        self.history.retain(|&c| c != cmd);
+        self.history.insert(0, cmd);
+        self.history.truncate(Self::HISTORY_LEN);
+    }
+
+    /// How many recently-used commands are promoted on an empty query.
+    const HISTORY_LEN: usize = 5;
+
+    /// Split `verb rest` into a command and its argument.
+    ///
+    /// Returns `None` when the input is not an argument form, in which case it
+    /// is treated as a fuzzy query over command labels.
+    fn parse_verb(input: &str) -> Option<(Command, String)> {
+        let (head, rest) = input.split_once(char::is_whitespace)?;
+        let head = head.to_lowercase();
+        let cmd = Command::ALL
+            .iter()
+            .copied()
+            .find(|c| c.verb() == Some(head.as_str()))?;
+        Some((cmd, rest.trim().to_string()))
     }
 
     /// Recompute filtered results using nucleo fuzzy matching.
     /// `excluded` contains commands to hide (e.g. kill/renice in remote mode).
     pub fn refilter_excluding(&mut self, excluded: &[Command]) {
+        self.refilter_ctx(excluded, None);
+    }
+
+    /// Recompute filtered results, ranking the active tab's commands first.
+    ///
+    /// Context matters more than raw fuzzy score here: "sort by memory" while
+    /// looking at the Network tab almost certainly means the network table.
+    pub fn refilter_ctx(&mut self, excluded: &[Command], tab: Option<Tab>) {
         let is_available = |cmd: &Command| !excluded.contains(cmd);
+
+        // An argument form collapses the list to the single command it names,
+        // so `kill firefox` cannot be confused with "Kill container".
+        if let Some((cmd, arg)) = Self::parse_verb(&self.input)
+            && is_available(&cmd)
+        {
+            self.arg = Some(arg);
+            self.filtered.clear();
+            self.filtered.push((cmd, Some(u16::MAX)));
+            self.selected = 0;
+            return;
+        }
+        self.arg = None;
 
         if self.input.is_empty() {
             self.filtered.clear();
-            self.filtered.extend(
-                Command::ALL
+            let mut candidates: Vec<Command> = Command::ALL
+                .iter()
+                .copied()
+                .filter(|c| !c.is_verb_only())
+                .filter(is_available)
+                .collect();
+            // Recently used first, then this tab's commands, then the rest.
+            candidates.sort_by_key(|c| {
+                let recency = self
+                    .history
                     .iter()
-                    .copied()
-                    .filter(is_available)
-                    .map(|cmd| (cmd, None)),
-            );
+                    .position(|h| h == c)
+                    .unwrap_or(Self::HISTORY_LEN);
+                let context = match (c.home_tab(), tab) {
+                    (Some(home), Some(active)) if home == active => 0,
+                    (None, _) => 1,
+                    _ => 2,
+                };
+                (recency, context)
+            });
+            self.filtered
+                .extend(candidates.into_iter().map(|cmd| (cmd, None)));
         } else {
             // PERF-M3: reuse the matcher across keystrokes — building one
             // allocates several scratch tables that we'd otherwise throw away.
@@ -334,6 +582,7 @@ impl PaletteState {
                 .iter()
                 .copied()
                 .enumerate()
+                .filter(|(_, cmd)| !cmd.is_verb_only())
                 .filter(|(_, cmd)| is_available(cmd))
                 .filter_map(|(idx, cmd)| {
                     // PERF-M3: lift the cached haystack instead of `format!`'ing
@@ -341,8 +590,17 @@ impl PaletteState {
                     let haystack = &haystacks[idx];
                     let mut buf = Vec::new();
                     let haystack_utf32 = Utf32Str::new(haystack, &mut buf);
-                    atom.score(haystack_utf32, matcher)
-                        .map(|score| (cmd, score))
+                    atom.score(haystack_utf32, matcher).map(|score| {
+                        // Commands belonging to the tab in front of the user
+                        // win ties. The bonus is deliberately small so it
+                        // reorders equals without overriding a clear match.
+                        let bonus = match (cmd.home_tab(), tab) {
+                            (Some(home), Some(active)) if home == active => 24,
+                            (None, _) => 8,
+                            _ => 0,
+                        };
+                        (cmd, score.saturating_add(bonus))
+                    })
                 })
                 .collect();
 
@@ -551,9 +809,6 @@ impl GpuSortField {
     }
 }
 
-/// Duration before a status message auto-clears.
-const STATUS_TIMEOUT_SECS: u64 = 5;
-
 /// Debounce window for filter-input keystroke bursts (PERF-H3).
 ///
 /// Held off recomputes coalesce a short typing burst into a single pipeline
@@ -572,14 +827,28 @@ pub struct AppState {
     pub tree_mode: bool,
     pub selected: usize,
     pub scroll_offset: usize,
-    pub show_palette: bool,
+    /// Which overlay owns the keyboard, if any.
+    pub overlay: Overlay,
     pub palette: PaletteState,
     /// Pending confirm dialog (kill/renice).
     pub confirm: Option<ConfirmAction>,
-    /// Status message with creation time (auto-clears after timeout).
-    pub status_message: Option<(String, Instant)>,
+    /// Toast stack and message log.
+    pub notifier: Notifier,
     /// Detected terminal capabilities.
     pub term_caps: TermCaps,
+    /// Active colour scheme.
+    pub theme_kind: ThemeKind,
+    /// When true, incoming snapshots are ignored so the user can read a
+    /// fast-moving table. Collection keeps running; only the view is frozen.
+    pub paused: bool,
+    /// Horizontal column-scroll offset for wide tables (`h` / `l`).
+    pub col_scroll: usize,
+    /// Selected entry in the contextual actions menu.
+    pub actions_selected: usize,
+    /// Scroll offset inside the help / log / inspector overlays.
+    pub overlay_scroll: usize,
+    /// Frame counter, used only to animate spinners.
+    pub tick: usize,
     running: bool,
     pub last_snapshot: Option<SystemSnapshot>,
     /// Derived: sorted + filtered process list.
@@ -656,9 +925,9 @@ pub struct AppState {
     /// Channel sender for container action outcomes. Spawned tokio tasks
     /// send their status messages here; the TUI main loop drains them via
     /// [`pump_action_results`].
-    action_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    action_tx: tokio::sync::mpsc::UnboundedSender<(Level, String)>,
     /// Matching receiver. Lives on AppState so call sites stay simple.
-    action_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    action_rx: tokio::sync::mpsc::UnboundedReceiver<(Level, String)>,
     /// Whether monitoring local machine or remote server.
     pub connection_mode: ConnectionMode,
     /// Render-coalescing flag (PERF-H1). Set by any state-mutating handler;
@@ -694,11 +963,17 @@ impl AppState {
             tree_mode: false,
             selected: 0,
             scroll_offset: 0,
-            show_palette: false,
+            overlay: Overlay::None,
             palette: PaletteState::new(),
             confirm: None,
-            status_message: None,
+            notifier: Notifier::new(),
             term_caps: TermCaps::default(),
+            theme_kind: ThemeKind::default(),
+            paused: false,
+            col_scroll: 0,
+            actions_selected: 0,
+            overlay_scroll: 0,
+            tick: 0,
             running: true,
             last_snapshot: None,
             visible_processes: Vec::new(),
@@ -754,6 +1029,7 @@ impl AppState {
             tree_mode: config.tree_mode,
             filter_input: config.filter.unwrap_or_default(),
             term_caps,
+            theme_kind: config.theme,
             connection_mode: config.connection_mode,
             ..Self::new()
         }
@@ -764,52 +1040,43 @@ impl AppState {
         matches!(self.connection_mode, ConnectionMode::Remote { .. })
     }
 
-    /// Returns the current status message if it hasn't expired.
-    pub fn active_status(&self) -> Option<&str> {
-        self.status_message.as_ref().and_then(|(msg, created)| {
-            if created.elapsed().as_secs() < STATUS_TIMEOUT_SECS {
-                Some(msg.as_str())
-            } else {
-                None
-            }
-        })
+    /// The newest visible message, if any.
+    pub fn active_status(&self) -> Option<&crate::notify::Toast> {
+        self.notifier.latest()
     }
 
-    /// Set a status message (auto-expires after STATUS_TIMEOUT_SECS).
+    /// Post a message with an explicit severity.
     ///
-    /// MED-S5: several call sites interpolate a process or container name into
-    /// the message, and the footer renders it verbatim. Scrubbing happens here
-    /// — once, for every current and future caller — rather than at each
-    /// `format!`.
-    fn set_status(&mut self, msg: String) {
-        let msg = scrub_ctrl(&msg).into_owned();
-        self.status_message = Some((msg, Instant::now()));
-        // A new status message changes what `draw_root` paints.
+    /// Severity is declared by the caller rather than sniffed out of the text:
+    /// 0.4 tested the message for the substring "failed", so rewording an error
+    /// silently painted it on the success colour.
+    pub fn notify(&mut self, level: Level, msg: impl Into<String>) {
+        self.notifier.push(level, msg);
         self.needs_redraw = true;
     }
 
-    /// Clear expired status messages.
-    fn clear_status_if_expired(&mut self) {
-        if let Some((_, created)) = &self.status_message
-            && created.elapsed().as_secs() >= STATUS_TIMEOUT_SECS
-        {
-            self.status_message = None;
-        }
+    /// Post an error.
+    fn set_error(&mut self, msg: String) {
+        self.notify(Level::Error, msg);
     }
 
-    /// Returns true and clears the status message iff there was an expired
-    /// status message at call time. Used by the event-driven render path
-    /// (PERF-H1) to schedule a final repaint when the bar should disappear
-    /// without spinning at 60 Hz to detect the transition.
+    /// Drop expired toasts, reporting whether anything changed.
+    ///
+    /// Used by the event-driven render path (PERF-H1) to schedule exactly one
+    /// repaint when a toast disappears, instead of spinning at 60 Hz to notice.
     pub fn status_message_just_expired(&mut self) -> bool {
-        let expired = self
-            .status_message
-            .as_ref()
-            .is_some_and(|(_, t)| t.elapsed().as_secs() >= STATUS_TIMEOUT_SECS);
-        if expired {
-            self.status_message = None;
-        }
-        expired
+        self.notifier.expire()
+    }
+
+    /// Time until the next toast expires, so the event loop can size its poll
+    /// timeout instead of waking up for nothing.
+    pub fn next_status_deadline(&self) -> Option<Duration> {
+        self.notifier.next_deadline()
+    }
+
+    /// Advance the animation counter (spinners). Cheap and wrapping.
+    pub fn tick(&mut self) {
+        self.tick = self.tick.wrapping_add(1);
     }
 
     pub fn running(&self) -> bool {
@@ -1030,8 +1297,9 @@ impl AppState {
     /// switch.
     pub fn toggle_kube_scope(&mut self) {
         let Some(engine) = self.cluster_engine.clone() else {
-            self.set_status(
-                "Namespace scope is local-only (unavailable in remote mode / --no-kube)".into(),
+            self.notify(
+                Level::Warning,
+                "Namespace scope is local-only (unavailable in remote mode / --no-kube)",
             );
             return;
         };
@@ -1046,7 +1314,7 @@ impl AppState {
                     None => "Kube scope: all namespaces".to_string(),
                 },
             };
-            let _ = tx.send(msg);
+            let _ = tx.send((Level::Info, msg));
         });
         // The row set is about to change out from under the cursor.
         self.kube_selected = 0;
@@ -1080,8 +1348,8 @@ impl AppState {
     /// status messages. Called by the TUI main loop every tick.
     pub fn pump_action_results(&mut self) {
         let mut had_any = false;
-        while let Ok(msg) = self.action_rx.try_recv() {
-            self.set_status(msg);
+        while let Ok((level, msg)) = self.action_rx.try_recv() {
+            self.notify(level, msg);
             had_any = true;
         }
         // A new status message changes what `draw_root` paints, so coalesce
@@ -1146,7 +1414,7 @@ impl AppState {
 
     fn request_container_action(&mut self, build: impl FnOnce(String, String) -> ConfirmAction) {
         if self.is_remote() {
-            self.set_status("Actions disabled in remote mode".into());
+            self.notify(Level::Warning, "Actions are disabled in remote mode");
             return;
         }
         if let Some(c) = self.selected_container() {
@@ -1181,7 +1449,7 @@ impl AppState {
     /// next scheduler tick rather than running detached.
     fn execute_container_action(&mut self, action: ConfirmAction) {
         let Some(engine) = self.container_engine.clone() else {
-            self.set_status("Container engine not configured".into());
+            self.notify(Level::Error, "No container engine is configured");
             return;
         };
         let tx = self.action_tx.clone();
@@ -1189,41 +1457,41 @@ impl AppState {
         match action {
             ConfirmAction::StopContainer { id, name } => {
                 tokio::spawn(async move {
-                    let msg = tokio::select! {
+                    let outcome = tokio::select! {
                         biased;
                         _ = token.cancelled() => return,
                         result = engine.stop(&id, Some(10)) => match result {
-                            Ok(()) => format!("Container {name} stopped"),
-                            Err(e) => format!("Failed to stop {name}: {e}"),
+                            Ok(()) => (Level::Success, format!("Container {name} stopped")),
+                            Err(e) => (Level::Error, format!("Failed to stop {name}: {e}")),
                         },
                     };
-                    let _ = tx.send(msg);
+                    let _ = tx.send(outcome);
                 });
             }
             ConfirmAction::KillContainer { id, name } => {
                 tokio::spawn(async move {
-                    let msg = tokio::select! {
+                    let outcome = tokio::select! {
                         biased;
                         _ = token.cancelled() => return,
                         result = engine.kill(&id) => match result {
-                            Ok(()) => format!("Container {name} killed"),
-                            Err(e) => format!("Failed to kill {name}: {e}"),
+                            Ok(()) => (Level::Success, format!("Container {name} killed")),
+                            Err(e) => (Level::Error, format!("Failed to kill {name}: {e}")),
                         },
                     };
-                    let _ = tx.send(msg);
+                    let _ = tx.send(outcome);
                 });
             }
             ConfirmAction::RestartContainer { id, name } => {
                 tokio::spawn(async move {
-                    let msg = tokio::select! {
+                    let outcome = tokio::select! {
                         biased;
                         _ = token.cancelled() => return,
                         result = engine.restart(&id) => match result {
-                            Ok(()) => format!("Container {name} restarted"),
-                            Err(e) => format!("Failed to restart {name}: {e}"),
+                            Ok(()) => (Level::Success, format!("Container {name} restarted")),
+                            Err(e) => (Level::Error, format!("Failed to restart {name}: {e}")),
                         },
                     };
-                    let _ = tx.send(msg);
+                    let _ = tx.send(outcome);
                 });
             }
             _ => unreachable!("execute_container_action only handles container variants"),
@@ -1231,7 +1499,14 @@ impl AppState {
     }
 
     /// Update the snapshot and recompute derived views.
+    ///
+    /// Ignored while paused: `Space` freezes the view so a fast-moving table
+    /// can actually be read. Collection keeps running in the background, so
+    /// resuming shows the present rather than replaying a backlog.
     pub fn apply_snapshot(&mut self, snapshot: SystemSnapshot) {
+        if self.paused {
+            return;
+        }
         self.network_history.push(snapshot.networks.clone());
         if let Some(cs) = snapshot.containers.as_ref() {
             self.push_container_history(cs);
@@ -1388,361 +1663,642 @@ impl AppState {
         }
     }
 
-    /// Handle a keyboard event.
+    // -----------------------------------------------------------------
+    // Input routing
+    // -----------------------------------------------------------------
+
+    /// Route a key press to whatever currently owns the keyboard.
+    ///
+    /// The order here *is* the modality model: confirm dialog, then overlay,
+    /// then filter editing, then the keymap. 0.4 spread the same decision over
+    /// four independent booleans, which is why `Esc` behaved differently
+    /// depending on which one happened to be set.
     pub fn handle_key_event(&mut self, key: KeyEvent) {
-        // Clear expired status on any key press.
-        self.clear_status_if_expired();
+        self.notifier.expire();
 
-        // Confirm dialog captures y/n/Esc only.
-        if self.confirm.is_some() {
-            self.handle_confirm_key(key);
-            return;
-        }
-
-        // Palette mode captures most keys.
-        if self.show_palette {
-            self.handle_palette_key(key);
-            return;
-        }
-
-        // Filter mode captures most keys as text input.
-        if self.filter_active
-            || self.net_filter_active
-            || self.containers_filter_active
-            || self.kube_filter_active
-            || self.gpu_filter_active
-        {
-            self.handle_filter_key(key);
-            return;
-        }
-
-        // Clear status on any normal key press.
-        self.status_message = None;
-
-        match key.code {
-            // Quit
-            KeyCode::Char('q') => self.quit(),
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit(),
-
-            // Navigation (tab-aware)
-            KeyCode::Down | KeyCode::Char('j') => {
-                let count = self.item_count();
-                if count > 0 {
-                    let (sel, _) = self.selected_mut();
-                    *sel = (*sel + 1).min(count - 1);
-                }
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                let (sel, _) = self.selected_mut();
-                *sel = sel.saturating_sub(1);
-            }
-            KeyCode::PageDown => {
-                let count = self.item_count();
-                if count > 0 {
-                    let (sel, _) = self.selected_mut();
-                    *sel = (*sel + 20).min(count - 1);
-                }
-            }
-            KeyCode::PageUp => {
-                let (sel, _) = self.selected_mut();
-                *sel = sel.saturating_sub(20);
-            }
-            KeyCode::Home | KeyCode::Char('g') => {
-                let (sel, _) = self.selected_mut();
-                *sel = 0;
-            }
-            KeyCode::End | KeyCode::Char('G') => {
-                let count = self.item_count();
-                if count > 0 {
-                    let (sel, _) = self.selected_mut();
-                    *sel = count - 1;
-                }
-            }
-
-            // Direct tab selection (Alt+1/Alt+2)
-            KeyCode::Char('1') if key.modifiers.contains(KeyModifiers::ALT) => {
-                self.tab = Tab::General;
-            }
-            KeyCode::Char('2') if key.modifiers.contains(KeyModifiers::ALT) => {
-                self.tab = Tab::Processes;
-            }
-            KeyCode::Char('3') if key.modifiers.contains(KeyModifiers::ALT) => {
-                self.tab = Tab::Network;
-            }
-            KeyCode::Char('4') if key.modifiers.contains(KeyModifiers::ALT) => {
-                self.tab = Tab::Containers;
-            }
-            KeyCode::Char('5') if key.modifiers.contains(KeyModifiers::ALT) => {
-                self.tab = Tab::Kube;
-            }
-            KeyCode::Char('6') if key.modifiers.contains(KeyModifiers::ALT) => {
-                self.tab = Tab::Gpu;
-            }
-
-            // Arrow tab navigation
-            KeyCode::Right => {
-                self.tab = self.tab.next();
-            }
-            KeyCode::Left => {
-                self.tab = self.tab.prev();
-            }
-
-            // Tab switching
-            KeyCode::Tab => {
-                self.tab = self.tab.next();
-            }
-            KeyCode::BackTab => {
-                self.tab = self.tab.prev();
-            }
-
-            // Tree mode toggle (G-08: reset selection to avoid jumping to wrong process)
-            KeyCode::Char('t') => {
-                self.tree_mode = !self.tree_mode;
-                self.selected = 0;
-                self.scroll_offset = 0;
-                self.recompute_visible();
-            }
-
-            // Sort cycling (tab-aware)
-            KeyCode::Char('s') => match self.tab {
-                Tab::Network => {
-                    self.net_sort_field = next_net_sort_field(self.net_sort_field);
-                }
-                Tab::Containers => {
-                    self.containers_sort_field =
-                        next_container_sort_field(self.containers_sort_field);
-                    self.recompute_containers_view();
-                }
-                Tab::Kube => {
-                    self.kube_sort_field =
-                        next_kube_sort_field(self.kube_sort_field, self.kube_subview);
-                    self.kube_selected = 0;
-                    self.kube_scroll_offset = 0;
-                }
-                Tab::Gpu => {
-                    self.gpu_sort_field =
-                        next_gpu_sort_field(self.gpu_sort_field, self.gpu_subview);
-                    self.gpu_selected = 0;
-                    self.gpu_scroll_offset = 0;
-                }
-                _ => {
-                    self.sort_field = next_sort_field(self.sort_field);
-                    self.recompute_visible();
-                }
-            },
-            KeyCode::Char('S') | KeyCode::Char('I') => match self.tab {
-                Tab::Network => {
-                    self.net_sort_order = match self.net_sort_order {
-                        SortOrder::Asc => SortOrder::Desc,
-                        SortOrder::Desc => SortOrder::Asc,
-                    };
-                }
-                Tab::Containers => {
-                    self.containers_sort_order = match self.containers_sort_order {
-                        SortOrder::Asc => SortOrder::Desc,
-                        SortOrder::Desc => SortOrder::Asc,
-                    };
-                    self.recompute_containers_view();
-                }
-                Tab::Kube => {
-                    self.kube_sort_order = match self.kube_sort_order {
-                        SortOrder::Asc => SortOrder::Desc,
-                        SortOrder::Desc => SortOrder::Asc,
-                    };
-                }
-                Tab::Gpu => {
-                    self.gpu_sort_order = match self.gpu_sort_order {
-                        SortOrder::Asc => SortOrder::Desc,
-                        SortOrder::Desc => SortOrder::Asc,
-                    };
-                }
-                _ => {
-                    self.sort_order = match self.sort_order {
-                        SortOrder::Asc => SortOrder::Desc,
-                        SortOrder::Desc => SortOrder::Asc,
-                    };
-                    self.recompute_visible();
-                }
-            },
-
-            // Kube sub-view switching (only when the Kube tab is focused).
-            KeyCode::Char('P') if self.tab == Tab::Kube => {
-                self.switch_kube_subview(KubeSubview::Pods);
-            }
-            KeyCode::Char('N') if self.tab == Tab::Kube => {
-                self.switch_kube_subview(KubeSubview::Nodes);
-            }
-            KeyCode::Char('D') if self.tab == Tab::Kube => {
-                self.switch_kube_subview(KubeSubview::Deployments);
-            }
-            // Namespace scope toggle (Kube tab, local mode).
-            KeyCode::Char('A') if self.tab == Tab::Kube => {
-                self.toggle_kube_scope();
-            }
-
-            // GPU sub-view switching. `D` and `P` are also Kube bindings, but
-            // both arms are tab-guarded so the two tabs never contend.
-            KeyCode::Char('D') if self.tab == Tab::Gpu => {
-                self.switch_gpu_subview(GpuSubview::Devices);
-            }
-            KeyCode::Char('P') if self.tab == Tab::Gpu => {
-                self.switch_gpu_subview(GpuSubview::Procs);
-            }
-
-            // F-key sort shortcuts
-            KeyCode::F(1) => {
-                self.sort_field = SortField::Pid;
-                self.recompute_visible();
-            }
-            KeyCode::F(2) => {
-                self.sort_field = SortField::Name;
-                self.recompute_visible();
-            }
-            KeyCode::F(3) => {
-                self.sort_field = SortField::Cpu;
-                self.recompute_visible();
-            }
-            KeyCode::F(4) => {
-                self.sort_field = SortField::Mem;
-                self.recompute_visible();
-            }
-            KeyCode::F(5) => {
-                self.sort_field = SortField::User;
-                self.recompute_visible();
-            }
-
-            // Kill process — F9 (Processes tab only, local mode only)
-            KeyCode::F(9) if self.tab == Tab::Processes => {
-                if self.is_remote() {
-                    self.set_status("Actions disabled in remote mode".to_string());
-                } else {
-                    self.request_kill(Signal::Term);
-                }
-            }
-
-            // Force kill — F10 (Processes tab only, local mode only)
-            KeyCode::F(10) if self.tab == Tab::Processes => {
-                if self.is_remote() {
-                    self.set_status("Actions disabled in remote mode".to_string());
-                } else {
-                    self.request_kill(Signal::Kill);
-                }
-            }
-
-            // Renice — F7 lower priority (+1), F8 higher priority (-1)
-            KeyCode::F(7) if self.tab == Tab::Processes => {
-                if self.is_remote() {
-                    self.set_status("Actions disabled in remote mode".to_string());
-                } else {
-                    self.request_renice(1);
-                }
-            }
-            KeyCode::F(8) if self.tab == Tab::Processes => {
-                if self.is_remote() {
-                    self.set_status("Actions disabled in remote mode".to_string());
-                } else {
-                    self.request_renice(-1);
-                }
-            }
-
-            // Container actions — F9 Stop, F10 Kill, F11 Restart (Containers
-            // tab, local only). `request_container_*` handles the remote-mode
-            // notice internally.
-            KeyCode::F(9) if self.tab == Tab::Containers => {
-                self.request_container_stop();
-            }
-            KeyCode::F(10) if self.tab == Tab::Containers => {
-                self.request_container_kill();
-            }
-            KeyCode::F(11) if self.tab == Tab::Containers => {
-                self.request_container_restart();
-            }
-
-            // Clear filter with Esc (when not in filter input mode)
-            KeyCode::Esc => match self.tab {
-                Tab::Network => {
-                    if !self.net_filter_input.is_empty() {
-                        self.net_filter_input.clear();
-                    }
-                }
-                Tab::Containers => {
-                    if !self.containers_filter_input.is_empty() {
-                        self.containers_filter_input.clear();
-                        self.recompute_containers_view();
-                    }
-                }
-                Tab::Kube => {
-                    if !self.kube_filter_input.is_empty() {
-                        self.kube_filter_input.clear();
-                        self.kube_selected = 0;
-                        self.kube_scroll_offset = 0;
-                    }
-                }
-                Tab::Gpu => {
-                    if !self.gpu_filter_input.is_empty() {
-                        self.gpu_filter_input.clear();
-                        self.gpu_selected = 0;
-                        self.gpu_scroll_offset = 0;
-                    }
-                }
-                _ => {
-                    if !self.filter_input.is_empty() {
-                        self.filter_input.clear();
-                        self.recompute_visible();
-                    }
-                }
-            },
-
-            // Filter mode (tab-aware)
-            KeyCode::Char('/') => match self.tab {
-                Tab::Network => self.net_filter_active = true,
-                Tab::Containers => self.containers_filter_active = true,
-                Tab::Kube => self.kube_filter_active = true,
-                Tab::Gpu => self.gpu_filter_active = true,
-                _ => self.filter_active = true,
-            },
-
-            // Command palette toggle
-            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.open_palette();
-            }
-
-            _ => {}
-        }
-    }
-
-    /// Request to kill the currently selected process (opens confirm dialog).
-    fn request_kill(&mut self, signal: Signal) {
-        if let Some(proc) = self.selected_process() {
-            self.confirm = Some(ConfirmAction::Kill {
-                pid: proc.pid,
-                name: proc.name.clone(),
-                signal,
-            });
-        }
-    }
-
-    /// Request to renice the currently selected process (opens confirm dialog).
-    fn request_renice(&mut self, delta: i32) {
-        if let Some(proc) = self.selected_process() {
-            self.confirm = Some(ConfirmAction::Renice {
-                pid: proc.pid,
-                name: proc.name.clone(),
-                delta,
-            });
-        }
-    }
-
-    /// Handle keys while the confirm dialog is open.
-    fn handle_confirm_key(&mut self, key: KeyEvent) {
-        // Ctrl+C always quits.
+        // Ctrl+C quits from every mode, unconditionally. Nothing below may
+        // capture it — a user who cannot leave is a user we have trapped.
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.quit();
             return;
         }
 
+        if self.confirm.is_some() {
+            self.handle_confirm_key(key);
+            return;
+        }
+
+        match self.overlay {
+            Overlay::Palette | Overlay::Command => {
+                self.handle_palette_key(key);
+                return;
+            }
+            Overlay::Help | Overlay::Log | Overlay::Inspector => {
+                self.handle_scrollable_overlay_key(key);
+                return;
+            }
+            Overlay::Actions => {
+                self.handle_actions_key(key);
+                return;
+            }
+            Overlay::None => {}
+        }
+
+        if self.filter_editing() {
+            self.handle_filter_key(key);
+            return;
+        }
+
+        if let Some(action) = keymap::resolve(key.code, key.modifiers, self.tab) {
+            self.dispatch(action);
+        }
+        self.mark_dirty();
+    }
+
+    /// Perform an action, whatever asked for it: a key, the palette, the
+    /// actions menu or a mouse click. One implementation, one behaviour.
+    pub fn dispatch(&mut self, action: Action) {
+        // A remote server owns its own processes and sockets; muxtop is a
+        // viewer there. Refuse loudly rather than silently doing nothing.
+        if action.is_local_only() && self.is_remote() {
+            self.notify(Level::Warning, "Actions are disabled in remote mode");
+            return;
+        }
+
+        match action {
+            // -- application --
+            Action::Quit => self.quit(),
+            Action::Help => self.open_overlay(Overlay::Help),
+            Action::Palette => self.open_palette(),
+            Action::CommandMode => self.open_command_line(),
+            Action::ToggleLog => self.open_overlay(Overlay::Log),
+            Action::TogglePause => {
+                self.paused = !self.paused;
+                let msg = if self.paused {
+                    "Paused — press Space to resume"
+                } else {
+                    "Resumed"
+                };
+                self.notify(Level::Info, msg);
+            }
+            Action::Refresh => {
+                // Collection runs on its own schedule; the useful thing a
+                // manual refresh can do is un-freeze a paused view.
+                if self.paused {
+                    self.paused = false;
+                    self.notify(Level::Info, "Resumed");
+                } else {
+                    self.notify(Level::Info, "Refreshing on the next collector tick");
+                }
+            }
+
+            // -- navigation --
+            Action::NextTab => self.go_to_tab(self.tab.next()),
+            Action::PrevTab => self.go_to_tab(self.tab.prev()),
+            Action::GoTab(tab) => self.go_to_tab(tab),
+            Action::NextSubview => self.cycle_subview(1),
+            Action::PrevSubview => self.cycle_subview(-1),
+
+            // -- table --
+            Action::RowDown => self.move_selection(1),
+            Action::RowUp => self.move_selection(-1),
+            Action::RowPageDown => self.move_selection(Self::PAGE as isize),
+            Action::RowPageUp => self.move_selection(-(Self::PAGE as isize)),
+            Action::RowHalfDown => self.move_selection(Self::PAGE as isize / 2),
+            Action::RowHalfUp => self.move_selection(-(Self::PAGE as isize) / 2),
+            Action::RowFirst => self.select_index(0),
+            Action::RowLast => self.select_index(self.item_count().saturating_sub(1)),
+            Action::ColLeft => self.col_scroll = self.col_scroll.saturating_sub(1),
+            Action::ColRight => self.col_scroll = (self.col_scroll + 1).min(Self::MAX_COL_SCROLL),
+            Action::OpenInspector => {
+                if self.item_count() == 0 {
+                    self.notify(Level::Info, "Nothing selected");
+                } else {
+                    self.open_overlay(Overlay::Inspector);
+                }
+            }
+            Action::ActionsMenu => {
+                if self.tab_actions().is_empty() {
+                    self.notify(Level::Info, "No actions available on this tab");
+                } else {
+                    self.actions_selected = 0;
+                    self.open_overlay(Overlay::Actions);
+                }
+            }
+            Action::CopySelection => self.copy_selection(),
+
+            // -- sort & filter --
+            Action::OpenFilter => self.set_filter_editing(true),
+            Action::Back => self.go_back(),
+            Action::CycleSort => self.cycle_sort(),
+            Action::ReverseSort => self.reverse_sort(),
+
+            // -- processes --
+            Action::ToggleTree => {
+                self.tree_mode = !self.tree_mode;
+                self.selected = 0;
+                self.scroll_offset = 0;
+                self.recompute_visible();
+            }
+            Action::Renice(delta) => self.request_renice(delta),
+            Action::Kill(signal) => self.request_kill(signal),
+
+            // -- containers --
+            Action::ContainerStop => self.request_container_stop(),
+            Action::ContainerKill => self.request_container_kill(),
+            Action::ContainerRestart => self.request_container_restart(),
+
+            // -- kubernetes --
+            Action::KubeSubview(sv) => self.switch_kube_subview(sv),
+            Action::ToggleKubeScope => self.toggle_kube_scope(),
+
+            // -- gpu --
+            Action::GpuSubview(sv) => self.switch_gpu_subview(sv),
+        }
+    }
+
+    /// Rows moved by a page key.
+    const PAGE: usize = 20;
+    /// Upper bound on horizontal column scrolling, so `l` cannot walk a table
+    /// off the edge of the world.
+    const MAX_COL_SCROLL: usize = 8;
+
+    /// Switch tabs, resetting the per-view transient state that would be
+    /// meaningless in the new context.
+    fn go_to_tab(&mut self, tab: Tab) {
+        if self.tab == tab {
+            return;
+        }
+        self.tab = tab;
+        self.col_scroll = 0;
+        // Leaving a tab abandons a half-typed filter on it, but keeps the
+        // filter itself: coming back should find the view as it was left.
+        self.filter_active = false;
+        self.net_filter_active = false;
+        self.containers_filter_active = false;
+        self.kube_filter_active = false;
+    }
+
+    /// `[` / `]` — walk the active tab's sub-views. Only Kubernetes has any
+    /// today; the action exists so future tabs inherit the binding for free.
+    fn cycle_subview(&mut self, delta: isize) {
+        match self.tab {
+            Tab::Kube => {
+                const ORDER: [KubeSubview; 3] = [
+                    KubeSubview::Pods,
+                    KubeSubview::Nodes,
+                    KubeSubview::Deployments,
+                ];
+                let idx = ORDER
+                    .iter()
+                    .position(|&s| s == self.kube_subview)
+                    .unwrap_or(0) as isize;
+                let next = (idx + delta).rem_euclid(ORDER.len() as isize) as usize;
+                self.switch_kube_subview(ORDER[next]);
+            }
+            Tab::Gpu => {
+                const ORDER: [GpuSubview; 2] = [GpuSubview::Devices, GpuSubview::Procs];
+                let idx = ORDER
+                    .iter()
+                    .position(|&s| s == self.gpu_subview)
+                    .unwrap_or(0) as isize;
+                let next = (idx + delta).rem_euclid(ORDER.len() as isize) as usize;
+                self.switch_gpu_subview(ORDER[next]);
+            }
+            _ => {}
+        }
+    }
+
+    /// Move the cursor by `delta` rows, clamped to the list.
+    fn move_selection(&mut self, delta: isize) {
+        let count = self.item_count();
+        if count == 0 {
+            return;
+        }
+        let (sel, _) = self.selected_mut();
+        let next = (*sel as isize + delta).clamp(0, count as isize - 1);
+        *sel = next as usize;
+    }
+
+    fn select_index(&mut self, index: usize) {
+        let count = self.item_count();
+        if count == 0 {
+            return;
+        }
+        let (sel, _) = self.selected_mut();
+        *sel = index.min(count - 1);
+    }
+
+    /// `Esc` — one step back, every time.
+    ///
+    /// Overlay, then toasts, then filter editing, then the filter itself. It
+    /// never quits: a monitor that exits on a stray Esc is a monitor that
+    /// loses your place.
+    fn go_back(&mut self) {
+        if self.overlay != Overlay::None {
+            self.close_overlay();
+        } else if !self.notifier.is_empty() {
+            self.notifier.dismiss_all();
+        } else if self.filter_editing() {
+            self.set_filter_editing(false);
+        } else if !self.filter_text().is_empty() {
+            self.clear_filter();
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Filters — one implementation for all four tabs
+    // -----------------------------------------------------------------
+
+    /// Whether the active tab's filter input has the keyboard.
+    pub fn filter_editing(&self) -> bool {
+        match self.tab {
+            Tab::Gpu => self.gpu_filter_active,
+            Tab::Network => self.net_filter_active,
+            Tab::Containers => self.containers_filter_active,
+            Tab::Kube => self.kube_filter_active,
+            _ => self.filter_active,
+        }
+    }
+
+    /// The active tab's filter text.
+    pub fn filter_text(&self) -> &str {
+        match self.tab {
+            Tab::Gpu => &self.gpu_filter_input,
+            Tab::Network => &self.net_filter_input,
+            Tab::Containers => &self.containers_filter_input,
+            Tab::Kube => &self.kube_filter_input,
+            _ => &self.filter_input,
+        }
+    }
+
+    fn set_filter_editing(&mut self, on: bool) {
+        match self.tab {
+            Tab::Gpu => self.gpu_filter_active = on,
+            Tab::Network => self.net_filter_active = on,
+            Tab::Containers => self.containers_filter_active = on,
+            Tab::Kube => self.kube_filter_active = on,
+            _ => self.filter_active = on,
+        }
+    }
+
+    fn filter_text_mut(&mut self) -> &mut String {
+        match self.tab {
+            Tab::Gpu => &mut self.gpu_filter_input,
+            Tab::Network => &mut self.net_filter_input,
+            Tab::Containers => &mut self.containers_filter_input,
+            Tab::Kube => &mut self.kube_filter_input,
+            _ => &mut self.filter_input,
+        }
+    }
+
+    /// Clear the active tab's filter.
+    ///
+    /// 0.4's palette command had no `Tab::Kube` arm, so "Clear filter" on the
+    /// Kube tab silently cleared the *process* filter instead. Routing every
+    /// caller through one method is what makes that class of bug impossible.
+    pub fn clear_filter(&mut self) {
+        self.filter_text_mut().clear();
+        self.after_filter_change(true);
+    }
+
+    /// Replace the active tab's filter wholesale (used by `filter <text>`).
+    pub fn set_filter(&mut self, text: impl Into<String>) {
+        *self.filter_text_mut() = text.into();
+        self.after_filter_change(true);
+    }
+
+    /// Re-run whatever the active tab derives from its filter.
+    fn after_filter_change(&mut self, immediate: bool) {
+        match self.tab {
+            Tab::Containers => self.recompute_containers_view(),
+            Tab::Kube | Tab::Gpu | Tab::Network => {}
+            _ => {
+                if immediate {
+                    self.last_filter_change = None;
+                    self.recompute_visible();
+                } else {
+                    self.recompute_visible_debounced();
+                }
+            }
+        }
+        // A filter change can shrink the list under the cursor.
+        let count = self.item_count();
+        let (sel, off) = self.selected_mut();
+        *sel = widgets::clamp_selection(*sel, count);
+        *off = 0;
+        self.mark_dirty();
+    }
+
+    /// Maximum number of characters accepted in a filter input.
+    const MAX_FILTER_LEN: usize = 256;
+
+    /// Handle keys while a filter input has the keyboard.
+    fn handle_filter_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
+            KeyCode::Esc => {
+                // First Esc leaves the input; the filter stays applied. A
+                // second Esc (handled by `go_back`) clears it.
+                self.set_filter_editing(false);
+            }
+            KeyCode::Enter => {
+                self.set_filter_editing(false);
+                self.after_filter_change(true);
+            }
+            KeyCode::Backspace => {
+                self.filter_text_mut().pop();
+                self.after_filter_change(false);
+            }
+            // A control chord is a command we do not have here, not text.
+            KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => {}
+            KeyCode::Char(c) if self.filter_text().len() < Self::MAX_FILTER_LEN => {
+                self.filter_text_mut().push(c);
+                self.after_filter_change(false);
+            }
+            _ => {}
+        }
+        self.mark_dirty();
+    }
+
+    // -----------------------------------------------------------------
+    // Sorting
+    // -----------------------------------------------------------------
+
+    fn cycle_sort(&mut self) {
+        match self.tab {
+            Tab::Network => self.net_sort_field = next_net_sort_field(self.net_sort_field),
+            Tab::Containers => {
+                self.containers_sort_field = next_container_sort_field(self.containers_sort_field);
+                self.recompute_containers_view();
+            }
+            Tab::Kube => {
+                self.kube_sort_field =
+                    next_kube_sort_field(self.kube_sort_field, self.kube_subview);
+                self.kube_selected = 0;
+                self.kube_scroll_offset = 0;
+            }
+            Tab::Gpu => {
+                self.gpu_sort_field = next_gpu_sort_field(self.gpu_sort_field, self.gpu_subview);
+                self.gpu_selected = 0;
+                self.gpu_scroll_offset = 0;
+            }
+            _ => {
+                self.sort_field = next_sort_field(self.sort_field);
+                self.recompute_visible();
+            }
+        }
+    }
+
+    fn reverse_sort(&mut self) {
+        let flip = |o: SortOrder| match o {
+            SortOrder::Asc => SortOrder::Desc,
+            SortOrder::Desc => SortOrder::Asc,
+        };
+        match self.tab {
+            Tab::Network => self.net_sort_order = flip(self.net_sort_order),
+            Tab::Containers => {
+                self.containers_sort_order = flip(self.containers_sort_order);
+                self.recompute_containers_view();
+            }
+            Tab::Kube => self.kube_sort_order = flip(self.kube_sort_order),
+            Tab::Gpu => self.gpu_sort_order = flip(self.gpu_sort_order),
+            _ => {
+                self.sort_order = flip(self.sort_order);
+                self.recompute_visible();
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Row identity — inspector, clipboard, argument commands
+    // -----------------------------------------------------------------
+
+    /// A short identifier for the selected row: PID, interface name, container
+    /// id or Kubernetes object name, depending on the tab.
+    pub fn selected_identifier(&self) -> Option<String> {
+        match self.tab {
+            Tab::Network => self
+                .visible_interfaces()
+                .get(self.net_selected)
+                .map(|i| i.name.clone()),
+            Tab::Containers => self
+                .sorted_filtered_containers()
+                .get(self.containers_selected)
+                .map(|c| c.id_full.clone()),
+            Tab::Kube => self.selected_kube_name(),
+            Tab::Gpu => self.selected_gpu_name(),
+            _ => self.selected_process().map(|p| p.pid.to_string()),
+        }
+    }
+
+    /// Network interfaces after the filter, in snapshot order.
+    pub fn visible_interfaces(&self) -> Vec<muxtop_core::network::NetworkInterfaceSnapshot> {
+        let Some(snapshot) = self.last_snapshot.as_ref() else {
+            return Vec::new();
+        };
+        let filter = self.net_filter_input.to_lowercase();
+        snapshot
+            .networks
+            .interfaces
+            .iter()
+            .filter(|i| filter.is_empty() || i.name.to_lowercase().contains(&filter))
+            .cloned()
+            .collect()
+    }
+
+    /// Name of the selected Kubernetes object, whichever sub-view is active.
+    fn selected_kube_name(&self) -> Option<String> {
+        let snap = self.last_snapshot.as_ref()?.kube.as_ref()?;
+        let f = self.kube_filter_input.to_lowercase();
+        let matches = |name: &str, ns: &str| {
+            f.is_empty() || name.to_lowercase().contains(&f) || ns.to_lowercase().contains(&f)
+        };
+        match self.kube_subview {
+            KubeSubview::Pods => snap
+                .pods
+                .iter()
+                .filter(|p| matches(&p.name, &p.namespace))
+                .nth(self.kube_selected)
+                .map(|p| p.name.clone()),
+            KubeSubview::Nodes => snap
+                .nodes
+                .iter()
+                .filter(|n| matches(&n.name, ""))
+                .nth(self.kube_selected)
+                .map(|n| n.name.clone()),
+            KubeSubview::Deployments => snap
+                .deployments
+                .iter()
+                .filter(|d| matches(&d.name, &d.namespace))
+                .nth(self.kube_selected)
+                .map(|d| d.name.clone()),
+        }
+    }
+
+    /// Identifier of the selected GPU row: the device's name, or the PID of
+    /// the process holding VRAM.
+    fn selected_gpu_name(&self) -> Option<String> {
+        let snap = self.last_snapshot.as_ref()?.gpu.as_ref()?;
+        let f = self.gpu_filter_input.to_lowercase();
+        match self.gpu_subview {
+            GpuSubview::Devices => snap
+                .devices
+                .iter()
+                .filter(|d| f.is_empty() || d.name.to_lowercase().contains(&f))
+                .nth(self.gpu_selected)
+                .map(|d| d.name.clone()),
+            GpuSubview::Procs => snap
+                .processes
+                .iter()
+                .filter(|p| f.is_empty() || p.name.to_lowercase().contains(&f))
+                .nth(self.gpu_selected)
+                .map(|p| p.pid.to_string()),
+        }
+    }
+
+    /// `y` — copy the selected row's identifier to the system clipboard.
+    ///
+    /// Uses OSC 52, which travels over ssh and through tmux, because muxtop's
+    /// whole point is being useful on a machine you are not sitting at.
+    fn copy_selection(&mut self) {
+        let Some(id) = self.selected_identifier() else {
+            self.notify(Level::Info, "Nothing selected");
+            return;
+        };
+        match crate::clipboard::copy(&id) {
+            Ok(()) => self.notify(Level::Success, format!("Copied {id}")),
+            Err(e) => self.notify(Level::Error, format!("Clipboard unavailable: {e}")),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Overlays
+    // -----------------------------------------------------------------
+
+    fn open_overlay(&mut self, overlay: Overlay) {
+        self.overlay = overlay;
+        self.overlay_scroll = 0;
+        self.mark_dirty();
+    }
+
+    /// Close whatever overlay is open.
+    pub fn close_overlay(&mut self) {
+        self.overlay = Overlay::None;
+        self.overlay_scroll = 0;
+        self.palette.input.clear();
+        self.palette.selected = 0;
+        self.palette.arg = None;
+        self.mark_dirty();
+    }
+
+    /// Whether the command palette is on screen.
+    pub fn show_palette(&self) -> bool {
+        matches!(self.overlay, Overlay::Palette | Overlay::Command)
+    }
+
+    /// Whether the palette is in typed-command mode rather than fuzzy mode.
+    pub fn command_mode(&self) -> bool {
+        self.overlay == Overlay::Command
+    }
+
+    /// Keys shared by the read-only, scrollable overlays.
+    fn handle_scrollable_overlay_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.close_overlay(),
+            KeyCode::Char('?') if self.overlay == Overlay::Help => self.close_overlay(),
+            KeyCode::Enter if self.overlay == Overlay::Inspector => self.close_overlay(),
+            KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.close_overlay()
+            }
+            KeyCode::Down | KeyCode::Char('j') => self.overlay_scroll += 1,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.overlay_scroll = self.overlay_scroll.saturating_sub(1)
+            }
+            KeyCode::PageDown => self.overlay_scroll += Self::PAGE,
+            KeyCode::PageUp => self.overlay_scroll = self.overlay_scroll.saturating_sub(Self::PAGE),
+            KeyCode::Home | KeyCode::Char('g') => self.overlay_scroll = 0,
+            KeyCode::Char('y') if self.overlay == Overlay::Inspector => self.copy_selection(),
+            _ => {}
+        }
+        self.mark_dirty();
+    }
+
+    /// The actions offered by `x` on the active tab, in keymap order.
+    ///
+    /// Derived from the keymap, so an action added there appears here without
+    /// anybody remembering to add it.
+    pub fn tab_actions(&self) -> Vec<(&'static str, &'static str, Action)> {
+        keymap::for_tab(self.tab)
+            // Tab-scoped only: `x` itself is a global action, and a menu that
+            // offers to open itself is noise.
+            .filter(|b| matches!(b.scope, keymap::Scope::Tab(t) if t == self.tab))
+            .filter(|b| b.group == keymap::Group::Actions && b.primary)
+            .filter(|b| !(self.is_remote() && b.action.is_local_only()))
+            .map(|b| (b.display, b.label, b.action))
+            .collect()
+    }
+
+    fn handle_actions_key(&mut self, key: KeyEvent) {
+        let actions = self.tab_actions();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('x') => self.close_overlay(),
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.actions_selected =
+                    widgets::clamp_selection(self.actions_selected + 1, actions.len());
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.actions_selected = self.actions_selected.saturating_sub(1);
+            }
+            KeyCode::Enter => {
+                if let Some(&(_, _, action)) = actions.get(self.actions_selected) {
+                    self.close_overlay();
+                    self.dispatch(action);
+                }
+            }
+            _ => {}
+        }
+        self.mark_dirty();
+    }
+
+    // -----------------------------------------------------------------
+    // Confirmation
+    // -----------------------------------------------------------------
+
+    /// Request to kill the currently selected process (opens confirm dialog).
+    fn request_kill(&mut self, signal: Signal) {
+        match self.selected_process() {
+            Some(proc) => {
+                self.confirm = Some(ConfirmAction::Kill {
+                    pid: proc.pid,
+                    name: proc.name.clone(),
+                    signal,
+                });
+            }
+            None => self.notify(Level::Info, "No process selected"),
+        }
+    }
+
+    /// Request to renice the currently selected process (opens confirm dialog).
+    fn request_renice(&mut self, delta: i32) {
+        match self.selected_process() {
+            Some(proc) => {
+                self.confirm = Some(ConfirmAction::Renice {
+                    pid: proc.pid,
+                    name: proc.name.clone(),
+                    delta,
+                });
+            }
+            None => self.notify(Level::Info, "No process selected"),
+        }
+    }
+
+    /// Handle keys while the confirm dialog is up.
+    ///
+    /// Cancel is the default: `Esc`, `n` and any unbound key leave the dialog
+    /// standing rather than doing something irreversible.
+    fn handle_confirm_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                 if let Some(action) = self.confirm.take() {
                     self.execute_confirm(action);
                 }
@@ -1752,9 +2308,10 @@ impl AppState {
             }
             _ => {} // Block all other keys
         }
+        self.mark_dirty();
     }
 
-    /// Execute a confirmed action and set status message.
+    /// Execute a confirmed action and report the outcome.
     fn execute_confirm(&mut self, action: ConfirmAction) {
         match action {
             ConfirmAction::Kill { pid, name, signal } => {
@@ -1763,19 +2320,22 @@ impl AppState {
                     Signal::Term => "SIGTERM",
                 };
                 match actions::kill_process(pid, signal) {
-                    Ok(()) => self.set_status(format!("Sent {sig_name} to {name} (PID {pid})")),
-                    Err(e) => self.set_status(format!("Kill failed: {e}")),
+                    Ok(()) => self.notify(
+                        Level::Success,
+                        format!("Sent {sig_name} to {name} (PID {pid})"),
+                    ),
+                    Err(e) => self.set_error(format!("Kill failed: {e}")),
                 }
             }
             ConfirmAction::Renice { pid, name, delta } => {
-                // Read current nice value via the centralized core wrapper, then apply delta.
                 let current = actions::get_process_priority(pid).unwrap_or(0);
                 let new_nice = current + delta;
                 match actions::renice_process(pid, new_nice) {
-                    Ok(()) => {
-                        self.set_status(format!("Reniced {name} (PID {pid}) to nice={new_nice}"))
-                    }
-                    Err(e) => self.set_status(format!("Renice failed: {e}")),
+                    Ok(()) => self.notify(
+                        Level::Success,
+                        format!("Reniced {name} (PID {pid}) to nice={new_nice}"),
+                    ),
+                    Err(e) => self.set_error(format!("Renice failed: {e}")),
                 }
             }
             action @ (ConfirmAction::StopContainer { .. }
@@ -1786,6 +2346,25 @@ impl AppState {
         }
     }
 
+    // -----------------------------------------------------------------
+    // Command palette
+    // -----------------------------------------------------------------
+
+    /// Commands that cannot work against a remote host.
+    const REMOTE_BLOCKED_COMMANDS: &[Command] = &[
+        Command::KillProcess,
+        Command::ForceKillProcess,
+        Command::KillNamed,
+        Command::NiceDown,
+        Command::NiceUp,
+        Command::StopContainer,
+        Command::KillContainer,
+        Command::RestartContainer,
+        Command::StopNamed,
+        Command::RestartNamed,
+        Command::KubeToggleScope,
+    ];
+
     /// Returns the list of commands to exclude from the palette (empty in local mode).
     fn excluded_commands(&self) -> &[Command] {
         if self.is_remote() {
@@ -1795,206 +2374,309 @@ impl AppState {
         }
     }
 
-    /// Open the command palette with a fresh state.
+    /// Open the fuzzy command palette.
     fn open_palette(&mut self) {
-        self.show_palette = true;
-        self.palette = PaletteState::new();
-        let excluded = self.excluded_commands().to_vec();
-        self.palette.refilter_excluding(&excluded);
-    }
-
-    /// Close the command palette and clear state.
-    fn close_palette(&mut self) {
-        self.show_palette = false;
+        self.overlay = Overlay::Palette;
         self.palette.input.clear();
         self.palette.selected = 0;
+        self.refilter_palette();
+        self.mark_dirty();
     }
 
-    /// Handle keys while the command palette is open.
-    fn handle_palette_key(&mut self, key: KeyEvent) {
-        // Ctrl+C always quits.
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.quit();
-            return;
-        }
+    /// Open the typed command line (`:`), which is the same registry with the
+    /// argument forms reachable.
+    fn open_command_line(&mut self) {
+        self.overlay = Overlay::Command;
+        self.palette.input.clear();
+        self.palette.selected = 0;
+        self.refilter_palette();
+        self.mark_dirty();
+    }
 
+    fn refilter_palette(&mut self) {
+        let excluded = self.excluded_commands().to_vec();
+        let tab = self.tab;
+        self.palette.refilter_ctx(&excluded, Some(tab));
+    }
+
+    /// Handle keys while the palette or command line is open.
+    fn handle_palette_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Esc => {
-                self.close_palette();
+            KeyCode::Esc => self.close_overlay(),
+            // Both palette keys toggle it shut again.
+            KeyCode::Char('p' | 'k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.close_overlay()
             }
-            // Ctrl+P also closes the palette (toggle).
-            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.close_palette();
-            }
+            // Any other control chord is a command we do not have, not text:
+            // inserting its letter into the query would be surprising.
+            KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => {}
             KeyCode::Enter => {
                 if let Some(&(cmd, _)) = self.palette.filtered.get(self.palette.selected) {
-                    self.close_palette();
-                    self.execute_command(cmd);
+                    let arg = self.palette.arg.clone();
+                    self.palette.remember(cmd);
+                    self.close_overlay();
+                    self.execute_invocation(cmd, arg);
                 }
             }
-            KeyCode::Down if !self.palette.filtered.is_empty() => {
-                self.palette.selected =
-                    (self.palette.selected + 1).min(self.palette.filtered.len() - 1);
+            KeyCode::Down => {
+                self.palette.selected = widgets::clamp_selection(
+                    self.palette.selected + 1,
+                    self.palette.filtered.len(),
+                );
             }
             KeyCode::Up => {
                 self.palette.selected = self.palette.selected.saturating_sub(1);
             }
             KeyCode::Backspace => {
                 self.palette.input.pop();
-                let excluded = self.excluded_commands().to_vec();
-                self.palette.refilter_excluding(&excluded);
+                self.refilter_palette();
             }
-            KeyCode::Char(c) => {
+            KeyCode::Char(c) if self.palette.input.len() < Self::MAX_FILTER_LEN => {
                 self.palette.input.push(c);
-                let excluded = self.excluded_commands().to_vec();
-                self.palette.refilter_excluding(&excluded);
+                self.refilter_palette();
             }
             _ => {}
         }
+        self.mark_dirty();
     }
 
-    /// Commands that are blocked in remote mode (cannot kill/renice on a remote host).
-    const REMOTE_BLOCKED_COMMANDS: &[Command] = &[
-        Command::KillProcess,
-        Command::ForceKillProcess,
-        Command::NiceDown,
-        Command::NiceUp,
-        Command::StopContainer,
-        Command::KillContainer,
-        Command::RestartContainer,
-    ];
+    /// Execute a palette command with its optional argument.
+    pub fn execute_invocation(&mut self, cmd: Command, arg: Option<String>) {
+        match (cmd, arg) {
+            (Command::KillNamed, Some(name)) => self.kill_named(&name),
+            (Command::StopNamed, Some(name)) => {
+                self.container_named(&name, |id, name| ConfirmAction::StopContainer { id, name })
+            }
+            (Command::RestartNamed, Some(name)) => self.container_named(&name, |id, name| {
+                ConfirmAction::RestartContainer { id, name }
+            }),
+            (Command::SortBy, Some(field)) => self.sort_by_name(&field),
+            (Command::FilterBy, Some(text)) => self.set_filter(text),
+            (Command::SetTheme, Some(name)) => self.set_theme(&name),
+            (Command::GoToTab, Some(name)) => self.go_to_tab_named(&name),
+            (cmd, _) if cmd.is_verb_only() => {
+                self.notify(Level::Info, format!("Usage: {}", cmd.shortcut()));
+            }
+            (cmd, _) => self.execute_command(cmd),
+        }
+    }
 
-    /// Execute a command from the palette.
+    /// `kill <name>` — target the busiest process whose name matches.
+    ///
+    /// Ambiguity is resolved by the confirmation dialog, which names the exact
+    /// target, rather than by guessing silently.
+    fn kill_named(&mut self, needle: &str) {
+        let needle_lower = needle.to_lowercase();
+        let matches: Vec<&ProcessInfo> = self
+            .visible_processes
+            .iter()
+            .filter(|p| {
+                p.name.to_lowercase().contains(&needle_lower)
+                    || p.command.to_lowercase().contains(&needle_lower)
+            })
+            .collect();
+
+        match matches.first() {
+            None => self.notify(Level::Warning, format!("No process matches `{needle}`")),
+            Some(target) => {
+                let (pid, name) = (target.pid, target.name.clone());
+                let extra = matches.len();
+                if extra > 1 {
+                    self.notify(
+                        Level::Info,
+                        format!("{extra} processes match `{needle}` — targeting the busiest"),
+                    );
+                }
+                self.confirm = Some(ConfirmAction::Kill {
+                    pid,
+                    name,
+                    signal: Signal::Term,
+                });
+            }
+        }
+    }
+
+    /// `stop <name>` / `restart <name>` — same contract for containers.
+    fn container_named(
+        &mut self,
+        needle: &str,
+        build: impl FnOnce(String, String) -> ConfirmAction,
+    ) {
+        if self.is_remote() {
+            self.notify(Level::Warning, "Actions are disabled in remote mode");
+            return;
+        }
+        let needle_lower = needle.to_lowercase();
+        let found = self
+            .sorted_filtered_containers()
+            .iter()
+            .find(|c| {
+                c.name.to_lowercase().contains(&needle_lower)
+                    || c.image.to_lowercase().contains(&needle_lower)
+                    || c.id.to_lowercase().starts_with(&needle_lower)
+            })
+            .map(|c| (c.id_full.clone(), c.name.clone()));
+
+        match found {
+            Some((id, name)) => self.confirm = Some(build(id, name)),
+            None => self.notify(Level::Warning, format!("No container matches `{needle}`")),
+        }
+    }
+
+    /// `sort <field>` — resolved against the active tab's own columns.
+    fn sort_by_name(&mut self, field: &str) {
+        let f = field.trim().to_lowercase();
+        let ok = match self.tab {
+            Tab::Network => {
+                let set = match f.as_str() {
+                    "name" | "interface" => Some(NetworkSortField::Name),
+                    "rx" | "down" => Some(NetworkSortField::RxRate),
+                    "tx" | "up" => Some(NetworkSortField::TxRate),
+                    "errors" | "err" => Some(NetworkSortField::Errors),
+                    _ => None,
+                };
+                if let Some(s) = set {
+                    self.net_sort_field = s;
+                }
+                set.is_some()
+            }
+            Tab::Containers => {
+                let set = match f.as_str() {
+                    "name" => Some(ContainerSortField::Name),
+                    "cpu" => Some(ContainerSortField::Cpu),
+                    "mem" | "memory" => Some(ContainerSortField::Mem),
+                    "rx" | "net" => Some(ContainerSortField::NetRx),
+                    "tx" => Some(ContainerSortField::NetTx),
+                    "uptime" | "age" => Some(ContainerSortField::Uptime),
+                    _ => None,
+                };
+                if let Some(s) = set {
+                    self.containers_sort_field = s;
+                    self.recompute_containers_view();
+                }
+                set.is_some()
+            }
+            Tab::Kube => false,
+            _ => {
+                let set = match f.as_str() {
+                    "cpu" => Some(SortField::Cpu),
+                    "mem" | "memory" => Some(SortField::Mem),
+                    "pid" => Some(SortField::Pid),
+                    "name" | "command" => Some(SortField::Name),
+                    "user" => Some(SortField::User),
+                    _ => None,
+                };
+                if let Some(s) = set {
+                    self.sort_field = s;
+                    self.recompute_visible();
+                }
+                set.is_some()
+            }
+        };
+        if ok {
+            self.notify(Level::Info, format!("Sorted by {f}"));
+        } else {
+            self.notify(
+                Level::Warning,
+                format!("`{f}` is not a sortable column on this tab"),
+            );
+        }
+    }
+
+    /// `theme <name>`.
+    fn set_theme(&mut self, name: &str) {
+        match name.parse::<ThemeKind>() {
+            Ok(kind) => {
+                self.theme_kind = kind;
+                self.notify(Level::Success, format!("Theme: {kind}"));
+            }
+            Err(e) => self.notify(Level::Warning, e),
+        }
+    }
+
+    /// `tab <name>`.
+    fn go_to_tab_named(&mut self, name: &str) {
+        let n = name.trim().to_lowercase();
+        let found = Tab::ALL
+            .iter()
+            .copied()
+            .find(|t| t.label().to_lowercase().starts_with(&n));
+        match found {
+            Some(tab) => self.go_to_tab(tab),
+            None => self.notify(Level::Warning, format!("No tab named `{name}`")),
+        }
+    }
+
+    /// Execute an argument-free command from the palette.
     fn execute_command(&mut self, cmd: Command) {
-        // Block kill/renice actions in remote mode.
+        // Block local-only actions in remote mode.
         if self.is_remote() && Self::REMOTE_BLOCKED_COMMANDS.contains(&cmd) {
-            self.set_status("Actions disabled in remote mode".to_string());
+            self.notify(Level::Warning, "Actions are disabled in remote mode");
             return;
         }
 
         match cmd {
-            Command::Quit => self.quit(),
+            Command::Quit => self.dispatch(Action::Quit),
             Command::ToggleTreeView => {
-                self.tree_mode = !self.tree_mode;
-                self.selected = 0;
-                self.scroll_offset = 0;
-                self.recompute_visible();
+                // Reachable from any tab through the palette, but it only means
+                // something on the process table — go there first.
+                self.go_to_tab(Tab::Processes);
+                self.dispatch(Action::ToggleTree);
             }
-            Command::SortByCpu => {
-                self.sort_field = SortField::Cpu;
-                self.recompute_visible();
-            }
-            Command::SortByMem => {
-                self.sort_field = SortField::Mem;
-                self.recompute_visible();
-            }
-            Command::SortByPid => {
-                self.sort_field = SortField::Pid;
-                self.recompute_visible();
-            }
-            Command::SortByName => {
-                self.sort_field = SortField::Name;
-                self.recompute_visible();
-            }
-            Command::SortByUser => {
-                self.sort_field = SortField::User;
-                self.recompute_visible();
-            }
-            Command::ToggleSortOrder => {
-                self.sort_order = match self.sort_order {
-                    SortOrder::Asc => SortOrder::Desc,
-                    SortOrder::Desc => SortOrder::Asc,
-                };
-                self.recompute_visible();
-            }
-            Command::CycleSort => {
-                self.sort_field = next_sort_field(self.sort_field);
-                self.recompute_visible();
-            }
-            Command::SwitchToGeneral => {
-                self.tab = Tab::General;
-            }
-            Command::SwitchToProcesses => {
-                self.tab = Tab::Processes;
-            }
-            Command::OpenFilter => {
-                self.filter_active = true;
-            }
-            Command::NextTab => {
-                self.tab = self.tab.next();
-            }
-            Command::PrevTab => {
-                self.tab = self.tab.prev();
-            }
-            Command::KillProcess => {
-                if self.tab == Tab::Processes {
-                    self.request_kill(Signal::Term);
-                }
-            }
-            Command::ForceKillProcess => {
-                if self.tab == Tab::Processes {
-                    self.request_kill(Signal::Kill);
-                }
-            }
-            Command::NiceDown => {
-                if self.tab == Tab::Processes {
-                    self.request_renice(1);
-                }
-            }
-            Command::NiceUp => {
-                if self.tab == Tab::Processes {
-                    self.request_renice(-1);
-                }
-            }
-            Command::ClearFilter => match self.tab {
-                Tab::Network => self.net_filter_input.clear(),
-                Tab::Containers => self.containers_filter_input.clear(),
-                Tab::Kube => self.kube_filter_input.clear(),
-                Tab::Gpu => self.gpu_filter_input.clear(),
-                _ => {
-                    self.filter_input.clear();
-                    self.recompute_visible();
-                }
-            },
-            Command::SwitchToNetwork => {
-                self.tab = Tab::Network;
-            }
-            Command::SortNetByRx => {
-                self.net_sort_field = NetworkSortField::RxRate;
-            }
-            Command::SortNetByTx => {
-                self.net_sort_field = NetworkSortField::TxRate;
-            }
-            Command::SortNetByName => {
-                self.net_sort_field = NetworkSortField::Name;
-            }
-            Command::SortNetByErrors => {
-                self.net_sort_field = NetworkSortField::Errors;
-            }
-            Command::SwitchToContainers => {
-                self.tab = Tab::Containers;
-            }
-            Command::SortContainersByCpu => {
-                self.containers_sort_field = ContainerSortField::Cpu;
-                self.recompute_containers_view();
-            }
-            Command::SortContainersByMem => {
-                self.containers_sort_field = ContainerSortField::Mem;
-                self.recompute_containers_view();
-            }
-            Command::SortContainersByName => {
-                self.containers_sort_field = ContainerSortField::Name;
-                self.recompute_containers_view();
-            }
-            Command::SortContainersByNetRx => {
-                self.containers_sort_field = ContainerSortField::NetRx;
-                self.recompute_containers_view();
-            }
+            Command::SortByCpu => self.set_process_sort(SortField::Cpu),
+            Command::SortByMem => self.set_process_sort(SortField::Mem),
+            Command::SortByPid => self.set_process_sort(SortField::Pid),
+            Command::SortByName => self.set_process_sort(SortField::Name),
+            Command::SortByUser => self.set_process_sort(SortField::User),
+            Command::ToggleSortOrder => self.reverse_sort(),
+            Command::CycleSort => self.cycle_sort(),
+            Command::SwitchToGeneral => self.go_to_tab(Tab::General),
+            Command::SwitchToProcesses => self.go_to_tab(Tab::Processes),
+            Command::SwitchToNetwork => self.go_to_tab(Tab::Network),
+            Command::SwitchToContainers => self.go_to_tab(Tab::Containers),
+            Command::SwitchToKube => self.go_to_tab(Tab::Kube),
+            Command::OpenFilter => self.set_filter_editing(true),
+            Command::ClearFilter => self.clear_filter(),
+            Command::NextTab => self.go_to_tab(self.tab.next()),
+            Command::PrevTab => self.go_to_tab(self.tab.prev()),
+            Command::KillProcess => self.request_kill(Signal::Term),
+            Command::ForceKillProcess => self.request_kill(Signal::Kill),
+            Command::NiceDown => self.request_renice(1),
+            Command::NiceUp => self.request_renice(-1),
+            Command::SortNetByRx => self.net_sort_field = NetworkSortField::RxRate,
+            Command::SortNetByTx => self.net_sort_field = NetworkSortField::TxRate,
+            Command::SortNetByName => self.net_sort_field = NetworkSortField::Name,
+            Command::SortNetByErrors => self.net_sort_field = NetworkSortField::Errors,
+            Command::SortContainersByCpu => self.set_container_sort(ContainerSortField::Cpu),
+            Command::SortContainersByMem => self.set_container_sort(ContainerSortField::Mem),
+            Command::SortContainersByName => self.set_container_sort(ContainerSortField::Name),
+            Command::SortContainersByNetRx => self.set_container_sort(ContainerSortField::NetRx),
             Command::StopContainer => self.request_container_stop(),
             Command::KillContainer => self.request_container_kill(),
             Command::RestartContainer => self.request_container_restart(),
-            Command::SwitchToKube => {
-                self.tab = Tab::Kube;
+            Command::ShowHelp => self.open_overlay(Overlay::Help),
+            Command::TogglePause => self.dispatch(Action::TogglePause),
+            Command::RefreshNow => self.dispatch(Action::Refresh),
+            Command::ShowLog => self.open_overlay(Overlay::Log),
+            Command::InspectRow => self.dispatch(Action::OpenInspector),
+            Command::CopyRowId => self.copy_selection(),
+            Command::KubePods => self.kube_command(KubeSubview::Pods),
+            Command::KubeNodes => self.kube_command(KubeSubview::Nodes),
+            Command::KubeDeployments => self.kube_command(KubeSubview::Deployments),
+            Command::KubeToggleScope => {
+                self.go_to_tab(Tab::Kube);
+                self.toggle_kube_scope();
+            }
+            // Verb forms are handled by `execute_invocation`; reaching here
+            // means the user picked one without typing an argument.
+            Command::KillNamed
+            | Command::StopNamed
+            | Command::RestartNamed
+            | Command::SortBy
+            | Command::FilterBy
+            | Command::SetTheme
+            | Command::GoToTab => {
+                self.notify(Level::Info, format!("Usage: {}", cmd.shortcut()));
             }
             Command::SwitchToGpu => {
                 self.tab = Tab::Gpu;
@@ -2002,129 +2684,71 @@ impl AppState {
         }
     }
 
-    /// Maximum number of characters accepted in the process filter input.
-    const MAX_FILTER_LEN: usize = 256;
-
-    /// Handle keys while in filter input mode.
-    fn handle_filter_key(&mut self, key: KeyEvent) {
-        // G-03: Ctrl+C must always quit, even in filter mode.
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.quit();
-            return;
-        }
-
-        if self.net_filter_active {
-            match key.code {
-                KeyCode::Esc => {
-                    self.net_filter_active = false;
-                }
-                KeyCode::Enter => {
-                    self.net_filter_active = false;
-                }
-                KeyCode::Backspace => {
-                    self.net_filter_input.pop();
-                }
-                KeyCode::Char(c) if self.net_filter_input.len() < Self::MAX_FILTER_LEN => {
-                    self.net_filter_input.push(c);
-                }
-                _ => {}
-            }
-            return;
-        }
-
-        if self.containers_filter_active {
-            match key.code {
-                KeyCode::Esc | KeyCode::Enter => {
-                    self.containers_filter_active = false;
-                }
-                KeyCode::Backspace => {
-                    self.containers_filter_input.pop();
-                    self.recompute_containers_view();
-                }
-                KeyCode::Char(c) if self.containers_filter_input.len() < Self::MAX_FILTER_LEN => {
-                    self.containers_filter_input.push(c);
-                    self.recompute_containers_view();
-                }
-                _ => {}
-            }
-            return;
-        }
-
-        if self.kube_filter_active {
-            match key.code {
-                KeyCode::Esc | KeyCode::Enter => {
-                    self.kube_filter_active = false;
-                }
-                KeyCode::Backspace => {
-                    self.kube_filter_input.pop();
-                    self.kube_selected = 0;
-                    self.kube_scroll_offset = 0;
-                }
-                KeyCode::Char(c) if self.kube_filter_input.len() < Self::MAX_FILTER_LEN => {
-                    self.kube_filter_input.push(c);
-                    self.kube_selected = 0;
-                    self.kube_scroll_offset = 0;
-                }
-                _ => {}
-            }
-            return;
-        }
-
-        if self.gpu_filter_active {
-            match key.code {
-                KeyCode::Esc | KeyCode::Enter => {
-                    self.gpu_filter_active = false;
-                }
-                KeyCode::Backspace => {
-                    self.gpu_filter_input.pop();
-                    self.gpu_selected = 0;
-                    self.gpu_scroll_offset = 0;
-                }
-                KeyCode::Char(c) if self.gpu_filter_input.len() < Self::MAX_FILTER_LEN => {
-                    self.gpu_filter_input.push(c);
-                    self.gpu_selected = 0;
-                    self.gpu_scroll_offset = 0;
-                }
-                _ => {}
-            }
-            return;
-        }
-
-        match key.code {
-            KeyCode::Esc => {
-                self.filter_active = false;
-            }
-            KeyCode::Enter => {
-                self.filter_active = false;
-                // Keep filter_input — it stays applied. Drop debounce so the
-                // visible list is in sync the moment the user commits.
-                self.last_filter_change = None;
-                self.recompute_visible();
-            }
-            KeyCode::Backspace => {
-                self.filter_input.pop();
-                self.recompute_visible_debounced();
-            }
-            KeyCode::Char(c) if self.filter_input.len() < Self::MAX_FILTER_LEN => {
-                self.filter_input.push(c);
-                self.recompute_visible_debounced();
-            }
-            _ => {}
-        }
+    fn set_process_sort(&mut self, field: SortField) {
+        self.sort_field = field;
+        self.recompute_visible();
     }
 
+    fn set_container_sort(&mut self, field: ContainerSortField) {
+        self.containers_sort_field = field;
+        self.recompute_containers_view();
+    }
+
+    fn kube_command(&mut self, sv: KubeSubview) {
+        self.go_to_tab(Tab::Kube);
+        self.switch_kube_subview(sv);
+    }
+
+    // -----------------------------------------------------------------
+    // Mouse
+    // -----------------------------------------------------------------
+
     /// Handle a mouse event.
+    ///
+    /// Every gesture here has a keyboard equivalent — muxtop has to be usable
+    /// on a bare console with no pointer, and on a terminal where the user has
+    /// turned mouse capture off to keep native text selection.
+    ///
+    /// Two bugs are fixed relative to 0.4: the wheel moved the *process* scroll
+    /// offset regardless of the active tab, and it moved the offset without the
+    /// selection, so the very next frame snapped the view back and the wheel
+    /// appeared dead.
     pub fn handle_mouse_event(&mut self, mouse: MouseEvent) {
-        match mouse.kind {
-            MouseEventKind::ScrollDown => {
-                let max = self.process_count().saturating_sub(1);
-                self.scroll_offset = (self.scroll_offset + 1).min(max);
+        if self.overlay != Overlay::None {
+            match mouse.kind {
+                MouseEventKind::ScrollDown => self.overlay_scroll += Self::WHEEL_ROWS,
+                MouseEventKind::ScrollUp => {
+                    self.overlay_scroll = self.overlay_scroll.saturating_sub(Self::WHEEL_ROWS)
+                }
+                _ => return,
             }
-            MouseEventKind::ScrollUp => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(1);
-            }
-            _ => {}
+            self.mark_dirty();
+            return;
         }
+
+        match mouse.kind {
+            MouseEventKind::ScrollDown => self.scroll_rows(Self::WHEEL_ROWS as isize),
+            MouseEventKind::ScrollUp => self.scroll_rows(-(Self::WHEEL_ROWS as isize)),
+            _ => return,
+        }
+        self.mark_dirty();
+    }
+
+    /// Rows travelled per wheel notch.
+    const WHEEL_ROWS: usize = 3;
+
+    /// Scroll the active tab's table, carrying the selection along so the
+    /// viewport actually stays where the user put it.
+    fn scroll_rows(&mut self, delta: isize) {
+        let count = self.item_count();
+        if count == 0 {
+            return;
+        }
+        let (sel, off) = self.selected_mut();
+        let new_off = (*off as isize + delta).max(0) as usize;
+        *off = new_off.min(count.saturating_sub(1));
+        // Keep the cursor inside the window we just scrolled to.
+        *sel = (*sel).max(*off).min(count - 1);
     }
 }
 
@@ -2355,9 +2979,8 @@ mod tests {
         app.handle_key_event(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT));
 
         let msg = app
-            .status_message
-            .as_ref()
-            .map(|(m, _)| m.clone())
+            .active_status()
+            .map(|t| t.text.clone())
             .expect("A on the Kube tab must set a status message");
         assert!(
             msg.contains("local-only"),
@@ -2372,7 +2995,7 @@ mod tests {
         let mut app = AppState::new();
         app.tab = Tab::Processes;
         app.handle_key_event(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT));
-        assert!(app.status_message.is_none());
+        assert!(app.active_status().is_none());
     }
 
     #[test]
@@ -2386,7 +3009,7 @@ mod tests {
         assert!(!app.tree_mode);
         assert_eq!(app.selected, 0);
         assert_eq!(app.scroll_offset, 0);
-        assert!(!app.show_palette);
+        assert!(!app.show_palette());
         assert!(app.running());
         assert!(app.last_snapshot.is_none());
     }
@@ -2634,11 +3257,25 @@ mod tests {
     #[test]
     fn test_tree_toggle() {
         let mut app = app_with_processes();
+        app.tab = Tab::Processes;
         assert!(!app.tree_mode);
         app.handle_key_event(key(KeyCode::Char('t')));
         assert!(app.tree_mode);
         app.handle_key_event(key(KeyCode::Char('t')));
         assert!(!app.tree_mode);
+    }
+
+    /// `t` used to fire from any tab, silently re-shaping the process table
+    /// while the user was looking at something else.
+    #[test]
+    fn test_tree_toggle_is_scoped_to_the_processes_tab() {
+        let mut app = app_with_processes();
+        for tab in [Tab::General, Tab::Network, Tab::Containers, Tab::Kube] {
+            app.tab = tab;
+            app.tree_mode = false;
+            app.handle_key_event(key(KeyCode::Char('t')));
+            assert!(!app.tree_mode, "`t` must do nothing on {tab:?}");
+        }
     }
 
     #[test]
@@ -2662,18 +3299,30 @@ mod tests {
     }
 
     #[test]
-    fn test_sort_f_keys() {
+    fn test_f_keys_follow_the_htop_map() {
+        // muxtop advertises htop shortcuts, so F1 must be Help — 0.4 bound it
+        // to sort-by-PID, which silently re-sorted the table of a user who
+        // pressed it expecting documentation.
         let mut app = app_with_processes();
+        app.tab = Tab::Processes;
+
         app.handle_key_event(key(KeyCode::F(1)));
-        assert!(matches!(app.sort_field, SortField::Pid));
-        app.handle_key_event(key(KeyCode::F(2)));
-        assert!(matches!(app.sort_field, SortField::Name));
-        app.handle_key_event(key(KeyCode::F(3)));
-        assert!(matches!(app.sort_field, SortField::Cpu));
-        app.handle_key_event(key(KeyCode::F(4)));
-        assert!(matches!(app.sort_field, SortField::Mem));
+        assert_eq!(app.overlay, Overlay::Help);
+        app.handle_key_event(key(KeyCode::Esc));
+
         app.handle_key_event(key(KeyCode::F(5)));
-        assert!(matches!(app.sort_field, SortField::User));
+        assert!(app.tree_mode, "F5 toggles the tree, as in htop");
+        app.handle_key_event(key(KeyCode::F(5)));
+
+        assert!(matches!(app.sort_field, SortField::Cpu));
+        app.handle_key_event(key(KeyCode::F(6)));
+        assert!(
+            matches!(app.sort_field, SortField::Mem),
+            "F6 cycles the sort"
+        );
+
+        app.handle_key_event(key(KeyCode::F(4)));
+        assert!(app.filter_editing(), "F4 opens the filter, as in htop");
     }
 
     #[test]
@@ -2756,45 +3405,61 @@ mod tests {
     #[test]
     fn test_palette_toggle() {
         let mut app = AppState::new();
-        assert!(!app.show_palette);
+        assert!(!app.show_palette());
         app.handle_key_event(key_mod(KeyCode::Char('p'), KeyModifiers::CONTROL));
-        assert!(app.show_palette);
+        assert!(app.show_palette());
         app.handle_key_event(key_mod(KeyCode::Char('p'), KeyModifiers::CONTROL));
-        assert!(!app.show_palette);
+        assert!(!app.show_palette());
     }
 
-    // -- Left/Right arrow tab cycling (STORY-09) --
+    // -- Arrow keys (0.5.1: horizontal arrows scroll columns) --
 
+    /// Vertical arrows move the row cursor and horizontal arrows scroll
+    /// columns. In 0.4 the horizontal pair changed *screen*, which put "change
+    /// row" and "change tab" on the same arrow cluster.
     #[test]
-    fn test_tab_right_arrow_next() {
-        let mut app = AppState::new();
-        assert_eq!(app.tab, Tab::General);
+    fn test_horizontal_arrows_do_not_switch_tabs() {
+        let mut app = app_with_processes();
+        app.tab = Tab::Processes;
         app.handle_key_event(key(KeyCode::Right));
+        assert_eq!(app.tab, Tab::Processes);
+        assert_eq!(app.col_scroll, 1, "Right scrolls columns");
+        app.handle_key_event(key(KeyCode::Left));
+        assert_eq!(app.col_scroll, 0);
         assert_eq!(app.tab, Tab::Processes);
     }
 
     #[test]
-    fn test_tab_left_arrow_prev() {
-        let mut app = AppState::new();
-        app.tab = Tab::Processes;
-        app.handle_key_event(key(KeyCode::Left));
-        assert_eq!(app.tab, Tab::General);
+    fn test_column_scroll_is_bounded() {
+        let mut app = app_with_processes();
+        for _ in 0..50 {
+            app.handle_key_event(key(KeyCode::Right));
+        }
+        assert!(
+            app.col_scroll <= 8,
+            "column scroll ran away: {}",
+            app.col_scroll
+        );
+        for _ in 0..50 {
+            app.handle_key_event(key(KeyCode::Left));
+        }
+        assert_eq!(app.col_scroll, 0);
     }
 
     #[test]
-    fn test_tab_left_arrow_wraps() {
+    fn test_tab_key_cycles_tabs_forwards_and_backwards() {
         let mut app = AppState::new();
         assert_eq!(app.tab, Tab::General);
-        app.handle_key_event(key(KeyCode::Left));
-        assert_eq!(app.tab, *Tab::ALL.last().unwrap());
-    }
-
-    #[test]
-    fn test_tab_right_arrow_wraps() {
-        let mut app = AppState::new();
-        app.tab = *Tab::ALL.last().unwrap();
-        app.handle_key_event(key(KeyCode::Right));
+        app.handle_key_event(key(KeyCode::Tab));
+        assert_eq!(app.tab, Tab::Processes);
+        app.handle_key_event(key(KeyCode::BackTab));
         assert_eq!(app.tab, Tab::General);
+        app.handle_key_event(key(KeyCode::BackTab));
+        assert_eq!(
+            app.tab,
+            *Tab::ALL.last().unwrap(),
+            "cycling wraps to the last tab, whatever it is"
+        );
     }
 
     // -- Mouse handling (STORY-04) --
@@ -2808,20 +3473,42 @@ mod tests {
         }
     }
 
+    /// Regression: 0.4 moved `scroll_offset` without the selection, so the
+    /// next frame's `viewport_offset` snapped the view straight back and the
+    /// wheel appeared to do nothing at all.
     #[test]
-    fn test_mouse_scroll_down() {
+    fn test_mouse_scroll_down_moves_the_viewport_and_the_cursor() {
         let mut app = app_with_processes();
         assert_eq!(app.scroll_offset, 0);
         app.handle_mouse_event(mouse_scroll(MouseEventKind::ScrollDown));
-        assert_eq!(app.scroll_offset, 1);
+        assert!(app.scroll_offset > 0, "wheel did not scroll");
+        assert!(
+            app.selected >= app.scroll_offset,
+            "the cursor must follow the viewport, or the next frame undoes the scroll"
+        );
     }
 
     #[test]
     fn test_mouse_scroll_up() {
         let mut app = app_with_processes();
         app.scroll_offset = 3;
+        app.selected = 3;
         app.handle_mouse_event(mouse_scroll(MouseEventKind::ScrollUp));
-        assert_eq!(app.scroll_offset, 2);
+        assert!(app.scroll_offset < 3);
+    }
+
+    /// Regression: the wheel always moved the *process* offset, whatever tab
+    /// was on screen.
+    #[test]
+    fn test_mouse_scroll_follows_the_active_tab() {
+        let mut app = app_with_processes();
+        app.tab = Tab::Network;
+        let before = app.scroll_offset;
+        app.handle_mouse_event(mouse_scroll(MouseEventKind::ScrollDown));
+        assert_eq!(
+            app.scroll_offset, before,
+            "scrolling the Network tab must not move the process table"
+        );
     }
 
     #[test]
@@ -2838,6 +3525,14 @@ mod tests {
         app.scroll_offset = app.process_count().saturating_sub(1);
         app.handle_mouse_event(mouse_scroll(MouseEventKind::ScrollDown));
         assert_eq!(app.scroll_offset, app.process_count().saturating_sub(1));
+    }
+
+    #[test]
+    fn test_mouse_scroll_on_an_empty_list_does_nothing() {
+        let mut app = AppState::new();
+        app.handle_mouse_event(mouse_scroll(MouseEventKind::ScrollDown));
+        assert_eq!(app.scroll_offset, 0);
+        assert_eq!(app.selected, 0);
     }
 
     // -- Command registry tests (Epic 6) --
@@ -2865,20 +3560,88 @@ mod tests {
         let ps = PaletteState::new();
         assert!(ps.input.is_empty());
         assert_eq!(ps.selected, 0);
-        assert_eq!(ps.filtered.len(), Command::ALL.len());
+        assert_eq!(ps.filtered.len(), argument_free_command_count());
+    }
+
+    /// Commands that need an argument (`kill <name>`) are meaningless on their
+    /// own, so they stay hidden until their verb has been typed.
+    fn argument_free_command_count() -> usize {
+        Command::ALL.iter().filter(|c| !c.is_verb_only()).count()
     }
 
     #[test]
     fn test_palette_refilter_empty_shows_all() {
         let mut ps = PaletteState::new();
         ps.refilter();
-        assert_eq!(ps.filtered.len(), Command::ALL.len());
+        assert_eq!(ps.filtered.len(), argument_free_command_count());
+        assert!(
+            ps.filtered.iter().all(|(c, _)| !c.is_verb_only()),
+            "an argument form with no argument is noise"
+        );
+    }
+
+    #[test]
+    fn test_palette_parses_argument_commands() {
+        // The README has advertised `kill firefox` since 0.3 against a command
+        // enum that could not carry an argument.
+        let mut ps = PaletteState::new();
+        ps.input = "kill firefox".to_string();
+        ps.refilter();
+        assert_eq!(ps.filtered.len(), 1);
+        assert_eq!(ps.filtered[0].0, Command::KillNamed);
+        assert_eq!(ps.arg.as_deref(), Some("firefox"));
+    }
+
+    #[test]
+    fn test_palette_argument_commands_cover_the_documented_verbs() {
+        for (input, expected) in [
+            ("kill firefox", Command::KillNamed),
+            ("stop nginx", Command::StopNamed),
+            ("restart postgres", Command::RestartNamed),
+            ("sort mem", Command::SortBy),
+            ("filter ngin", Command::FilterBy),
+            ("theme mono", Command::SetTheme),
+            ("tab kube", Command::GoToTab),
+        ] {
+            let mut ps = PaletteState::new();
+            ps.input = input.to_string();
+            ps.refilter();
+            assert_eq!(
+                ps.filtered.first().map(|(c, _)| *c),
+                Some(expected),
+                "`{input}`"
+            );
+            assert!(ps.arg.is_some(), "`{input}` must carry an argument");
+        }
+    }
+
+    #[test]
+    fn test_palette_ranks_the_active_tab_first() {
+        let mut ps = PaletteState::new();
+        ps.input = "sort".to_string();
+        ps.refilter_ctx(&[], Some(Tab::Network));
+        let first = ps.filtered.first().map(|(c, _)| c.label()).unwrap_or("");
+        assert!(
+            first.contains("network"),
+            "a sort query on the Network tab should surface network sorts first, got `{first}`"
+        );
+    }
+
+    #[test]
+    fn test_palette_history_promotes_recent_commands() {
+        let mut ps = PaletteState::new();
+        ps.remember(Command::SwitchToKube);
+        ps.refilter();
+        assert_eq!(
+            ps.filtered.first().map(|(c, _)| *c),
+            Some(Command::SwitchToKube)
+        );
     }
 
     #[test]
     fn test_palette_refilter_fuzzy_match() {
         let mut ps = PaletteState::new();
-        ps.input = "sort cpu".to_string();
+        ps.input = "sortcpu".to_string();
         ps.refilter();
         assert!(!ps.filtered.is_empty(), "Should match at least one command");
         assert_eq!(
@@ -2886,6 +3649,17 @@ mod tests {
             Command::SortByCpu,
             "First result should be Sort by CPU"
         );
+    }
+
+    /// `sort cpu` is now the *argument* form, not a fuzzy query — which is
+    /// what a user typing it actually means.
+    #[test]
+    fn test_palette_prefers_the_argument_form_over_fuzzy_matching() {
+        let mut ps = PaletteState::new();
+        ps.input = "sort cpu".to_string();
+        ps.refilter();
+        assert_eq!(ps.filtered[0].0, Command::SortBy);
+        assert_eq!(ps.arg.as_deref(), Some("cpu"));
     }
 
     #[test]
@@ -2910,34 +3684,34 @@ mod tests {
     #[test]
     fn test_palette_opens_with_ctrl_p() {
         let mut app = AppState::new();
-        assert!(!app.show_palette);
+        assert!(!app.show_palette());
         app.handle_key_event(key_mod(KeyCode::Char('p'), KeyModifiers::CONTROL));
-        assert!(app.show_palette);
+        assert!(app.show_palette());
         assert!(app.palette.input.is_empty());
     }
 
     #[test]
     fn test_palette_closes_with_esc() {
         let mut app = AppState::new();
-        app.show_palette = true;
+        app.overlay = Overlay::Palette;
         app.palette.input = "test".to_string();
         app.handle_key_event(key(KeyCode::Esc));
-        assert!(!app.show_palette);
+        assert!(!app.show_palette());
         assert!(app.palette.input.is_empty());
     }
 
     #[test]
     fn test_palette_closes_with_ctrl_p() {
         let mut app = AppState::new();
-        app.show_palette = true;
+        app.overlay = Overlay::Palette;
         app.handle_key_event(key_mod(KeyCode::Char('p'), KeyModifiers::CONTROL));
-        assert!(!app.show_palette);
+        assert!(!app.show_palette());
     }
 
     #[test]
     fn test_palette_typing_captures_input() {
         let mut app = AppState::new();
-        app.show_palette = true;
+        app.overlay = Overlay::Palette;
         app.handle_key_event(key(KeyCode::Char('s')));
         app.handle_key_event(key(KeyCode::Char('o')));
         app.handle_key_event(key(KeyCode::Char('r')));
@@ -2948,7 +3722,7 @@ mod tests {
     #[test]
     fn test_palette_backspace() {
         let mut app = AppState::new();
-        app.show_palette = true;
+        app.overlay = Overlay::Palette;
         app.palette.input = "sor".to_string();
         app.handle_key_event(key(KeyCode::Backspace));
         assert_eq!(app.palette.input, "so");
@@ -2957,7 +3731,7 @@ mod tests {
     #[test]
     fn test_palette_blocks_quit() {
         let mut app = AppState::new();
-        app.show_palette = true;
+        app.overlay = Overlay::Palette;
         app.handle_key_event(key(KeyCode::Char('q')));
         assert!(app.running(), "Pressing 'q' in palette should NOT quit");
         assert_eq!(app.palette.input, "q", "Should type 'q' into palette");
@@ -2966,7 +3740,7 @@ mod tests {
     #[test]
     fn test_palette_ctrl_c_quits() {
         let mut app = AppState::new();
-        app.show_palette = true;
+        app.overlay = Overlay::Palette;
         app.handle_key_event(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(!app.running(), "Ctrl+C should quit even with palette open");
     }
@@ -2974,7 +3748,7 @@ mod tests {
     #[test]
     fn test_palette_navigate_down() {
         let mut app = AppState::new();
-        app.show_palette = true;
+        app.overlay = Overlay::Palette;
         app.palette.refilter();
         assert_eq!(app.palette.selected, 0);
         app.handle_key_event(key(KeyCode::Down));
@@ -2984,7 +3758,7 @@ mod tests {
     #[test]
     fn test_palette_navigate_up() {
         let mut app = AppState::new();
-        app.show_palette = true;
+        app.overlay = Overlay::Palette;
         app.palette.refilter();
         app.palette.selected = 3;
         app.handle_key_event(key(KeyCode::Up));
@@ -2994,7 +3768,7 @@ mod tests {
     #[test]
     fn test_palette_navigate_clamp_top() {
         let mut app = AppState::new();
-        app.show_palette = true;
+        app.overlay = Overlay::Palette;
         app.palette.selected = 0;
         app.handle_key_event(key(KeyCode::Up));
         assert_eq!(app.palette.selected, 0);
@@ -3003,7 +3777,7 @@ mod tests {
     #[test]
     fn test_palette_navigate_clamp_bottom() {
         let mut app = AppState::new();
-        app.show_palette = true;
+        app.overlay = Overlay::Palette;
         app.palette.refilter();
         let max = app.palette.filtered.len() - 1;
         app.palette.selected = max;
@@ -3070,13 +3844,13 @@ mod tests {
     #[test]
     fn test_palette_enter_executes_and_closes() {
         let mut app = AppState::new();
-        app.show_palette = true;
+        app.overlay = Overlay::Palette;
         app.palette.refilter();
         // First command in the list is Quit
         app.palette.selected = 0;
         assert_eq!(app.palette.filtered[0].0, Command::Quit);
         app.handle_key_event(key(KeyCode::Enter));
-        assert!(!app.show_palette);
+        assert!(!app.show_palette());
         assert!(!app.running());
     }
 
@@ -3228,8 +4002,11 @@ mod tests {
     #[test]
     fn test_status_message_set_and_read() {
         let mut app = AppState::new();
-        app.set_status("Test message".to_string());
-        assert_eq!(app.active_status(), Some("Test message"));
+        app.notify(Level::Info, "Test message".to_string());
+        assert_eq!(
+            app.active_status().map(|t| t.text.as_str()),
+            Some("Test message")
+        );
     }
 
     /// MED-S5: a process name carrying an OSC sequence must not reach the
@@ -3237,15 +4014,22 @@ mod tests {
     #[test]
     fn test_set_status_scrubs_control_chars() {
         let mut app = AppState::new();
-        app.set_status("Sent SIGTERM to \x1b]0;pwn\x07evil (PID 42)".to_string());
-        let status = app.active_status().expect("status must be set");
+        app.notify(
+            Level::Info,
+            "Sent SIGTERM to \x1b]0;pwn\x07evil (PID 42)".to_string(),
+        );
+        let status = app
+            .active_status()
+            .expect("status must be set")
+            .text
+            .clone();
         assert!(
             !status.contains('\x1b'),
-            "ESC must not survive set_status: {status:?}"
+            "ESC must not survive a notification: {status:?}"
         );
         assert!(
             !status.contains('\x07'),
-            "BEL must not survive set_status: {status:?}"
+            "BEL must not survive a notification: {status:?}"
         );
         assert_eq!(status, "Sent SIGTERM to ?]0;pwn?evil (PID 42)");
     }
@@ -3293,13 +4077,27 @@ mod tests {
     }
 
     #[test]
-    fn test_status_clears_on_key_press() {
+    fn test_status_survives_the_next_keystroke() {
+        // 0.4 wiped the status line on the very next key press, so an outcome
+        // the user had not finished reading vanished the moment they moved the
+        // cursor. Messages now expire on their own schedule.
         let mut app = app_with_processes();
-        app.set_status("Test message".to_string());
-        assert!(app.status_message.is_some());
-        // Any normal key press should clear status
+        app.notify(Level::Info, "Test message".to_string());
         app.handle_key_event(key(KeyCode::Down));
-        assert!(app.status_message.is_none());
+        assert!(
+            app.active_status().is_some(),
+            "moving the cursor ate the message"
+        );
+    }
+
+    #[test]
+    fn test_escape_dismisses_messages() {
+        let mut app = app_with_processes();
+        app.notify(Level::Error, "Kill failed".to_string());
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(app.active_status().is_none(), "Esc must dismiss toasts");
+        // Dismissed, not lost.
+        assert_eq!(app.notifier.history().len(), 1);
     }
 
     // -- Epic 7: Command registry expanded --
@@ -3698,7 +4496,7 @@ mod tests {
         app.handle_key_event(KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE));
         assert!(
             app.active_status()
-                .is_some_and(|s| s.contains("disabled in remote")),
+                .is_some_and(|s| s.text.contains("disabled in remote")),
             "expected 'disabled in remote' status, got {:?}",
             app.active_status()
         );
@@ -3711,7 +4509,7 @@ mod tests {
         app.handle_key_event(KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE));
         assert!(
             app.active_status()
-                .is_some_and(|s| s.contains("disabled in remote")),
+                .is_some_and(|s| s.text.contains("disabled in remote")),
         );
     }
 
@@ -3722,7 +4520,7 @@ mod tests {
         app.handle_key_event(KeyEvent::new(KeyCode::F(7), KeyModifiers::NONE));
         assert!(
             app.active_status()
-                .is_some_and(|s| s.contains("disabled in remote")),
+                .is_some_and(|s| s.text.contains("disabled in remote")),
         );
     }
 
@@ -3870,7 +4668,7 @@ mod tests {
         assert!(app.confirm.is_none(), "confirm dialog should not open");
         assert!(
             app.active_status()
-                .is_some_and(|s| s.contains("disabled in remote")),
+                .is_some_and(|s| s.text.contains("disabled in remote")),
             "expected remote-mode notice, got {:?}",
             app.active_status()
         );
@@ -3919,11 +4717,16 @@ mod tests {
         app.handle_key_event(key(KeyCode::F(9)));
         app.handle_key_event(key(KeyCode::Char('y')));
         assert!(app.confirm.is_none());
+        let status = app.active_status().expect("an outcome must be reported");
         assert!(
-            app.active_status()
-                .is_some_and(|s| s.contains("not configured")),
-            "expected 'not configured' status, got {:?}",
-            app.active_status()
+            status.text.contains("No container engine"),
+            "expected a missing-engine message, got {:?}",
+            status.text
+        );
+        assert_eq!(
+            status.level,
+            Level::Error,
+            "a request that cannot be honoured is an error, not a notice"
         );
     }
 
@@ -3973,10 +4776,13 @@ mod tests {
         let mut app = AppState::new();
         let _ = app.take_needs_redraw(); // drain seed flag
         // Inject a synthetic action outcome.
-        app.action_tx.send("kill ok".into()).unwrap();
+        app.action_tx.send((Level::Info, "kill ok".into())).unwrap();
         app.pump_action_results();
         assert!(app.take_needs_redraw(), "action outcome must arm redraw");
-        assert_eq!(app.active_status(), Some("kill ok"));
+        assert_eq!(
+            app.active_status().map(|t| t.text.as_str()),
+            Some("kill ok")
+        );
     }
 
     /// PERF-H1 — when the status message expires, the main loop schedules
@@ -3985,9 +4791,10 @@ mod tests {
     fn test_status_message_just_expired_returns_true_and_clears() {
         let mut app = AppState::new();
         // Seed an artificially-old status message.
-        app.status_message = Some(("old".into(), Instant::now() - Duration::from_secs(60)));
+        app.notify(Level::Info, "old");
+        app.notifier.backdate_for_test(Duration::from_secs(60));
         assert!(app.status_message_just_expired());
-        assert!(app.status_message.is_none());
+        assert!(app.active_status().is_none());
         // Subsequent calls return false so the main loop doesn't loop-paint.
         assert!(!app.status_message_just_expired());
     }

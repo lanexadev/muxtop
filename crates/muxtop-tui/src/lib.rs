@@ -1,16 +1,22 @@
 pub mod app;
+pub mod clipboard;
 pub mod error;
 pub mod event;
+pub mod keymap;
+pub mod notify;
 pub mod terminal;
 pub mod ui;
 
-pub use app::{AppState, Command, ConfirmAction, PaletteState, Tab};
+pub use app::{AppState, Command, ConfirmAction, Overlay, PaletteState, Tab};
 pub use error::TuiError;
 pub use event::{Event, EventHandler, TICK_RATE};
+pub use keymap::{Action, Binding};
+pub use notify::{Notifier, Toast};
 pub use terminal::{
-    ColorSupport, TermCaps, TerminalGuard, Tui, detect_terminal_caps, init_terminal,
-    install_panic_hook, restore_terminal,
+    Breakpoint, CapsOverrides, ColorSupport, TermCaps, TerminalGuard, Tui, detect_terminal_caps,
+    detect_terminal_caps_with, init_terminal, install_panic_hook, restore_terminal,
 };
+pub use ui::theme::{Level, ThemeKind};
 
 use std::net::SocketAddr;
 
@@ -39,6 +45,10 @@ pub struct CliConfig {
     pub tree_mode: bool,
     /// Local or remote connection mode.
     pub connection_mode: ConnectionMode,
+    /// Colour scheme (from `--theme`).
+    pub theme: ThemeKind,
+    /// Terminal capability overrides (`--no-color`, `--ascii`, `--no-mouse`).
+    pub caps: CapsOverrides,
 }
 
 impl Default for CliConfig {
@@ -48,6 +58,8 @@ impl Default for CliConfig {
             sort_field: SortField::Cpu,
             tree_mode: false,
             connection_mode: ConnectionMode::default(),
+            theme: ThemeKind::default(),
+            caps: CapsOverrides::default(),
         }
     }
 }
@@ -76,8 +88,10 @@ pub fn run(
     >,
 ) -> Result<(), TuiError> {
     install_panic_hook();
-    let mut guard = init_terminal()?;
-    let term_caps = detect_terminal_caps();
+    // Capabilities are detected before the terminal is put into raw mode so the
+    // mouse decision is known by the time we would enable capture.
+    let term_caps = detect_terminal_caps_with(config.caps);
+    let mut guard = init_terminal(term_caps.mouse)?;
     let mut app = app::AppState::with_config(config, term_caps);
     if let Some(engine) = container_engine {
         app.set_container_engine(engine);
@@ -112,14 +126,17 @@ pub fn run(
                 app.apply_snapshot(snap);
                 should_draw = true;
             }
-            Event::Resize(_, _) => {
+            Event::Resize(width, height) => {
+                // The layout picks its breakpoint from these, so they have to
+                // be current before the next frame is composed.
+                app.term_caps.set_size(width, height);
                 should_draw = true;
             }
             Event::Tick => {
                 // PERF-H1: ticks no longer force a redraw. The only thing
-                // that "ages" without a key/snapshot/action is the status
-                // message — schedule one final repaint when it expires so
-                // the bottom bar visually clears.
+                // that "ages" without a key/snapshot/action is a toast —
+                // schedule one final repaint when it expires so the bottom
+                // bar visually clears.
                 if app.status_message_just_expired() {
                     should_draw = true;
                 }
@@ -127,12 +144,14 @@ pub fn run(
         }
 
         if should_draw {
-            guard.0.draw(|frame| ui::draw_root(frame, &app))?;
+            app.tick();
+            guard.terminal.draw(|frame| ui::draw_root(frame, &app))?;
         }
     }
 
     // Explicit restore for clean exit (TerminalGuard Drop is the safety net).
-    restore_terminal(&mut guard.0)?;
+    let mouse_enabled = guard.mouse_enabled();
+    restore_terminal(&mut guard.terminal, mouse_enabled)?;
     Ok(())
 }
 

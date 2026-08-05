@@ -7,6 +7,112 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-08-05
+
+Ergonomics and UI/UX release. No new data source: everything muxtop already
+collected, made navigable, discoverable and readable. The audit that produced
+it, with the per-screen specifications, is in [`docs/UX-v0.5.1.md`](docs/UX-v0.5.1.md).
+
+The root cause of most of what follows was structural: the five table views each
+hand-rolled their own column header, scroll arithmetic, striping, filter bar and
+empty state. Five copies meant five behaviours and five places to fix every bug.
+They now share `ui/widgets/`, and the keymap is a single table that drives
+dispatch, the help screen and the footer hints at once.
+
+### Changed — breaking
+
+- **`←` / `→` no longer switch tabs.** They scroll columns. Horizontal arrows
+  meaning "change screen" while vertical arrows meant "change row" was the single
+  most disorienting thing in the 0.4/0.5 UI. Use `Tab` / `Shift+Tab`, or
+  `Alt+1`…`Alt+6`.
+- **`F1`–`F5` no longer sort.** muxtop advertises htop shortcuts, so it now
+  honours the htop map: `F1` Help, `F3`/`F4` Search/Filter, `F5` Tree, `F6` Sort,
+  `F7`/`F8` Nice, `F9` Kill, `F10` Force kill. A user coming from htop pressing
+  `F1` expecting documentation used to silently re-sort the table instead.
+- **Tab-scoped keys act only on their own tab.** `t` and the function keys used
+  to fire from anywhere: pressing `F9` on the Network tab killed the selected
+  *process*, and `t` re-shaped a process table the user was not looking at.
+- **`Esc` is progressive.** One step back per press: close overlay → dismiss
+  messages → leave the filter input → clear the filter. It never quits.
+
+### Fixed
+
+- **The mouse wheel works.** It moved `scroll_offset` without the selection, so
+  the next frame snapped the view back and the wheel appeared dead. It also
+  always moved the *process* offset, whatever tab was on screen.
+- **"Clear filter" clears the filter you can see.** The palette command had no
+  `Tab::Kube` arm, so on the Kube tab it cleared the process filter instead.
+  Every filter operation now routes through one implementation.
+- **Message severity is declared, not guessed.** The footer decided whether a
+  message was an error by testing it for the substring `"failed"`, so rewording
+  an error painted it on the success colour.
+- **256-colour terminals get a 256-colour theme.** `ColorSupport::Colors256` was
+  detected and then discarded — `Theme::new` only branched on TrueColor, so
+  Terminal.app and a default `ssh user@host` session both fell through to 16
+  colours.
+- **`NO_COLOR` is honoured**, and `TERM=dumb` really gets no colour: the "no
+  colour" branch used to emit `Cyan` and `Green` like every other fallback.
+- **`+` / `-` renice exists.** It had been in the README since 0.1 with no
+  handler behind it.
+- **Palette commands take arguments** — `kill firefox`, `stop nginx`,
+  `restart postgres` — as the README has advertised since 0.3 against a command
+  enum that could not carry one.
+- **GPU columns sort unreported metrics last in both directions.** Folding an
+  absent value in as a very low one made a card whose driver reports no
+  temperature look like the coldest one, which is exactly the confusion the
+  dashes exist to prevent.
+
+### Added
+
+- **Help overlay (`?` / `F1`)**, generated from the keymap table, so it cannot
+  drift from the bindings. Leads with the active tab's own keys and annotates
+  what remote mode disables.
+- **Inspector (`Enter` / `i`)** — the second layer the tables truncate: full
+  command line, image, memory against its cgroup limit, pod node and QoS, GPU
+  clocks and power, interface error counters. A side panel on wide terminals, a
+  full overlay on narrow ones.
+- **Actions menu (`x`)** listing exactly the actions available on this tab, with
+  their shortcuts.
+- **Command mode (`:`)** for the argument forms, alongside the fuzzy palette
+  (`Ctrl+P` / `Ctrl+K`). The palette now ranks the active tab's commands first,
+  highlights matched characters, remembers the session's recent commands, and
+  finally exposes the Kube and GPU sub-views and the namespace toggle.
+- **Typed notifications** with a severity, a toast stack, and a session log
+  (`Ctrl+L`) so an action that failed while you were on another tab is still
+  recoverable.
+- **`Space` pauses the view** so a fast-moving table can be read; `r` resumes.
+- **`y` copies the selected row's identifier** over OSC 52 — works through `ssh`
+  and `tmux`.
+- **Live per-tab counts in the tab bar**, and a header line carrying host,
+  connection, uptime and global CPU/memory meters.
+- **A status bar that shows state**: sort column and direction, active filter
+  with its match count, cursor position, paused indicator — then as many
+  contextual hints as fit, instead of a fixed list that silently overflowed an
+  80-column terminal.
+- **The General tab is a dashboard**: CPU, load against core count, memory, a
+  traffic graph, the top processes, and a cross-tab Workloads card that
+  summarises containers, Kubernetes and the busiest GPU. 0.5 absorbed the
+  remaining height with an empty `Constraint::Min(0)` — on a 50-row terminal,
+  half the tab was blank.
+- **Responsive tables.** Columns declare a priority; the least useful are dropped
+  first and the identity column always survives. Plus scrollbars, position
+  readouts, and empty states that say why a view is empty and what to do about it.
+- **`--theme <name>`** (`tokyo-night`, `tokyo-night-light`, `mono`),
+  **`--no-color`**, **`--ascii`**, **`--no-mouse`**.
+- **Honest terminal detection.** `TERM=linux` (the kernel console, a KVM console,
+  serial-over-LAN) gets the ASCII glyph set, because its bitmap font has no
+  block, braille or rounded-box glyphs and would otherwise paint tofu. A
+  non-UTF-8 locale does the same on Unix. Mouse capture is skipped where there is
+  no pointer. Every mouse gesture has a keyboard equivalent.
+- **`muxtop_core::system::host_name()`**, cached, for the header.
+
+### Tests
+
+TUI coverage roughly doubles (486 tests). Every tab and every overlay is rendered
+at sizes from 1×1 to 400×100 and under all four colour depths crossed with
+Unicode and ASCII, with an assertion that ASCII mode emits no multi-byte
+character anywhere. Each fixed bug above has a regression test that names it.
+
 ## [0.5.0] - 2026-08-05
 
 Feature release: the **GPU** tab. NVIDIA via [NVML](https://developer.nvidia.com/nvidia-management-library-nvml) and AMD via the `amdgpu` sysfs interface, with per-process usage on NVIDIA. Auto-detected at startup, so `muxtop` gains a sixth tab on any host with a supported GPU.
