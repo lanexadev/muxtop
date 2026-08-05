@@ -15,10 +15,12 @@
 //!
 //! ## Status (v0.4.0)
 //!
-//! Sub-views, sort cycling, filter, selection scrolling and the ANSI
-//! sanitizer (`scrub_ctrl`) are wired here. **Per-row sparklines and the
-//! all-namespaces toggle (`A`) are deferred to v0.4.x** — the public state
-//! and data model are already in place so the wiring is mechanical.
+//! Sub-views, sort cycling, filter, selection scrolling, the namespace scope
+//! toggle (`A`) and the ANSI sanitizer (`scrub_ctrl`) are wired here.
+//! **Per-row sparklines are deferred to v0.4.x** — the public state and data
+//! model are already in place so the wiring is mechanical.
+
+use std::borrow::Cow;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -109,6 +111,22 @@ fn draw_active(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme, sna
     }
 }
 
+/// Human label for the snapshot's namespace scope.
+///
+/// `current_namespace` is empty when the engine lists cluster-wide; rendering
+/// that verbatim produced a bare `ns:` with nothing after it.
+///
+/// Scrubbed like every other render site that shows a string muxtop did not
+/// author: in remote mode this field arrives from the server, and the v0.3.1
+/// sanitizer sweep never covered it — the summary bar interpolated it raw.
+pub(crate) fn namespace_label(snap: &KubeSnapshot) -> Cow<'_, str> {
+    if snap.current_namespace.is_empty() {
+        Cow::Borrowed("all")
+    } else {
+        scrub_ctrl(&snap.current_namespace)
+    }
+}
+
 fn draw_summary(frame: &mut Frame, area: Rect, theme: &Theme, snap: &KubeSnapshot) {
     let kind_label = cluster_kind_label(snap.cluster_kind);
     let metrics_badge = if snap.metrics_available {
@@ -122,7 +140,9 @@ fn draw_summary(frame: &mut Frame, area: Rect, theme: &Theme, snap: &KubeSnapsho
             Style::default().fg(theme.accent_primary),
         ),
         Span::raw("  "),
-        Span::raw(format!("ns: {}  ", snap.current_namespace)),
+        // An empty `current_namespace` is the wire encoding of "cluster-wide"
+        // (see `KubeSnapshot::current_namespace`), not missing data.
+        Span::raw(format!("ns: {}  ", namespace_label(snap))),
         Span::raw(format!("pods: {}  ", snap.pods.len())),
         Span::raw(format!("nodes: {}  ", snap.nodes.len())),
         Span::raw(format!("deployments: {}  ", snap.deployments.len())),
@@ -162,6 +182,16 @@ fn draw_subtab_bar(frame: &mut Frame, area: Rect, theme: &Theme, app: &AppState)
         if idx < 2 {
             spans.push(Span::raw("  "));
         }
+    }
+    // Scope toggle hint. Names the namespace it would switch *to* so the key
+    // is self-explanatory without a help screen.
+    if let Some(snap) = app.last_snapshot.as_ref().and_then(|s| s.kube.as_ref()) {
+        let hint = if snap.current_namespace.is_empty() {
+            "   [A] scope to namespace".to_string()
+        } else {
+            format!("   [A] all namespaces (now: {})", namespace_label(snap))
+        };
+        spans.push(Span::styled(hint, Style::default().fg(theme.text_dim)));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -318,10 +348,17 @@ fn draw_nodes(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme, snap
     let nodes = sort_nodes(filter_nodes(&snap.nodes, &app.kube_filter_input), app);
 
     if nodes.is_empty() {
-        let msg = if app.kube_filter_input.is_empty() {
+        let msg = if !app.kube_filter_input.is_empty() {
+            "  No nodes match the filter."
+        } else if snap.current_namespace.is_empty() {
             "  No nodes."
         } else {
-            "  No nodes match the filter."
+            // Scoped to a namespace and the node list came back empty: the
+            // overwhelmingly likely cause is RBAC, because Node is
+            // cluster-scoped and a namespace-bound Role cannot list it.
+            // Saying just "No nodes." here reads as "this cluster has no
+            // nodes", which is never true of a reachable cluster.
+            "  No nodes — listing nodes needs cluster-scoped access (they are not namespaced)."
         };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -710,6 +747,41 @@ fn format_mem(bytes: Option<u64>) -> String {
 mod tests {
     use super::*;
     use muxtop_core::kube::{DeploymentStrategy, KubeSnapshot, NodeStatus, PodSnapshot, QosClass};
+
+    // ---- namespace scope label ----
+
+    fn snapshot_with_namespace(ns: &str) -> KubeSnapshot {
+        KubeSnapshot {
+            current_namespace: ns.into(),
+            ..KubeSnapshot::unavailable()
+        }
+    }
+
+    #[test]
+    fn namespace_label_renders_empty_scope_as_all() {
+        // The engine encodes cluster-wide as the empty string; rendering it
+        // verbatim left a bare "ns:" in the summary bar.
+        let snap = snapshot_with_namespace("");
+        assert_eq!(namespace_label(&snap), "all");
+    }
+
+    #[test]
+    fn namespace_label_passes_through_a_real_namespace() {
+        let snap = snapshot_with_namespace("kube-system");
+        assert_eq!(namespace_label(&snap), "kube-system");
+    }
+
+    #[test]
+    fn namespace_label_scrubs_control_characters() {
+        // In remote mode this string arrives from the server. An OSC sequence
+        // here would retitle the user's terminal on render.
+        let snap = snapshot_with_namespace("ns\u{001b}]0;pwned\u{0007}");
+        let label = namespace_label(&snap);
+        assert!(
+            !label.contains('\u{001b}') && !label.contains('\u{0007}'),
+            "escape sequence survived the sanitizer: {label:?}"
+        );
+    }
 
     // ---- format helpers ----
 

@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-08-05
+
+Follow-up to 0.4.1: `--kube-namespace` becomes a real scoping filter instead of a display label, and the workspace compiles on Windows again. No wire-format change — 0.4.1 and 0.4.2 remain compatible on the wire.
+
+### Fixed
+
+- **The workspace compiles on Windows again (`muxtop-core`)** — `actions.rs` called `libc::kill`, `libc::setpriority`, `libc::getpriority`, `libc::SIGKILL`, `libc::PRIO_PROCESS` and `libc::id_t` with no `cfg(unix)` gate. None of those exist in `libc` on Windows, so the whole of `muxtop-core` failed to build there and took every dependent crate with it — no `cargo check`, no `cargo test`, no way to work on any part of muxtop from a Windows machine. The POSIX implementations are now gated behind `cfg(unix)`, with `cfg(not(unix))` stubs of identical signature that fail with `ErrorKind::Unsupported`. PID validation was extracted into a shared `validate_pid` that runs *before* the platform split, so the safety guarantees (no `kill(-1, …)`, no `kill(0, …)`) hold and stay tested on every platform.
+
+  This is a build fix, not Windows support: `release.yml` still publishes musl and darwin binaries only, and F7/F8/F9/F10 return an error there rather than acting.
+
+### Changed
+
+- **CI runs the test suite on `windows-latest`** as a regression guard. The break above survived two releases precisely because nothing in the pipeline ever compiled the workspace on Windows.
+
+### Added
+
+- **Real namespace scoping for the Kubernetes tab (`muxtop-core`, `muxtop-tui`, `muxtop`, `muxtop-server`)** — `--kube-namespace <NS>` now scopes the actual API calls: Pods and Deployments are listed through `Api::namespaced` instead of `Api::all`, and pod metrics move to `/apis/metrics.k8s.io/v1beta1/namespaces/{ns}/pods`. A `Role` bound to one namespace is now sufficient to use the tab — previously muxtop required cluster-scoped `list` on all three resources, which locked out anyone without cluster-wide RBAC. Without the flag the behaviour is unchanged (cluster-wide), so existing setups are unaffected.
+- **`A` toggles the namespace scope at runtime** (Kube tab, local mode) — flips between the configured namespace and all-namespaces. The engine owns the flip because only it knows which namespace to scope to (`--kube-namespace`, else the kubeconfig context's default). Rescoping clears the pod and deployment caches immediately so no out-of-scope row survives until the next 5 s poll. In `--remote` mode the server's `--kube-namespace` decides and the key reports that it is local-only, mirroring how container actions are gated. Closes the "namespace toggle `A`" item deferred from v0.4.0.
+- **`ClusterEngine::scope` / `ClusterEngine::toggle_scope`** with default implementations reporting `KubeScope::AllNamespaces`, so out-of-tree implementations keep compiling.
+- **README gains a "Kubernetes permissions" section** with a minimal namespace-scoped `Role` manifest and an explanation of why Nodes are the exception.
+
+### Security
+
+- **Namespace input is validated as a DNS-1123 label** before it reaches the metrics-server URI builder (`is_valid_namespace`, shared by both binaries through `parse_namespace` so they reject identical input with identical wording). The namespace comes from `--kube-namespace` and is interpolated into a request path; the accepted character set excludes `/`, `.`, `?` and `%`, so neither a path segment nor a query string can be injected. Rejected at the CLI boundary by clap and again inside `KubeEngine::connect`, which must not depend on its callers validating.
+- **`current_namespace` is now scrubbed before rendering (`muxtop-tui`)** — the Kube summary bar interpolated it raw. In `--remote` mode this string arrives from the server, making it the last unsanitised render site in the Kube tab; the v0.3.1 sanitizer sweep and the v0.4.1 follow-up both missed it.
+
+### Changed
+
+- **`KubeSnapshot::current_namespace` now means the effective scope**, with the empty string encoding "all namespaces". It previously carried the kubeconfig's default namespace while listing cluster-wide regardless — the field described an intent the engine did not honour. **No wire-format change**: the distinction is encoded in the existing field rather than a new one, so 0.4.1 and this version remain compatible on the wire.
+- The Kube summary bar renders `ns: all` when cluster-wide instead of a bare `ns:`, and the sub-tab bar shows an `[A]` hint naming the scope it would switch to.
+- The Nodes sub-view distinguishes "no nodes" from "no access to nodes" when scoped to a namespace, rather than implying a reachable cluster has no nodes.
+- `muxtop_tui::run` takes a fourth argument, the optional cluster engine. Internal to the workspace — the only caller is `src/main.rs`.
+
 ## [0.4.1] - 2026-08-05
 
 First published release carrying the Kubernetes tab. **0.4.0 was tagged in the changelog and merged to `develop` on 2026-04-26 but never released** — no git tag, no GitHub release, no crates.io publication. Users upgrading from 0.3.1 receive the entire 0.4.0 feature set (see below) plus the security and correctness fixes in this section. There is no 0.4.0 artifact on any distribution channel; the 0.4.0 changelog entry is retained as the record of when that work landed.

@@ -55,6 +55,8 @@ cargo build --release
 
 > MSRV: Rust **1.88**
 
+> **Platforms.** Linux and macOS (x86_64 and aarch64) are the supported targets — those are what the release pipeline publishes. The workspace also builds and passes its tests on Windows so the project can be developed there, but no Windows binaries are published and the process actions (`F7`/`F8` renice, `F9`/`F10` kill) are POSIX-only and return an error.
+
 ---
 
 ## Features
@@ -64,7 +66,7 @@ cargo build --release
 | **Tabs** | General, Processes, Network, Containers and Kubernetes — `Alt+1` / `Alt+2` / `Alt+3` / `Alt+4` / `Alt+5` |
 | **Network tab** | Interface table with RX/s, TX/s, totals, errors + real-time sparklines |
 | **Containers tab** | Docker/Podman via [bollard](https://github.com/fussybeaver/bollard) — CPU/memory/network/IO table, CPU+RX sparklines, `F9` stop / `F10` kill / `F11` restart actions, automatic socket detection |
-| **Kubernetes tab** | Read-only Pods / Nodes / Deployments via [kube-rs](https://github.com/kube-rs/kube) — switch sub-views with `P` / `N` / `D`, sort with `s`, filter with `/`. Auto-detects `$KUBECONFIG` / `~/.kube/config` / in-cluster ServiceAccount; graceful fallback when `metrics-server` is absent (CPU/MEM render `—`). Lists **cluster-wide** (requires cluster-scoped `list` on pods, nodes and deployments) |
+| **Kubernetes tab** | Read-only Pods / Nodes / Deployments via [kube-rs](https://github.com/kube-rs/kube) — switch sub-views with `P` / `N` / `D`, sort with `s`, filter with `/`. Auto-detects `$KUBECONFIG` / `~/.kube/config` / in-cluster ServiceAccount; graceful fallback when `metrics-server` is absent (CPU/MEM render `—`). Lists cluster-wide by default; `--kube-namespace <NS>` scopes Pods and Deployments to one namespace so a namespace-bound Role is enough, and `A` toggles between the two at runtime (see [Kubernetes permissions](#kubernetes-permissions)) |
 | **Command palette** | `Ctrl+P` — `kill firefox`, `sort memory`, `stop nginx`, `restart postgres`, etc. |
 | **htop shortcuts** | `F1`–`F5` sort columns, `F7`/`F8` renice, `F9` kill, `F10` force kill |
 | **Fuzzy search** | Powered by [nucleo](https://github.com/helix-editor/nucleo) (from the Helix editor) |
@@ -76,6 +78,36 @@ cargo build --release
 | **Tokyo Night theme** | Native TrueColor, automatic fallback for ANSI/16-color terminals |
 | **Static binary** | Single musl binary, no system dependencies |
 | **Zero telemetry** | No client-side network calls, ever (see [Privacy](#privacy--telemetry)) |
+
+---
+
+## Kubernetes permissions
+
+By default muxtop lists Pods, Nodes and Deployments across every namespace, which needs cluster-scoped `list` on all three. On a shared cluster you usually don't have that.
+
+Pass `--kube-namespace <NS>` to scope Pods and Deployments to a single namespace — that works with a plain `Role` bound to it, no cluster-wide grant required. Press `A` in the Kube tab to switch between the scoped and cluster-wide views at runtime (local mode only; in `--remote` mode the server's `--kube-namespace` decides).
+
+**Nodes are cluster-scoped in Kubernetes** — there is no namespaced variant of the resource, so the Nodes sub-view always needs cluster-wide access and renders empty without it. The Pods and Deployments views are unaffected. The same split applies to metrics: pod CPU/MEM follows the namespace scope, node CPU/MEM does not.
+
+A minimal namespace-scoped Role:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: muxtop-readonly
+  namespace: my-namespace
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["list"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["list"]
+```
 
 ---
 
@@ -103,7 +135,7 @@ muxtop --no-containers                        # disable container collection
 # Kubernetes tab — by default muxtop reads $KUBECONFIG, then ~/.kube/config,
 # then falls back to in-cluster ServiceAccount credentials. Override or disable:
 muxtop --kube-context kind-kind               # use a specific kubeconfig context
-muxtop --kube-namespace kube-system           # set the displayed default namespace
+muxtop --kube-namespace kube-system           # scope Pods/Deployments to one namespace
 muxtop --no-kube                              # disable cluster collection entirely
 
 # Run the server (TLS + auth required)
@@ -139,6 +171,7 @@ MUXTOP_TOKEN="my-secret-16chars" muxtop --remote host:port --tls-ca cert.pem
 | `F10` | Force kill, SIGKILL (Processes) · Kill container (Containers) |
 | `F11` | Restart container (Containers) |
 | `P` / `N` / `D` | Switch Kube sub-view to **P**ods / **N**odes / **D**eployments (Kubernetes tab only) |
+| `A` | Toggle namespace scope — one namespace ↔ **A**ll namespaces (Kubernetes tab, local mode) |
 
 > There is no built-in help screen yet — `Ctrl+P` lists every command with its shortcut.
 
@@ -225,7 +258,7 @@ If you observe outbound activity from muxtop that isn't tied to a feature you've
 ### Read-only by design
 
 When the Kubernetes or Containers tab is active, muxtop only **reads** from the corresponding API:
-- Kubernetes : `LIST` on Pods / Nodes / Deployments + `GET` on `metrics.k8s.io/v1beta1`. No `CREATE` / `UPDATE` / `DELETE` / `PATCH` is ever issued. Write actions (Delete pod, Scale deployment, Rollout restart) are explicitly out of scope for v0.4.
+- Kubernetes : `LIST` on Pods / Nodes / Deployments + `GET` on `metrics.k8s.io/v1beta1`, scoped to one namespace or cluster-wide per [Kubernetes permissions](#kubernetes-permissions). No `CREATE` / `UPDATE` / `DELETE` / `PATCH` is ever issued. Write actions (Delete pod, Scale deployment, Rollout restart) are explicitly out of scope for v0.4.
 - Containers : `GET /containers/json` + `/stats?stream=false`. The Stop / Kill / Restart actions are gated behind a confirmation dialog and are local-only — disabled in `--remote` mode.
 
 ### Remote mode and credentials

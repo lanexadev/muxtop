@@ -1,7 +1,49 @@
 // System actions: kill and renice process wrappers.
 // All unsafe libc calls are isolated in this module.
+//
+// # Platform support
+//
+// Signalling and nice values are POSIX concepts with no portable Windows
+// equivalent: `kill`/`setpriority`/`getpriority` and the `SIGKILL` constant
+// simply do not exist in `libc` there. The implementations below are gated
+// on `cfg(unix)`; every other platform gets a stub with the identical
+// signature that fails with `ErrorKind::Unsupported`.
+//
+// The stubs exist so the workspace *compiles* off POSIX — without them the
+// whole of `muxtop-core` fails to build on Windows, which means no local
+// `cargo check`, no `cargo test`, and no way to work on any other part of
+// muxtop from a Windows machine. They are not a claim that muxtop is
+// supported on Windows: CI covers Linux and macOS only, and F7/F8/F9/F10
+// return an error rather than acting.
+//
+// The PID validation runs *before* the platform split, so the safety
+// guarantees below (no `kill(-1, …)`, no `kill(0, …)`) hold identically on
+// every platform and stay covered by tests everywhere.
 
 use crate::error::CoreError;
+
+/// Reject PIDs that cannot be safely narrowed to a positive `pid_t`.
+///
+/// # Safety boundary
+/// `u32` values above `i32::MAX` wrap to negative, and `kill(-1, sig)` sends
+/// the signal to ALL processes the caller can reach; `kill(0, sig)` hits the
+/// caller's entire process group. Both are rejected here, before any syscall.
+fn validate_pid(pid: u32) -> Result<i32, CoreError> {
+    let pid_i32 = i32::try_from(pid).map_err(|_| CoreError::ProcessNotFound { pid })?;
+    if pid_i32 <= 0 {
+        return Err(CoreError::ProcessNotFound { pid });
+    }
+    Ok(pid_i32)
+}
+
+/// Error returned by the non-POSIX stubs.
+#[cfg(not(unix))]
+fn unsupported(action: &str) -> CoreError {
+    CoreError::Io(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!("{action} is not supported on this platform (POSIX only)"),
+    ))
+}
 
 /// Safe subset of POSIX signals that muxtop is permitted to send.
 ///
@@ -16,6 +58,8 @@ pub enum Signal {
 }
 
 impl Signal {
+    /// `libc::SIGKILL` does not exist on Windows, so this mapping is POSIX-only.
+    #[cfg(unix)]
     fn as_libc(self) -> i32 {
         match self {
             Signal::Term => libc::SIGTERM,
@@ -32,16 +76,10 @@ impl Signal {
 /// - other  → `Io`
 ///
 /// # Safety boundary
-/// PIDs that would overflow `libc::pid_t` (i32) are rejected.
-/// Negative pid values after cast are rejected (pid -1 is a POSIX wildcard
-/// that sends the signal to ALL processes the caller can reach).
+/// See [`validate_pid`] — invalid PIDs are rejected before any syscall.
+#[cfg(unix)]
 pub fn kill_process(pid: u32, signal: Signal) -> Result<(), CoreError> {
-    // CRITICAL: pid as i32 must be positive. u32 values > i32::MAX wrap to
-    // negative, and kill(-1, sig) sends sig to ALL user processes.
-    let pid_i32 = i32::try_from(pid).map_err(|_| CoreError::ProcessNotFound { pid })?;
-    if pid_i32 <= 0 {
-        return Err(CoreError::ProcessNotFound { pid });
-    }
+    let pid_i32 = validate_pid(pid)?;
 
     let ret = unsafe { libc::kill(pid_i32, signal.as_libc()) };
     if ret == 0 {
@@ -58,6 +96,14 @@ pub fn kill_process(pid: u32, signal: Signal) -> Result<(), CoreError> {
     }
 }
 
+/// Non-POSIX stub — validates the PID, then reports that signalling is
+/// unavailable. See the module-level platform note.
+#[cfg(not(unix))]
+pub fn kill_process(pid: u32, signal: Signal) -> Result<(), CoreError> {
+    validate_pid(pid)?;
+    Err(unsupported(&format!("sending signal {signal:?}")))
+}
+
 /// Change the scheduling priority (nice value) of the process identified by `pid`.
 ///
 /// Because `setpriority` returns –1 both on error *and* as a valid success value
@@ -68,13 +114,9 @@ pub fn kill_process(pid: u32, signal: Signal) -> Result<(), CoreError> {
 /// - ESRCH  → `ProcessNotFound`
 /// - EPERM  → `Permission`
 /// - other  → `Io`
+#[cfg(unix)]
 pub fn renice_process(pid: u32, nice_value: i32) -> Result<(), CoreError> {
-    // Same overflow guard as kill_process — reject PIDs that don't fit in a
-    // positive i32 to avoid silent wrapping to negative id_t values.
-    let pid_i32 = i32::try_from(pid).map_err(|_| CoreError::ProcessNotFound { pid })?;
-    if pid_i32 <= 0 {
-        return Err(CoreError::ProcessNotFound { pid });
-    }
+    let pid_i32 = validate_pid(pid)?;
 
     // Clear errno and call setpriority in a single unsafe block to prevent
     // any interleaving between the errno clear and the syscall.
@@ -99,6 +141,14 @@ pub fn renice_process(pid: u32, nice_value: i32) -> Result<(), CoreError> {
     }
 }
 
+/// Non-POSIX stub — nice values have no Windows equivalent. See the
+/// module-level platform note.
+#[cfg(not(unix))]
+pub fn renice_process(pid: u32, nice_value: i32) -> Result<(), CoreError> {
+    validate_pid(pid)?;
+    Err(unsupported(&format!("setting nice value {nice_value}")))
+}
+
 /// Read the current scheduling priority (nice value) of the process identified by `pid`.
 ///
 /// Because `getpriority` returns –1 both on error *and* as a valid success value,
@@ -108,11 +158,9 @@ pub fn renice_process(pid: u32, nice_value: i32) -> Result<(), CoreError> {
 /// - ESRCH  → `ProcessNotFound`
 /// - EPERM  → `Permission`
 /// - other  → `Io`
+#[cfg(unix)]
 pub fn get_process_priority(pid: u32) -> Result<i32, CoreError> {
-    let pid_i32 = i32::try_from(pid).map_err(|_| CoreError::ProcessNotFound { pid })?;
-    if pid_i32 <= 0 {
-        return Err(CoreError::ProcessNotFound { pid });
-    }
+    let pid_i32 = validate_pid(pid)?;
 
     let ret = unsafe {
         set_errno_raw(0);
@@ -130,10 +178,19 @@ pub fn get_process_priority(pid: u32) -> Result<i32, CoreError> {
     }
 }
 
+/// Non-POSIX stub — nice values have no Windows equivalent. See the
+/// module-level platform note.
+#[cfg(not(unix))]
+pub fn get_process_priority(pid: u32) -> Result<i32, CoreError> {
+    validate_pid(pid)?;
+    Err(unsupported("reading the nice value"))
+}
+
 /// Raw errno write — must be called inside an existing `unsafe` block.
 ///
 /// # Safety
 /// Caller must be in an `unsafe` context.
+#[cfg(unix)]
 unsafe fn set_errno_raw(value: i32) {
     #[cfg(target_os = "macos")]
     {
@@ -213,6 +270,7 @@ mod tests {
 
     /// Lowering priority (raising nice value) is always permitted for the
     /// process itself on POSIX systems.
+    #[cfg(unix)]
     #[test]
     fn test_renice_self() {
         let pid = std::process::id();
@@ -258,7 +316,41 @@ mod tests {
         }
     }
 
+    /// Off POSIX the three entry points must fail cleanly with
+    /// `ErrorKind::Unsupported` — never panic, never silently no-op — and
+    /// must still reject an invalid PID *first*, so the safety guarantees
+    /// hold identically on every platform.
+    #[cfg(not(unix))]
+    #[test]
+    fn test_actions_unsupported_off_posix() {
+        use std::io::ErrorKind;
+
+        let self_pid = std::process::id();
+        let unsupported_kind = |e: CoreError| match e {
+            CoreError::Io(io) => io.kind(),
+            other => panic!("expected CoreError::Io, got {other:?}"),
+        };
+
+        let e = kill_process(self_pid, Signal::Term).unwrap_err();
+        assert_eq!(unsupported_kind(e), ErrorKind::Unsupported);
+        let e = renice_process(self_pid, 10).unwrap_err();
+        assert_eq!(unsupported_kind(e), ErrorKind::Unsupported);
+        let e = get_process_priority(self_pid).unwrap_err();
+        assert_eq!(unsupported_kind(e), ErrorKind::Unsupported);
+
+        // PID validation precedes the platform check.
+        assert!(matches!(
+            kill_process(0, Signal::Term),
+            Err(CoreError::ProcessNotFound { .. })
+        ));
+        assert!(matches!(
+            kill_process(u32::MAX, Signal::Term),
+            Err(CoreError::ProcessNotFound { .. })
+        ));
+    }
+
     /// get_process_priority must succeed for our own process.
+    #[cfg(unix)]
     #[test]
     fn test_get_priority_self() {
         let pid = std::process::id();
