@@ -1,0 +1,60 @@
+name: CodeQL
+
+# Static analysis feeding the repository's Security tab. This complements,
+# and does not replace, `cargo clippy -D warnings`: clippy reasons about one
+# function at a time, CodeQL follows data across function and crate
+# boundaries, which is where the interesting findings in a network-facing
+# daemon live (untrusted frame -> parser -> filesystem or process action).
+#
+# CodeQL's Rust support is newer than its C/Java support and its rule set is
+# correspondingly smaller. Treat a clean run as "no known pattern matched",
+# not as proof of absence.
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+    branches: [develop]
+  schedule:
+    # Weekly: the query packs change more often than the code does, so a
+    # scheduled run finds things a push-triggered run already missed.
+    - cron: "41 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  analyze:
+    name: Analyze (rust)
+    runs-on: ubuntu-latest
+    permissions:
+      # Required to upload the SARIF results to code scanning.
+      security-events: write
+      # Required by the action to read workflow run metadata.
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@c4dd10e44af883a891fe31ced449bcb4a6728b9b # v3
+        with:
+          languages: rust
+          # `none` means CodeQL extracts from source without invoking cargo.
+          # It costs no build minutes and cannot be broken by the k8s-openapi
+          # feature gate that trips every naive `cargo build` in this
+          # workspace. If a future query pack needs full type resolution,
+          # switch to `manual` and add a `cargo build --workspace
+          # --all-targets` step here.
+          build-mode: none
+          queries: security-and-quality
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@c4dd10e44af883a891fe31ced449bcb4a6728b9b # v3
+        with:
+          category: "/language:rust"
