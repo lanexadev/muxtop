@@ -3,7 +3,7 @@
 mod confirm;
 mod containers;
 mod general;
-mod kube;
+pub(crate) mod kube;
 mod network;
 mod palette;
 mod processes;

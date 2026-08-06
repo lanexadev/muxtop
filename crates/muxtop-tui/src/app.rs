@@ -539,6 +539,12 @@ pub struct AppState {
     pub kube_filter_active: bool,
     pub kube_selected: usize,
     pub kube_scroll_offset: usize,
+    /// Filtered + sorted indices into the active Kube sub-view's list
+    /// (PERF-03), refreshed by [`AppState::recompute_kube_view`] whenever the
+    /// snapshot, sub-view, filter or sort changes. Mirrors what
+    /// `sorted_filtered_containers_cache` does for the Containers tab, but
+    /// stores indices so the cache cost tracks row count, not row size.
+    pub kube_view_cache: Vec<usize>,
     pub containers_sort_field: ContainerSortField,
     /// Sort order for the Containers tab.
     pub containers_sort_order: SortOrder,
@@ -630,6 +636,7 @@ impl AppState {
             kube_filter_active: false,
             kube_selected: 0,
             kube_scroll_offset: 0,
+            kube_view_cache: Vec::new(),
             containers_sort_field: ContainerSortField::default(),
             containers_sort_order: SortOrder::Desc,
             containers_filter_input: String::new(),
@@ -804,36 +811,31 @@ impl AppState {
 
     /// Count of items rendered in the active Kube sub-view AFTER the filter
     /// is applied. Used by the j/k / scroll bounds.
+    ///
+    /// PERF-03: reads the cache. This runs on every navigation keypress, and
+    /// re-filtering the whole pod list — lowercasing two fields per row — to
+    /// answer "how many rows are there" was the same mistake PERF-M5 fixed
+    /// for the Network and Containers tabs.
     pub fn kube_count(&self) -> usize {
-        let Some(snap) = self.last_snapshot.as_ref().and_then(|s| s.kube.as_ref()) else {
-            return 0;
+        self.kube_view_cache.len()
+    }
+
+    /// Rebuild [`Self::kube_view_cache`] from the current snapshot and view
+    /// state. Cheap to call; every mutation that can reorder or resize the
+    /// Kube table must call it, or the table and the selection bounds drift
+    /// apart.
+    fn recompute_kube_view(&mut self) {
+        let indices = match self.last_snapshot.as_ref().and_then(|s| s.kube.as_ref()) {
+            Some(snap) => crate::ui::kube::compute_view_indices(
+                snap,
+                self.kube_subview,
+                &self.kube_filter_input,
+                self.kube_sort_field,
+                self.kube_sort_order,
+            ),
+            None => Vec::new(),
         };
-        let f = self.kube_filter_input.to_lowercase();
-        match self.kube_subview {
-            KubeSubview::Pods => snap
-                .pods
-                .iter()
-                .filter(|p| {
-                    f.is_empty()
-                        || p.name.to_lowercase().contains(&f)
-                        || p.namespace.to_lowercase().contains(&f)
-                })
-                .count(),
-            KubeSubview::Nodes => snap
-                .nodes
-                .iter()
-                .filter(|n| f.is_empty() || n.name.to_lowercase().contains(&f))
-                .count(),
-            KubeSubview::Deployments => snap
-                .deployments
-                .iter()
-                .filter(|d| {
-                    f.is_empty()
-                        || d.name.to_lowercase().contains(&f)
-                        || d.namespace.to_lowercase().contains(&f)
-                })
-                .count(),
-        }
+        self.kube_view_cache = indices;
     }
 
     /// Switch the Kube tab's active sub-view, resetting sort + filter +
@@ -846,6 +848,7 @@ impl AppState {
         self.kube_filter_active = false;
         self.kube_selected = 0;
         self.kube_scroll_offset = 0;
+        self.recompute_kube_view();
     }
 
     /// Returns the currently selected process, if any.
@@ -1055,6 +1058,9 @@ impl AppState {
         // PERF-H4: refresh the cached sorted+filtered container view exactly
         // once per snapshot; render and action paths read this slice.
         self.recompute_containers_view();
+        // PERF-03: same contract for the Kube tab — the cached view must
+        // never outlive the snapshot it indexes into.
+        self.recompute_kube_view();
         // PERF-H1: a fresh snapshot always changes what we'd paint.
         self.mark_dirty();
     }
@@ -1325,6 +1331,7 @@ impl AppState {
                         next_kube_sort_field(self.kube_sort_field, self.kube_subview);
                     self.kube_selected = 0;
                     self.kube_scroll_offset = 0;
+                    self.recompute_kube_view();
                 }
                 _ => {
                     self.sort_field = next_sort_field(self.sort_field);
@@ -1350,6 +1357,7 @@ impl AppState {
                         SortOrder::Asc => SortOrder::Desc,
                         SortOrder::Desc => SortOrder::Asc,
                     };
+                    self.recompute_kube_view();
                 }
                 _ => {
                     self.sort_order = match self.sort_order {
@@ -1458,6 +1466,7 @@ impl AppState {
                         self.kube_filter_input.clear();
                         self.kube_selected = 0;
                         self.kube_scroll_offset = 0;
+                        self.recompute_kube_view();
                     }
                 }
                 _ => {
@@ -1825,11 +1834,13 @@ impl AppState {
                     self.kube_filter_input.pop();
                     self.kube_selected = 0;
                     self.kube_scroll_offset = 0;
+                    self.recompute_kube_view();
                 }
                 KeyCode::Char(c) if self.kube_filter_input.len() < Self::MAX_FILTER_LEN => {
                     self.kube_filter_input.push(c);
                     self.kube_selected = 0;
                     self.kube_scroll_offset = 0;
+                    self.recompute_kube_view();
                 }
                 _ => {}
             }
@@ -3238,6 +3249,102 @@ mod tests {
         assert!(matches!(app.net_sort_field, NetworkSortField::RxRate));
         assert!(app.net_filter_input.is_empty());
         assert!(!app.net_filter_active);
+    }
+
+    // -- PERF-03: Kube view cache --
+
+    fn snapshot_with_kube(pod_names: &[(&str, &str)]) -> SystemSnapshot {
+        use muxtop_core::kube::{ClusterKind, KubeSnapshot, PodPhase, PodSnapshot, QosClass};
+        let mut snap = make_snapshot_with_container("c-id", "ctr");
+        snap.kube = Some(std::sync::Arc::new(KubeSnapshot {
+            cluster_kind: ClusterKind::Generic,
+            server_version: None,
+            current_namespace: "default".into(),
+            reachable: true,
+            metrics_available: false,
+            pods: pod_names
+                .iter()
+                .map(|(ns, name)| PodSnapshot {
+                    namespace: (*ns).into(),
+                    name: (*name).into(),
+                    phase: PodPhase::Running,
+                    ready: (1, 1),
+                    restarts: 0,
+                    age_seconds: 60,
+                    node: "node-1".into(),
+                    cpu_millis: None,
+                    mem_bytes: None,
+                    qos: QosClass::BestEffort,
+                })
+                .collect(),
+            nodes: Vec::new(),
+            deployments: Vec::new(),
+        }));
+        snap
+    }
+
+    /// The cache is what both the render path and the scroll bounds read, so
+    /// it has to track the snapshot exactly — a stale cache shows rows that
+    /// no longer exist or hides ones that do.
+    #[test]
+    fn test_kube_view_cache_follows_the_snapshot() {
+        let mut app = AppState::new();
+        app.tab = Tab::Kube;
+        assert_eq!(app.kube_count(), 0, "no snapshot yet");
+
+        app.apply_snapshot(snapshot_with_kube(&[
+            ("default", "nginx-1"),
+            ("kube-system", "coredns"),
+        ]));
+        assert_eq!(app.kube_count(), 2);
+
+        // A shrinking cluster must shrink the cache, or j/k would scroll past
+        // the end of the list.
+        app.apply_snapshot(snapshot_with_kube(&[("default", "nginx-1")]));
+        assert_eq!(app.kube_count(), 1);
+    }
+
+    /// Every keystroke that can change the visible set must refresh the
+    /// cache. Typing a filter is the one users hit hardest.
+    #[test]
+    fn test_kube_filter_keystrokes_refresh_the_cache() {
+        let mut app = AppState::new();
+        app.tab = Tab::Kube;
+        app.apply_snapshot(snapshot_with_kube(&[
+            ("default", "nginx-1"),
+            ("kube-system", "coredns"),
+        ]));
+
+        app.kube_filter_active = true;
+        for c in "nginx".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(app.kube_count(), 1, "filter should narrow the view");
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(app.kube_count(), 1, "\"ngin\" still matches only nginx-1");
+
+        for _ in 0..4 {
+            app.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        assert_eq!(app.kube_count(), 2, "clearing the filter restores all rows");
+    }
+
+    /// Switching sub-views changes which list the indices point into, so a
+    /// carried-over cache would index the wrong collection.
+    #[test]
+    fn test_kube_subview_switch_rebuilds_the_cache() {
+        let mut app = AppState::new();
+        app.tab = Tab::Kube;
+        app.apply_snapshot(snapshot_with_kube(&[("default", "nginx-1")]));
+        assert_eq!(app.kube_count(), 1);
+
+        // The fixture has no nodes; the count must follow the new sub-view.
+        app.switch_kube_subview(KubeSubview::Nodes);
+        assert_eq!(app.kube_count(), 0);
+
+        app.switch_kube_subview(KubeSubview::Pods);
+        assert_eq!(app.kube_count(), 1);
     }
 
     /// SEC-02: status text splices in process names and daemon error strings.

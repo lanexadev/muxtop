@@ -7,11 +7,16 @@
 //!
 //! ## Sort + filter
 //!
-//! Sort and filter are applied **at render time** via local helpers
-//! (`sort_pods` / `sort_nodes` / `sort_deployments`). For v0.4.0 cluster
-//! sizes (typical < 500 pods) the per-frame O(n log n) is microsecond-level
-//! and not worth caching. If a future profile shows it matters, the cache
-//! would live next to `sorted_filtered_containers_cache` in `AppState`.
+//! v0.4.0 applied both at render time and bet that per-frame O(n log n)
+//! would stay microsecond-level. It does not at the 5 000-pod ceiling
+//! `ListParams` allows, and every navigation keypress paid for a full
+//! re-filter through `kube_count()`.
+//!
+//! [`compute_view_indices`] now produces the filtered + sorted order once
+//! per state change; `AppState::kube_view_cache` holds it and the draw
+//! functions below only index into the snapshot. This is the same contract
+//! `sorted_filtered_containers_cache` has for the Containers tab — every
+//! mutation of sub-view, filter or sort must refresh the cache.
 //!
 //! ## Status (v0.4.0)
 //!
@@ -30,7 +35,7 @@ use muxtop_core::kube::{
     ClusterKind, DeploymentSnapshot, KubeSnapshot, NodeSnapshot, NodeStatus, PodPhase, PodSnapshot,
 };
 
-use muxtop_core::process::SortOrder;
+use muxtop_core::process::{SortOrder, contains_ignore_case};
 
 use crate::app::{AppState, KubeSortField, KubeSubview};
 use crate::ui::sanitize::scrub_ctrl;
@@ -192,7 +197,15 @@ fn draw_filter_bar(frame: &mut Frame, area: Rect, theme: &Theme, app: &AppState)
 // ---- Pods sub-view ------------------------------------------------------
 
 fn draw_pods(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme, snap: &KubeSnapshot) {
-    let pods = sort_pods(filter_pods(&snap.pods, &app.kube_filter_input), app);
+    // PERF-03: the filtered+sorted order is computed once per state change
+    // in `AppState::recompute_kube_view`, not once per frame. `get` rather
+    // than indexing so a cache that briefly trails the snapshot degrades to
+    // fewer rows instead of panicking.
+    let pods: Vec<&PodSnapshot> = app
+        .kube_view_cache
+        .iter()
+        .filter_map(|&i| snap.pods.get(i))
+        .collect();
 
     if pods.is_empty() {
         let msg = if app.kube_filter_input.is_empty() {
@@ -265,40 +278,39 @@ fn draw_pods(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme, snap:
     frame.render_widget(table, area);
 }
 
-fn filter_pods<'a>(pods: &'a [PodSnapshot], filter: &str) -> Vec<&'a PodSnapshot> {
-    if filter.is_empty() {
-        return pods.iter().collect();
-    }
-    let f = filter.to_lowercase();
-    pods.iter()
-        .filter(|p| p.name.to_lowercase().contains(&f) || p.namespace.to_lowercase().contains(&f))
-        .collect()
+fn pod_matches(p: &PodSnapshot, needle_lower: &str) -> bool {
+    contains_ignore_case(&p.name, needle_lower) || contains_ignore_case(&p.namespace, needle_lower)
 }
 
-fn sort_pods<'a>(mut pods: Vec<&'a PodSnapshot>, app: &AppState) -> Vec<&'a PodSnapshot> {
+fn cmp_pods(
+    a: &PodSnapshot,
+    b: &PodSnapshot,
+    field: KubeSortField,
+    order: SortOrder,
+) -> std::cmp::Ordering {
     use std::cmp::Ordering;
-    let asc = matches!(app.kube_sort_order, SortOrder::Asc);
-    pods.sort_by(|a, b| {
-        let ord = match app.kube_sort_field {
-            KubeSortField::PodName => a.name.cmp(&b.name),
-            KubeSortField::PodCpu => a
-                .cpu_millis
-                .unwrap_or(0)
-                .cmp(&b.cpu_millis.unwrap_or(0))
-                .reverse(),
-            KubeSortField::PodMem => a
-                .mem_bytes
-                .unwrap_or(0)
-                .cmp(&b.mem_bytes.unwrap_or(0))
-                .reverse(),
-            KubeSortField::PodRestarts => a.restarts.cmp(&b.restarts).reverse(),
-            KubeSortField::PodAge => a.age_seconds.cmp(&b.age_seconds).reverse(),
-            KubeSortField::PodPhase => pod_phase_rank(a.phase).cmp(&pod_phase_rank(b.phase)),
-            _ => Ordering::Equal, // Out-of-domain → render order = list order
-        };
-        if asc { ord.reverse() } else { ord }
-    });
-    pods
+    let ord = match field {
+        KubeSortField::PodName => a.name.cmp(&b.name),
+        KubeSortField::PodCpu => a
+            .cpu_millis
+            .unwrap_or(0)
+            .cmp(&b.cpu_millis.unwrap_or(0))
+            .reverse(),
+        KubeSortField::PodMem => a
+            .mem_bytes
+            .unwrap_or(0)
+            .cmp(&b.mem_bytes.unwrap_or(0))
+            .reverse(),
+        KubeSortField::PodRestarts => a.restarts.cmp(&b.restarts).reverse(),
+        KubeSortField::PodAge => a.age_seconds.cmp(&b.age_seconds).reverse(),
+        KubeSortField::PodPhase => pod_phase_rank(a.phase).cmp(&pod_phase_rank(b.phase)),
+        _ => Ordering::Equal, // Out-of-domain → render order = list order
+    };
+    if matches!(order, SortOrder::Asc) {
+        ord.reverse()
+    } else {
+        ord
+    }
 }
 
 /// Phase ordering for sort: most-attention-grabbing first (CrashLoop on top).
@@ -317,7 +329,11 @@ fn pod_phase_rank(p: PodPhase) -> u8 {
 // ---- Nodes sub-view -----------------------------------------------------
 
 fn draw_nodes(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme, snap: &KubeSnapshot) {
-    let nodes = sort_nodes(filter_nodes(&snap.nodes, &app.kube_filter_input), app);
+    let nodes: Vec<&NodeSnapshot> = app
+        .kube_view_cache
+        .iter()
+        .filter_map(|&i| snap.nodes.get(i))
+        .collect();
 
     if nodes.is_empty() {
         let msg = if app.kube_filter_input.is_empty() {
@@ -387,38 +403,36 @@ fn draw_nodes(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme, snap
     frame.render_widget(table, area);
 }
 
-fn filter_nodes<'a>(nodes: &'a [NodeSnapshot], filter: &str) -> Vec<&'a NodeSnapshot> {
-    if filter.is_empty() {
-        return nodes.iter().collect();
-    }
-    let f = filter.to_lowercase();
-    nodes
-        .iter()
-        .filter(|n| n.name.to_lowercase().contains(&f))
-        .collect()
+fn node_matches(n: &NodeSnapshot, needle_lower: &str) -> bool {
+    contains_ignore_case(&n.name, needle_lower)
 }
 
-fn sort_nodes<'a>(mut nodes: Vec<&'a NodeSnapshot>, app: &AppState) -> Vec<&'a NodeSnapshot> {
+fn cmp_nodes(
+    a: &NodeSnapshot,
+    b: &NodeSnapshot,
+    field: KubeSortField,
+    order: SortOrder,
+) -> std::cmp::Ordering {
     use std::cmp::Ordering;
-    let asc = matches!(app.kube_sort_order, SortOrder::Asc);
-    nodes.sort_by(|a, b| {
-        let ord = match app.kube_sort_field {
-            KubeSortField::NodeName => a.name.cmp(&b.name),
-            KubeSortField::NodeAge => a.age_seconds.cmp(&b.age_seconds).reverse(),
-            KubeSortField::NodePodCount => a.pod_count.cmp(&b.pod_count).reverse(),
-            KubeSortField::NodeCpuPct => pct_for(a.cpu_used_millis, a.cpu_allocatable_millis)
-                .partial_cmp(&pct_for(b.cpu_used_millis, b.cpu_allocatable_millis))
-                .unwrap_or(Ordering::Equal)
-                .reverse(),
-            KubeSortField::NodeMemPct => pct_for_u64(a.mem_used_bytes, a.mem_allocatable_bytes)
-                .partial_cmp(&pct_for_u64(b.mem_used_bytes, b.mem_allocatable_bytes))
-                .unwrap_or(Ordering::Equal)
-                .reverse(),
-            _ => Ordering::Equal,
-        };
-        if asc { ord.reverse() } else { ord }
-    });
-    nodes
+    let ord = match field {
+        KubeSortField::NodeName => a.name.cmp(&b.name),
+        KubeSortField::NodeAge => a.age_seconds.cmp(&b.age_seconds).reverse(),
+        KubeSortField::NodePodCount => a.pod_count.cmp(&b.pod_count).reverse(),
+        KubeSortField::NodeCpuPct => pct_for(a.cpu_used_millis, a.cpu_allocatable_millis)
+            .partial_cmp(&pct_for(b.cpu_used_millis, b.cpu_allocatable_millis))
+            .unwrap_or(Ordering::Equal)
+            .reverse(),
+        KubeSortField::NodeMemPct => pct_for_u64(a.mem_used_bytes, a.mem_allocatable_bytes)
+            .partial_cmp(&pct_for_u64(b.mem_used_bytes, b.mem_allocatable_bytes))
+            .unwrap_or(Ordering::Equal)
+            .reverse(),
+        _ => Ordering::Equal,
+    };
+    if matches!(order, SortOrder::Asc) {
+        ord.reverse()
+    } else {
+        ord
+    }
 }
 
 fn pct_for(used: Option<u32>, total: u32) -> f32 {
@@ -478,10 +492,11 @@ fn draw_deployments(
     theme: &Theme,
     snap: &KubeSnapshot,
 ) {
-    let deployments = sort_deployments(
-        filter_deployments(&snap.deployments, &app.kube_filter_input),
-        app,
-    );
+    let deployments: Vec<&DeploymentSnapshot> = app
+        .kube_view_cache
+        .iter()
+        .filter_map(|&i| snap.deployments.get(i))
+        .collect();
 
     if deployments.is_empty() {
         let msg = if app.kube_filter_input.is_empty() {
@@ -545,49 +560,94 @@ fn draw_deployments(
     frame.render_widget(table, area);
 }
 
-fn filter_deployments<'a>(
-    deployments: &'a [DeploymentSnapshot],
-    filter: &str,
-) -> Vec<&'a DeploymentSnapshot> {
-    if filter.is_empty() {
-        return deployments.iter().collect();
-    }
-    let f = filter.to_lowercase();
-    deployments
-        .iter()
-        .filter(|d| d.name.to_lowercase().contains(&f) || d.namespace.to_lowercase().contains(&f))
-        .collect()
+fn deployment_matches(d: &DeploymentSnapshot, needle_lower: &str) -> bool {
+    contains_ignore_case(&d.name, needle_lower) || contains_ignore_case(&d.namespace, needle_lower)
 }
 
-fn sort_deployments<'a>(
-    mut deployments: Vec<&'a DeploymentSnapshot>,
-    app: &AppState,
-) -> Vec<&'a DeploymentSnapshot> {
+fn cmp_deployments(
+    a: &DeploymentSnapshot,
+    b: &DeploymentSnapshot,
+    field: KubeSortField,
+    order: SortOrder,
+) -> std::cmp::Ordering {
     use std::cmp::Ordering;
-    let asc = matches!(app.kube_sort_order, SortOrder::Asc);
-    deployments.sort_by(|a, b| {
-        let ord = match app.kube_sort_field {
-            KubeSortField::DeployName => a.name.cmp(&b.name),
-            KubeSortField::DeployNamespace => a
-                .namespace
-                .cmp(&b.namespace)
-                .then_with(|| a.name.cmp(&b.name)),
-            KubeSortField::DeployAge => a.age_seconds.cmp(&b.age_seconds).reverse(),
-            KubeSortField::DeployReadyRatio => {
-                let ratio = |x: &DeploymentSnapshot| -> f32 {
-                    if x.replicas_desired == 0 {
-                        1.0
-                    } else {
-                        x.replicas_ready as f32 / x.replicas_desired as f32
-                    }
-                };
-                ratio(a).partial_cmp(&ratio(b)).unwrap_or(Ordering::Equal)
-            }
-            _ => Ordering::Equal,
-        };
-        if asc { ord.reverse() } else { ord }
-    });
-    deployments
+    let ord = match field {
+        KubeSortField::DeployName => a.name.cmp(&b.name),
+        KubeSortField::DeployNamespace => a
+            .namespace
+            .cmp(&b.namespace)
+            .then_with(|| a.name.cmp(&b.name)),
+        KubeSortField::DeployAge => a.age_seconds.cmp(&b.age_seconds).reverse(),
+        KubeSortField::DeployReadyRatio => {
+            let ratio = |x: &DeploymentSnapshot| -> f32 {
+                if x.replicas_desired == 0 {
+                    1.0
+                } else {
+                    x.replicas_ready as f32 / x.replicas_desired as f32
+                }
+            };
+            ratio(a).partial_cmp(&ratio(b)).unwrap_or(Ordering::Equal)
+        }
+        _ => Ordering::Equal,
+    };
+    if matches!(order, SortOrder::Asc) {
+        ord.reverse()
+    } else {
+        ord
+    }
+}
+
+/// Indices into the active sub-view's list, filtered and sorted (PERF-03).
+///
+/// Returning indices rather than clones keeps the cache proportional to the
+/// row count instead of the row *size*, and lets the render path borrow
+/// straight from the snapshot.
+///
+/// The filter needle is lowercased once here; per-row matching goes through
+/// `contains_ignore_case`, whose ASCII fast path allocates nothing. The
+/// previous code lowercased every name and namespace on every render — at
+/// the 5 000-pod ceiling that was 10 000 transient Strings per frame, which
+/// is exactly what PERF-M2 removed from the other tabs in v0.3.1 and never
+/// reached the Kube tab.
+pub(crate) fn compute_view_indices(
+    snap: &KubeSnapshot,
+    subview: KubeSubview,
+    filter: &str,
+    sort_field: KubeSortField,
+    sort_order: SortOrder,
+) -> Vec<usize> {
+    let needle = filter.to_lowercase();
+
+    match subview {
+        KubeSubview::Pods => {
+            let mut idx: Vec<usize> = (0..snap.pods.len())
+                .filter(|&i| pod_matches(&snap.pods[i], &needle))
+                .collect();
+            idx.sort_by(|&a, &b| cmp_pods(&snap.pods[a], &snap.pods[b], sort_field, sort_order));
+            idx
+        }
+        KubeSubview::Nodes => {
+            let mut idx: Vec<usize> = (0..snap.nodes.len())
+                .filter(|&i| node_matches(&snap.nodes[i], &needle))
+                .collect();
+            idx.sort_by(|&a, &b| cmp_nodes(&snap.nodes[a], &snap.nodes[b], sort_field, sort_order));
+            idx
+        }
+        KubeSubview::Deployments => {
+            let mut idx: Vec<usize> = (0..snap.deployments.len())
+                .filter(|&i| deployment_matches(&snap.deployments[i], &needle))
+                .collect();
+            idx.sort_by(|&a, &b| {
+                cmp_deployments(
+                    &snap.deployments[a],
+                    &snap.deployments[b],
+                    sort_field,
+                    sort_order,
+                )
+            });
+            idx
+        }
+    }
 }
 
 fn deployment_ready_style(d: &DeploymentSnapshot, theme: &Theme) -> Style {
@@ -832,75 +892,100 @@ mod tests {
         }
     }
 
+    /// Drive the pipeline the render path actually reads, so these tests
+    /// exercise the cached ordering rather than a parallel helper.
+    fn view(
+        pods: &[PodSnapshot],
+        filter: &str,
+        field: KubeSortField,
+        order: SortOrder,
+    ) -> Vec<String> {
+        let snap = KubeSnapshot {
+            cluster_kind: ClusterKind::Generic,
+            server_version: None,
+            current_namespace: "default".into(),
+            reachable: true,
+            metrics_available: true,
+            pods: pods.to_vec(),
+            nodes: Vec::new(),
+            deployments: Vec::new(),
+        };
+        compute_view_indices(&snap, KubeSubview::Pods, filter, field, order)
+            .into_iter()
+            .map(|i| snap.pods[i].name.clone())
+            .collect()
+    }
+
     #[test]
     fn filter_pods_by_name() {
-        let pods = make_pods();
-        let filtered = filter_pods(&pods, "nginx");
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].name, "nginx-1");
+        let names = view(
+            &make_pods(),
+            "nginx",
+            KubeSortField::PodName,
+            SortOrder::Desc,
+        );
+        assert_eq!(names, vec!["nginx-1"]);
     }
 
     #[test]
     fn filter_pods_by_namespace() {
-        let pods = make_pods();
-        let filtered = filter_pods(&pods, "kube-system");
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].name, "coredns");
+        let names = view(
+            &make_pods(),
+            "kube-system",
+            KubeSortField::PodName,
+            SortOrder::Desc,
+        );
+        assert_eq!(names, vec!["coredns"]);
     }
 
     #[test]
     fn filter_pods_empty_returns_all() {
-        let pods = make_pods();
-        assert_eq!(filter_pods(&pods, "").len(), 3);
+        assert_eq!(
+            view(&make_pods(), "", KubeSortField::PodName, SortOrder::Desc).len(),
+            3
+        );
     }
 
     #[test]
     fn filter_pods_no_match() {
-        let pods = make_pods();
-        assert_eq!(filter_pods(&pods, "zzz").len(), 0);
+        assert!(view(&make_pods(), "zzz", KubeSortField::PodName, SortOrder::Desc).is_empty());
+    }
+
+    /// PERF-03 swapped `to_lowercase()`-per-row for `contains_ignore_case`;
+    /// the filter must stay case-insensitive across that change.
+    #[test]
+    fn filter_pods_is_case_insensitive() {
+        let names = view(
+            &make_pods(),
+            "NGINX",
+            KubeSortField::PodName,
+            SortOrder::Desc,
+        );
+        assert_eq!(names, vec!["nginx-1"]);
     }
 
     // ---- sort ----
 
-    fn make_app_with_kube(field: KubeSortField, order: SortOrder) -> AppState {
-        let mut app = AppState::new();
-        app.kube_sort_field = field;
-        app.kube_sort_order = order;
-        app
-    }
-
     #[test]
     fn sort_pods_by_cpu_desc() {
-        let pods = make_pods();
-        let app = make_app_with_kube(KubeSortField::PodCpu, SortOrder::Desc);
-        let refs: Vec<&PodSnapshot> = pods.iter().collect();
-        let sorted = sort_pods(refs, &app);
         // CPU values: nginx=100, coredns=50, redis=0
-        assert_eq!(sorted[0].name, "nginx-1");
-        assert_eq!(sorted[1].name, "coredns");
-        assert_eq!(sorted[2].name, "redis-0");
+        let names = view(&make_pods(), "", KubeSortField::PodCpu, SortOrder::Desc);
+        assert_eq!(names, vec!["nginx-1", "coredns", "redis-0"]);
     }
 
     #[test]
     fn sort_pods_by_phase_puts_crashloop_first() {
-        let pods = make_pods();
-        let app = make_app_with_kube(KubeSortField::PodPhase, SortOrder::Desc);
-        let refs: Vec<&PodSnapshot> = pods.iter().collect();
-        let sorted = sort_pods(refs, &app);
-        assert_eq!(sorted[0].phase, PodPhase::CrashLoop);
+        let names = view(&make_pods(), "", KubeSortField::PodPhase, SortOrder::Desc);
+        assert_eq!(names[0], "redis-0", "redis-0 is the CrashLoop pod");
     }
 
     #[test]
     fn sort_pods_asc_inverts_desc() {
         let pods = make_pods();
-        let app_desc = make_app_with_kube(KubeSortField::PodCpu, SortOrder::Desc);
-        let app_asc = make_app_with_kube(KubeSortField::PodCpu, SortOrder::Asc);
-        let refs_desc: Vec<&PodSnapshot> = pods.iter().collect();
-        let refs_asc: Vec<&PodSnapshot> = pods.iter().collect();
-        let desc = sort_pods(refs_desc, &app_desc);
-        let asc = sort_pods(refs_asc, &app_asc);
-        assert_eq!(desc[0].name, asc[2].name);
-        assert_eq!(desc[2].name, asc[0].name);
+        let desc = view(&pods, "", KubeSortField::PodCpu, SortOrder::Desc);
+        let asc = view(&pods, "", KubeSortField::PodCpu, SortOrder::Asc);
+        assert_eq!(desc[0], asc[2]);
+        assert_eq!(desc[2], asc[0]);
     }
 
     // ---- smoke renders ----
@@ -964,6 +1049,20 @@ mod tests {
         let mut app = AppState::new();
         app.switch_kube_subview(sv);
         let snap = populated_snapshot();
+        // Mirror what `AppState::recompute_kube_view` does — the render path
+        // reads this cache, so a smoke test that left it empty would render
+        // the "no rows" branch and prove nothing.
+        app.kube_view_cache = compute_view_indices(
+            &snap,
+            sv,
+            &app.kube_filter_input,
+            app.kube_sort_field,
+            app.kube_sort_order,
+        );
+        assert!(
+            !app.kube_view_cache.is_empty(),
+            "fixture should produce rows for {sv:?}"
+        );
         term.draw(|f| draw_active(f, f.area(), &app, &theme, &snap))
             .unwrap();
     }
@@ -1025,6 +1124,13 @@ mod tests {
         app.kube_filter_active = true;
         app.kube_filter_input = "nginx".into();
         let snap = populated_snapshot();
+        app.kube_view_cache = compute_view_indices(
+            &snap,
+            app.kube_subview,
+            &app.kube_filter_input,
+            app.kube_sort_field,
+            app.kube_sort_order,
+        );
         term.draw(|f| draw_active(f, f.area(), &app, &theme, &snap))
             .unwrap();
     }
