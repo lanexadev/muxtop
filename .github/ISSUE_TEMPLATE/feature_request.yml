@@ -1,0 +1,73 @@
+name: Feature request
+description: Propose something muxtop should do and does not.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        muxtop has hard budgets it will not break for a feature: **< 13 MiB peak
+        RSS**, **< 7 MiB binary**, **< 30 ms startup**, and no telemetry, ever.
+        A proposal that costs one of those needs to be worth it, so the
+        questions below are about the problem before the solution.
+
+        Check the [roadmap](https://github.com/lucasschimmel/muxtop#roadmap)
+        first — GPU on Apple Silicon, `docker exec`, the config file and the
+        plugin system are already scheduled.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve
+      description: >
+        What are you trying to do today, and what makes it painful? Describe the
+        situation, not the feature — the best solution is often not the one that
+        first comes to mind.
+      placeholder: |
+        I watch disk I/O on database hosts and currently have to keep iotop open
+        in a second pane, which defeats the point of having one tabbed monitor.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like it to do
+      description: Concretely — which tab, which keys, what the panel shows.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you tried instead
+      description: >
+        Other tools, existing muxtop flags, the command palette. If an existing
+        feature almost works, saying where it stops short is the most useful
+        thing in this form.
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Rough shape
+      options:
+        - New data source or tab
+        - Change to an existing tab
+        - Keybinding or navigation
+        - Command palette / command mode
+        - Theming, colours or layout
+        - CLI flag or configuration
+        - Remote / server behaviour
+        - Packaging or distribution
+        - Documentation
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched the existing issues and the roadmap.
+          required: true
+        - label: This does not require muxtop to make network calls of its own.
+          required: true

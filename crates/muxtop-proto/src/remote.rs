@@ -59,7 +59,7 @@ impl RemoteCollector {
 
     /// Spawn the remote collector as a background tokio task.
     ///
-    /// This has the same signature pattern as [`crate::collector::Collector::spawn`]:
+    /// This has the same signature pattern as [`muxtop_core::collector::Collector::spawn`]:
     /// it sends `SystemSnapshot` values into `tx` and shuts down when `cancel` fires.
     ///
     /// An optional `conn_tx` channel receives [`ConnectionEvent`] notifications

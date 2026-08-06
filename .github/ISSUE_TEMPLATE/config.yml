@@ -1,0 +1,21 @@
+# Blank issues stay available on purpose: a question that fits neither
+# template should not be forced into one, and "I could not find where to ask"
+# is a worse outcome than an unlabelled issue.
+blank_issues_enabled: true
+
+contact_links:
+  - name: 🔒 Report a security vulnerability
+    url: https://github.com/lucasschimmel/muxtop/security/advisories/new
+    about: >
+      Private, visible to maintainers only. Never file a vulnerability as a
+      public issue — see SECURITY.md.
+
+  - name: 📖 Documentation and guides
+    url: https://github.com/lucasschimmel/muxtop/wiki
+    about: >
+      Remote monitoring over TLS, Kubernetes RBAC, container sockets, GPU
+      backends, troubleshooting and the security model.
+
+  - name: 🛠 Contributing
+    url: https://github.com/lucasschimmel/muxtop/blob/main/CONTRIBUTING.md
+    about: Setup, the branch model, code standards and how to get a PR merged.

@@ -108,7 +108,7 @@ struct Cli {
     remote: Option<String>,
 
     /// Authentication token for remote server (required for --remote, ≥16
-    /// chars). Note: --token leaks via /proc/<pid>/cmdline and `ps eww` on
+    /// chars). Note: --token leaks via /proc/PID/cmdline and `ps eww` on
     /// shared hosts; prefer --token-file there.
     #[arg(long, env = "MUXTOP_TOKEN", conflicts_with = "token_file")]
     token: Option<String>,
@@ -166,7 +166,7 @@ struct Cli {
     #[arg(long)]
     no_gpu: bool,
 
-    /// [benchmark] Run the collector + apply snapshots through AppState for N
+    /// (benchmark) Run the collector + apply snapshots through AppState for N
     /// seconds without rendering, then exit cleanly. Used by the macro
     /// benchmark to measure steady-state RSS without a TTY.
     #[arg(long, hide = true, value_name = "SECS")]

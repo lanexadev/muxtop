@@ -5,17 +5,72 @@ on:
     tags:
       - "v*"
 
+# Read-only by default. Publishing a release, pushing the Homebrew formula and
+# signing provenance each need more than that, and each says so on its own job
+# — so a compromised build step cannot reach the release, and a compromised
+# release step cannot mint an attestation.
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  # Two pushes of the same tag must never race to publish the same version.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # A tag is the one input to this pipeline that nothing validates, and it is
+  # the one that cannot be taken back: the Homebrew formula, the APT repo and
+  # crates.io all derive their version from it, and crates.io publishes are
+  # permanent. Fail here, before anything leaves the runner, rather than
+  # halfway through with two package managers already updated.
+  verify:
+    name: Verify tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Tag must match the workspace version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "muxtop") | .version')
+
+          echo "tag=${TAG_VERSION} Cargo.toml=${CARGO_VERSION}"
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match the workspace version ${CARGO_VERSION}. Bump Cargo.toml or retag."
+            exit 1
+          fi
+
+      - name: CHANGELOG must document this version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if ! grep -qE "^#+ \[?${VERSION}\]?" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no section for ${VERSION}. The generated release notes are not a substitute for a curated entry."
+            exit 1
+          fi
+
   build:
     name: Build (${{ matrix.target }})
+    needs: verify
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      # Both required to mint a build-provenance attestation, which lets a
+      # user run `gh attestation verify muxtop-<target>.tar.gz --repo
+      # lucasschimmel/muxtop` and get a cryptographic answer to "was this
+      # binary built by that workflow from that commit" — the question a
+      # published SHA256 alone cannot answer, since an attacker who can
+      # replace the archive can replace the .sha256 next to it.
+      id-token: write
+      attestations: write
     strategy:
+      # One target failing must not cancel the other three: a release that
+      # ships three of four platforms is a decision, not an accident, and the
+      # logs of the survivors say whether the break is target-specific.
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
@@ -27,23 +82,31 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
+          # Required now that the action is pinned by SHA — see the same note
+          # in ci.yml.
+          toolchain: stable
           targets: ${{ matrix.target }}
 
+      # `cargo install cross --locked` compiles cross from source on every
+      # release, for every Linux target. install-action fetches the upstream
+      # prebuilt binary and verifies its checksum instead.
       - name: Install cross (Linux)
         if: contains(matrix.target, 'linux')
-        run: cargo install cross --locked
+        uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2
+        with:
+          tool: cross
 
       - name: Build (Linux via cross)
         if: contains(matrix.target, 'linux')
-        run: cross build --release --target ${{ matrix.target }}
+        run: cross build --release --locked --target ${{ matrix.target }}
 
       - name: Build (macOS native)
         if: contains(matrix.target, 'apple')
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Strip binary
         run: |
@@ -63,16 +126,28 @@ jobs:
           tar czf "$ARCHIVE" -C "target/${{ matrix.target }}/release" muxtop
           shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
 
+      - name: Install cargo-deb (Linux)
+        if: contains(matrix.target, 'linux')
+        uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2
+        with:
+          tool: cargo-deb
+
       - name: Build .deb package
         if: contains(matrix.target, 'linux')
         run: |
-          cargo install cargo-deb --locked
           cargo deb --no-build --no-strip --target ${{ matrix.target }}
           cp target/${{ matrix.target }}/debian/*.deb muxtop-${{ matrix.target }}.deb
           shasum -a 256 muxtop-${{ matrix.target }}.deb > muxtop-${{ matrix.target }}.deb.sha256
 
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: |
+            muxtop-${{ matrix.target }}.tar.gz
+            muxtop-${{ matrix.target }}.deb
+
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: muxtop-${{ matrix.target }}
           path: |
@@ -85,17 +160,20 @@ jobs:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      # The only job in this workflow that writes to this repository.
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
           merge-multiple: true
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           generate_release_notes: true
           files: |
@@ -108,9 +186,12 @@ jobs:
     name: Update Homebrew Formula
     needs: release
     runs-on: ubuntu-latest
+    # Writes to lucasschimmel/homebrew-tap with a PAT, so this job needs no
+    # permission at all on *this* repository.
+    permissions: {}
     steps:
       - name: Checkout tap
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: lucasschimmel/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
@@ -184,6 +265,9 @@ jobs:
     name: Update APT Repository
     needs: release
     runs-on: ubuntu-latest
+    # Dispatches a workflow in lucasschimmel/apt with a PAT — nothing needed
+    # on this repository.
+    permissions: {}
     steps:
       - name: Trigger APT repo update
         run: |
@@ -200,6 +284,9 @@ jobs:
     name: Publish to crates.io
     needs: release
     runs-on: ubuntu-latest
+    # crates.io auth is the registry token, not the GitHub token.
+    permissions:
+      contents: read
     env:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
       # `k8s-openapi` (transitive via `kube`) refuses to compile a library
@@ -218,8 +305,14 @@ jobs:
       # feature and the env var into one version, so matching values are safe.
       K8S_OPENAPI_ENABLED_VERSION: "1.31"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+      # Publish order is dependency order, and the sleeps let the crates.io
+      # index catch up before the next crate resolves against it. An
+      # "already exists" failure is tolerated so a partially-completed
+      # publish can be resumed by re-running the job.
       - name: Publish muxtop-core
         run: |
           if out=$(cargo publish --package muxtop-core 2>&1); then

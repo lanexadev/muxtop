@@ -3,11 +3,15 @@
 **A modern, multiplexed system monitor for the terminal.**
 
 [![CI](https://github.com/lucasschimmel/muxtop/actions/workflows/ci.yml/badge.svg)](https://github.com/lucasschimmel/muxtop/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/lucasschimmel/muxtop/actions/workflows/codeql.yml/badge.svg)](https://github.com/lucasschimmel/muxtop/actions/workflows/codeql.yml)
+[![Advisories](https://github.com/lucasschimmel/muxtop/actions/workflows/advisories.yml/badge.svg)](https://github.com/lucasschimmel/muxtop/actions/workflows/advisories.yml)
 [![Crates.io](https://img.shields.io/crates/v/muxtop.svg)](https://crates.io/crates/muxtop)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](LICENSE-MIT)
 
 muxtop replaces the `htop` + `iftop` + `ctop` workflow with a single tabbed interface.
 Think htop, but with multiplexer-style UX (à la tmux/zellij) and a VS Code-style command palette.
+
+📖 **[Wiki](https://github.com/lucasschimmel/muxtop/wiki)** — remote monitoring over TLS, Kubernetes RBAC, container sockets, GPU backends, troubleshooting, the security model.
 
 ---
 
@@ -365,9 +369,39 @@ In `--remote` mode, the **server** is the only side that opens kubeconfig or Doc
 
 ---
 
+## Documentation
+
+| | |
+|---|---|
+| **[Wiki](https://github.com/lucasschimmel/muxtop/wiki)** | Operational guides — the pages below, and more |
+| [Installation](https://github.com/lucasschimmel/muxtop/wiki/Installation) | All five install methods, verifying a download, uninstalling |
+| [Remote monitoring](https://github.com/lucasschimmel/muxtop/wiki/Remote-monitoring) | Certificates, tokens, a hardened systemd unit, firewalling |
+| [Security model](https://github.com/lucasschimmel/muxtop/wiki/Security-model) | Trust boundaries, what is *not* defended, hardening checklist |
+| [Kubernetes](https://github.com/lucasschimmel/muxtop/wiki/Kubernetes) | Minimal RBAC for the namespaced and cluster-wide cases |
+| [Containers](https://github.com/lucasschimmel/muxtop/wiki/Containers) | Socket detection, rootless Podman, why the tab is empty |
+| [GPU](https://github.com/lucasschimmel/muxtop/wiki/GPU) | NVML and `amdgpu` backends, and what each cannot report |
+| [Troubleshooting](https://github.com/lucasschimmel/muxtop/wiki/Troubleshooting) | Symptom → cause, and where the logs are |
+| [Architecture](https://github.com/lucasschimmel/muxtop/wiki/Architecture) | For contributors and auditors |
+
+The wiki is generated from [`docs/wiki/`](docs/wiki) — send documentation fixes as pull requests against those files, not as browser edits.
+
+---
+
+## Security
+
+Found a vulnerability? **[Report it privately](https://github.com/lucasschimmel/muxtop/security/advisories/new)** — never as a public issue. Scope, response targets and the threat model are in [SECURITY.md](SECURITY.md).
+
+Release archives carry a build-provenance attestation, so you can verify a download came from this repository's release workflow rather than only that it downloaded intact:
+
+```sh
+gh attestation verify muxtop-x86_64-unknown-linux-musl.tar.gz --repo lucasschimmel/muxtop
+```
+
+---
+
 ## Contributing
 
-Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for prerequisites, code conventions, the branch workflow and PR submission instructions.
+Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for prerequisites, code conventions, the branch workflow and PR submission instructions. Participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ---
 

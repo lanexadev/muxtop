@@ -719,7 +719,7 @@ impl KubeSubview {
 
 /// Single sort-field enum unioning the three Kube sub-views. Stored as one
 /// value on `AppState`; switching sub-view resets it to the sub-view's
-/// natural default. The cycling helper [`next_kube_sort_field`] only walks
+/// natural default. The cycling helper `next_kube_sort_field` only walks
 /// the variants that belong to the current sub-view, so an out-of-domain
 /// value (e.g. `PodCpu` while on the Nodes view) recovers to the default
 /// of the active sub-view.
@@ -776,7 +776,7 @@ impl GpuSubview {
 /// Single sort-field enum unioning the two GPU sub-views, following the
 /// [`KubeSortField`] pattern: one value on `AppState`, reset to the
 /// sub-view's natural default on switch, and cycled only within the active
-/// sub-view's domain by [`next_gpu_sort_field`].
+/// sub-view's domain by `next_gpu_sort_field`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuSortField {
     // Devices
@@ -906,7 +906,7 @@ pub struct AppState {
     /// Per-container RX deltas (bytes/tick), capped.
     container_rx_hist: std::collections::HashMap<String, std::collections::VecDeque<u64>>,
     /// Cached sorted+filtered container rows (PERF-H4). Refreshed in
-    /// [`recompute_containers_view`] whenever the snapshot, sort field, sort
+    /// `recompute_containers_view` whenever the snapshot, sort field, sort
     /// order, or filter input changes. Render call sites borrow this slice
     /// instead of recomputing the projection three times per frame.
     sorted_filtered_containers_cache: Vec<muxtop_core::containers::ContainerSnapshot>,
@@ -924,14 +924,14 @@ pub struct AppState {
         Option<std::sync::Arc<dyn muxtop_core::cluster_engine::ClusterEngine + Send + Sync>>,
     /// Channel sender for container action outcomes. Spawned tokio tasks
     /// send their status messages here; the TUI main loop drains them via
-    /// [`pump_action_results`].
+    /// `pump_action_results`.
     action_tx: tokio::sync::mpsc::UnboundedSender<(Level, String)>,
     /// Matching receiver. Lives on AppState so call sites stay simple.
     action_rx: tokio::sync::mpsc::UnboundedReceiver<(Level, String)>,
     /// Whether monitoring local machine or remote server.
     pub connection_mode: ConnectionMode,
     /// Render-coalescing flag (PERF-H1). Set by any state-mutating handler;
-    /// the main loop reads + clears it via [`take_needs_redraw`] each
+    /// the main loop reads + clears it via `take_needs_redraw` each
     /// iteration. `Event::Tick` no longer triggers a draw on its own.
     needs_redraw: bool,
     /// Debounce timer for the process filter (PERF-H3). Recorded on every

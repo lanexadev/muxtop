@@ -1,7 +1,20 @@
 name: Publish to crates.io (manual)
 
+# Escape hatch for the case where `release.yml` produced the GitHub release
+# but its `publish` job failed — a network blip, an index lag, a revoked
+# token. Re-running it republishes only what is missing, because an
+# "already exists" error from crates.io is tolerated.
+
 on:
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Never let two manual publishes of the same commit race.
+  group: crates-io-publish
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -22,8 +35,11 @@ jobs:
     env:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          # Required now that the action is pinned by SHA — see ci.yml.
+          toolchain: stable
       - name: Publish muxtop-core
         run: |
           if out=$(cargo publish --package muxtop-core 2>&1); then

@@ -1,0 +1,109 @@
+name: Advisories
+
+# `cargo deny` already runs in CI, but CI only runs when somebody pushes.
+# A RUSTSEC advisory published against a dependency muxtop already ships is
+# not a code change, so nothing triggers a build and the vulnerability sits
+# unnoticed until the next unrelated commit. This workflow closes that window:
+# it re-audits the committed Cargo.lock on a schedule and files an issue when
+# the answer changes.
+#
+# It deliberately runs `cargo deny` rather than `cargo audit` so the
+# exceptions in deny.toml (currently RUSTSEC-2025-0141 / bincode) are honoured
+# — an audit that re-reports a consciously accepted risk every morning is an
+# audit people learn to ignore.
+
+on:
+  schedule:
+    # 06:17 UTC daily. Off the hour on purpose: the top of the hour is when
+    # every scheduled workflow on GitHub queues at once.
+    - cron: "17 6 * * *"
+  push:
+    paths:
+      - Cargo.lock
+      - deny.toml
+      - .github/workflows/advisories.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: advisories
+  cancel-in-progress: false
+
+jobs:
+  advisories:
+    name: Audit dependencies
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Needed to file the tracking issue below, and nothing else.
+      issues: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2
+        with:
+          tool: cargo-deny
+
+      # The action wrapper gives no access to its output, and the output is
+      # what goes into the issue body, so drive the binary directly.
+      - name: Check advisories
+        id: deny
+        run: |
+          if cargo deny --all-features check advisories 2>&1 | tee advisories.log; then
+            echo "status=clean" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=dirty" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: File or update the tracking issue
+        if: steps.deny.outputs.status == 'dirty'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: "Dependency advisories need triage"
+        run: |
+          {
+            echo "\`cargo deny check advisories\` is failing against the committed \`Cargo.lock\`."
+            echo
+            echo "- Run: [\`${{ github.run_id }}\`](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+            echo "- Commit: \`${{ github.sha }}\`"
+            echo
+            echo "Triage options, in order of preference: bump the dependency, drop it, or"
+            echo "add a documented \`ignore\` entry to \`deny.toml\` explaining why the advisory"
+            echo "is not reachable in muxtop."
+            echo
+            echo "<details><summary>cargo deny output</summary>"
+            echo
+            echo '```'
+            cat advisories.log
+            echo '```'
+            echo
+            echo "</details>"
+          } > issue-body.md
+
+          # One rolling issue, not one per day: comment on the open one if it
+          # exists, otherwise open it.
+          existing=$(gh issue list \
+            --state open \
+            --label security \
+            --search "\"$TITLE\" in:title" \
+            --json number \
+            --jq '.[0].number // empty')
+
+          if [ -n "$existing" ]; then
+            echo "Updating issue #$existing"
+            gh issue comment "$existing" --body-file issue-body.md
+          else
+            gh issue create \
+              --title "$TITLE" \
+              --label security \
+              --label dependencies \
+              --body-file issue-body.md
+          fi
+
+      # Fail after filing, so the run is red in the Actions tab too — the
+      # issue is the durable signal, the red run is the immediate one.
+      - name: Fail the run
+        if: steps.deny.outputs.status == 'dirty'
+        run: exit 1

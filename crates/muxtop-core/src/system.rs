@@ -119,7 +119,7 @@ impl SystemSnapshot {
     /// Collect a full system snapshot from sysinfo.
     ///
     /// `containers` and `kube` are passed through verbatim: callers either
-    /// supply the latest snapshot from their engines (via [`crate::Collector`])
+    /// supply the latest snapshot from their engines (via [`crate::collector::Collector`])
     /// or `None` when running without one.
     ///
     /// `gpu` is the one exception — it is passed through *enriched*. GPU

@@ -1,0 +1,1 @@
+Generated from [`docs/wiki/`](https://github.com/lucasschimmel/muxtop/tree/main/docs/wiki) — edits made here are overwritten on the next release. · [Report a documentation error](https://github.com/lucasschimmel/muxtop/issues/new) · MIT OR Apache-2.0

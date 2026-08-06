@@ -7,6 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Repository and pipeline release: no change to the binary. muxtop is a public
+project with a network-facing daemon, and the parts of it that a user has to
+trust — the release pipeline, the disclosure policy, the operational
+documentation — had not received the same attention as the code.
+
+### Added
+
+- **`SECURITY.md`** — disclosure policy with private reporting, response
+  targets, an explicit in-scope / out-of-scope list, and a one-page summary of
+  the trust boundaries. Private vulnerability reporting is enabled on the
+  repository, so a report never has to start as a public issue.
+- **A wiki, generated from `docs/wiki/`** — thirteen pages covering what the
+  README cannot hold: TLS and token setup for `muxtop-server` with a hardened
+  systemd unit, Kubernetes RBAC for both the namespaced and cluster-wide cases,
+  container socket choices, GPU backend limits, a symptom → cause
+  troubleshooting table, performance tuning, the architecture, and the release
+  runbook. `wiki-sync.yml` mirrors it on release, so the wiki is a published
+  artefact rather than a second source that drifts.
+- **Scheduled advisory audit (`advisories.yml`)** — `cargo deny check
+  advisories` daily. CI only runs when somebody pushes, so an advisory
+  published against an already-shipped dependency previously went unnoticed
+  until the next unrelated commit. Failures open one rolling issue rather than
+  one per day, and `deny.toml`'s documented exceptions are honoured so the
+  audit does not re-report accepted risk every morning.
+- **CodeQL analysis** — on push and weekly, feeding the Security tab.
+- **Build-provenance attestations on release artefacts** — verifiable with
+  `gh attestation verify <archive> --repo lucasschimmel/muxtop`. A published
+  checksum cannot prove provenance: whoever can replace the archive can replace
+  the `.sha256` beside it.
+- **Release gate (`verify` job)** — the tag must match the workspace version and
+  `CHANGELOG.md` must document it. Everything downstream is irreversible: a
+  crates.io publish is permanent and two package managers take the version
+  before a mistake is noticeable.
+- **New CI jobs** — MSRV check against the declared 1.88, `cargo doc` with
+  `-Dwarnings` (broken intra-doc links are the most common rot in a published
+  crate), coverage via `cargo-llvm-cov` reported to the run summary with no
+  third-party service, and `cargo-semver-checks` on the three published crates.
+- **`dependabot.yml`** — weekly Cargo and GitHub Actions updates against
+  `develop`, grouped so the majors that need reading are not skimmed alongside
+  forty patch bumps.
+- **Issue and pull-request templates, `CODEOWNERS`, `CODE_OF_CONDUCT.md`.** The
+  bug template asks for terminal, `$TERM`, platform and local-vs-remote up
+  front — the answers that decide whether a report is reproducible.
+
+### Changed
+
+- **Every third-party GitHub Action is pinned to a commit SHA**, so a
+  re-pointed tag cannot inject code into a release. Dependabot advances them
+  under review. Note that pinning `dtolnay/rust-toolchain` by SHA means the
+  toolchain can no longer be inferred from the `@stable` ref, so every use now
+  names it explicitly.
+- **Workflow tokens are read-only by default**, with write scopes granted per
+  job: `release` gets `contents: write`, `build` gets attestation signing, and
+  the Homebrew and APT jobs get nothing on this repository. A compromised build
+  step cannot publish a release.
+- **`concurrency` groups on every workflow.** Pull-request runs supersede
+  themselves; `develop`, `main` and release runs never cancel, since a cancelled
+  required check reads as a failure.
+- **`cross` and `cargo-deb` install as prebuilt binaries** instead of being
+  compiled from source on every release build.
+- **`fail-fast: false`** on the test and release matrices — hiding whether a
+  break is platform-specific is the opposite of useful.
+
+### Security
+
+- Dependabot alerts and automated security fixes enabled; private vulnerability
+  reporting enabled; `develop` protected with required status checks.
+
 ## [0.5.1] - 2026-08-05
 
 Ergonomics and UI/UX release. No new data source: everything muxtop already

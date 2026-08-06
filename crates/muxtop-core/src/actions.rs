@@ -76,7 +76,7 @@ impl Signal {
 /// - other  → `Io`
 ///
 /// # Safety boundary
-/// See [`validate_pid`] — invalid PIDs are rejected before any syscall.
+/// See `validate_pid` — invalid PIDs are rejected before any syscall.
 #[cfg(unix)]
 pub fn kill_process(pid: u32, signal: Signal) -> Result<(), CoreError> {
     let pid_i32 = validate_pid(pid)?;

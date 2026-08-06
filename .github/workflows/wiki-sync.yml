@@ -1,0 +1,73 @@
+name: Wiki
+
+# The GitHub wiki is a second git repository with no pull requests, no CI and
+# no review. Editing it directly means documentation drifts from the code it
+# describes, silently, and nobody notices until a user follows a stale
+# instruction. So the wiki is a *published artefact* here, never a source:
+# `docs/wiki/` in this repository is the source of truth, it goes through the
+# same review as the code, and this workflow mirrors it after a release.
+#
+# Consequence worth knowing before editing the wiki in the browser: the next
+# run of this workflow overwrites it. Change `docs/wiki/` instead.
+#
+# Syncing from `main` (not `develop`) on purpose — the wiki documents the
+# released binary, not what is in flight.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - docs/wiki/**
+      - .github/workflows/wiki-sync.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wiki
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Publish docs/wiki
+    runs-on: ubuntu-latest
+    permissions:
+      # The wiki lives at <repo>.wiki.git and is covered by the repository's
+      # `contents` scope — the default read-only token cannot push to it.
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Clone the wiki
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A wiki that has never had a page does not exist as a git
+          # repository yet, and the clone fails with "Repository not found".
+          # Create the first page from the repository's Wiki tab once; every
+          # sync after that is automatic.
+          if ! git clone "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git" wiki 2>clone.log; then
+            cat clone.log
+            echo "::error::Could not clone the wiki. If this repository's wiki has no pages yet, create one from the Wiki tab to initialise it, then re-run."
+            exit 1
+          fi
+
+      - name: Mirror docs/wiki into the wiki
+        run: |
+          # --delete so that removing a page from git removes it from the
+          # wiki too; without it, deleted pages linger forever.
+          rsync --archive --delete --exclude .git docs/wiki/ wiki/
+
+      - name: Commit and push
+        working-directory: wiki
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add --all
+          if git diff --cached --quiet; then
+            echo "Wiki already matches docs/wiki — nothing to push."
+            exit 0
+          fi
+          git commit --message "docs: sync from ${GITHUB_SHA}"
+          git push
