@@ -122,7 +122,9 @@ fn draw_summary(frame: &mut Frame, area: Rect, theme: &Theme, snap: &KubeSnapsho
             Style::default().fg(theme.accent_primary),
         ),
         Span::raw("  "),
-        Span::raw(format!("ns: {}  ", snap.current_namespace)),
+        // Remote mode carries this field from the server's kubeconfig, so it
+        // is no more trustworthy than the pod/node names scrubbed below.
+        Span::raw(format!("ns: {}  ", scrub_ctrl(&snap.current_namespace))),
         Span::raw(format!("pods: {}  ", snap.pods.len())),
         Span::raw(format!("nodes: {}  ", snap.nodes.len())),
         Span::raw(format!("deployments: {}  ", snap.deployments.len())),
@@ -979,6 +981,37 @@ mod tests {
     #[test]
     fn smoke_render_deployments_subview() {
         render_subview(KubeSubview::Deployments);
+    }
+
+    /// SEC-03: in remote mode the namespace comes from the server's
+    /// kubeconfig, so the summary bar needs the same scrubbing the table
+    /// cells already got.
+    #[test]
+    fn summary_scrubs_hostile_namespace() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let backend = TestBackend::new(140, 3);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = Theme::default();
+        let mut snap = populated_snapshot();
+        snap.current_namespace = "kube\x1b[2Jsystem".into();
+
+        term.draw(|f| draw_summary(f, f.area(), &theme, &snap))
+            .unwrap();
+
+        let buf = term.backend().buffer().clone();
+        let rendered: String = (0..buf.area.width)
+            .map(|col| buf.cell((col, 0)).map(|c| c.symbol()).unwrap_or(" "))
+            .collect();
+
+        assert!(
+            !rendered.contains('\x1b'),
+            "ESC survived into the summary bar: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("kube?"),
+            "the printable part of the namespace should still render: {rendered:?}"
+        );
     }
 
     #[test]

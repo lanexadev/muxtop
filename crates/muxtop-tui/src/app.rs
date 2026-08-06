@@ -1,5 +1,6 @@
 // Application state machine.
 
+use std::borrow::Cow;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
@@ -16,6 +17,7 @@ use muxtop_core::process::{
 use muxtop_core::system::SystemSnapshot;
 
 use crate::terminal::TermCaps;
+use crate::ui::sanitize::scrub_ctrl;
 use crate::{CliConfig, ConnectionMode};
 
 // ---------------------------------------------------------------------------
@@ -677,7 +679,19 @@ impl AppState {
     }
 
     /// Set a status message (auto-expires after STATUS_TIMEOUT_SECS).
+    ///
+    /// Sanitizes here rather than at each call site: status strings splice in
+    /// process names and daemon error text (`Kill failed: {e}`,
+    /// `Sent {sig} to {name}`), both attacker-controlled, and the footer
+    /// renders them verbatim. One choke point covers every present and future
+    /// caller — auditing them individually is how MED-S5 was missed here.
     fn set_status(&mut self, msg: String) {
+        let msg = match scrub_ctrl(&msg) {
+            // Already clean: keep the allocation the caller handed us instead
+            // of round-tripping it through a copy.
+            Cow::Borrowed(_) => msg,
+            Cow::Owned(clean) => clean,
+        };
         self.status_message = Some((msg, Instant::now()));
         // A new status message changes what `draw_root` paints.
         self.needs_redraw = true;
@@ -3224,6 +3238,25 @@ mod tests {
         assert!(matches!(app.net_sort_field, NetworkSortField::RxRate));
         assert!(app.net_filter_input.is_empty());
         assert!(!app.net_filter_active);
+    }
+
+    /// SEC-02: status text splices in process names and daemon error strings.
+    /// Sanitizing at the setter covers every caller, including ones added
+    /// later that would not think to scrub.
+    #[test]
+    fn test_set_status_scrubs_control_sequences() {
+        let mut app = AppState::new();
+        app.set_status("Kill failed: \x1b]0;pwned\x07denied".to_string());
+
+        let status = app.active_status().expect("status was just set");
+        assert!(
+            !status.contains('\x1b') && !status.contains('\x07'),
+            "control bytes survived into the status bar: {status:?}"
+        );
+        assert!(
+            status.starts_with("Kill failed: ") && status.ends_with("denied"),
+            "the readable message must survive scrubbing: {status:?}"
+        );
     }
 
     // -- Epic 15: Remote mode tests --

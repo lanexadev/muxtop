@@ -20,6 +20,7 @@ use ratatui::{
 
 use crate::ConnectionMode;
 use crate::app::{AppState, Tab};
+use sanitize::scrub_ctrl;
 use theme::Theme;
 
 /// Labels for future tabs (not yet implemented).
@@ -75,8 +76,12 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &AppState, theme: &Theme) {
         ref addr,
     } = app.connection_mode
     {
+        // The hostname comes off the wire in the server's `Welcome` frame —
+        // a hostile or compromised server (or merely a host whose
+        // `$HOSTNAME` a local user controls) would otherwise land escape
+        // sequences in a header that stays on screen for the whole session.
         spans.push(Span::styled(
-            format!(" → remote:{hostname}:{} ", addr.port()),
+            format!(" → remote:{}:{} ", scrub_ctrl(hostname), addr.port()),
             Style::default()
                 .bg(theme.header_bg)
                 .fg(theme.accent_secondary),
@@ -323,6 +328,37 @@ mod tests {
         assert!(
             header.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
             "Header should contain version"
+        );
+    }
+
+    /// SEC-02: the `Welcome` hostname is remote input rendered into a header
+    /// that stays on screen all session — it must not reach the terminal with
+    /// its escape sequences intact.
+    #[test]
+    fn test_header_scrubs_hostile_remote_hostname() {
+        let addr: std::net::SocketAddr = "10.0.0.1:4242".parse().unwrap();
+        let config = crate::CliConfig {
+            connection_mode: ConnectionMode::Remote {
+                hostname: "prod\x1b]0;pwned\x07-01".to_string(),
+                addr,
+            },
+            ..Default::default()
+        };
+        let app = AppState::with_config(config, crate::terminal::TermCaps::default());
+        let buf = render_with(&app, 80, 24);
+        let header = buffer_line_text(&buf, 0);
+
+        assert!(
+            !header.contains('\x1b'),
+            "ESC survived into the header: {header:?}"
+        );
+        assert!(
+            !header.contains('\x07'),
+            "BEL survived into the header: {header:?}"
+        );
+        assert!(
+            header.contains("prod?"),
+            "the printable part of the hostname should still render: {header:?}"
         );
     }
 
