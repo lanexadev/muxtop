@@ -20,7 +20,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use sysinfo::{MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate};
+use sysinfo::{MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -40,6 +40,36 @@ const CONTAINER_INTERVAL: Duration = Duration::from_secs(2);
 /// Cluster snapshot sampling cadence — matches the kube-rs internal poll
 /// task interval (see ADR-05 v0.4 in `forge/32-v04-kubernetes-epics/`).
 const CLUSTER_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Exactly the per-process fields [`SystemSnapshot::collect`] reads — and
+/// nothing else (SEC-04 / PERF-01).
+///
+/// `ProcessRefreshKind::everything()` additionally collects `disk_usage`,
+/// `environ`, `cwd`, `root` and `exe`, none of which muxtop renders. Two
+/// distinct costs come with them:
+///
+/// * `disk_usage` is refreshed unconditionally on *every* tick, so on Linux
+///   it opens and parses `/proc/<pid>/io` once per process per second.
+/// * `environ` is read once and then kept in sysinfo's process table for
+///   the lifetime of the process. Running muxtop as root therefore parked a
+///   copy of every process's environment — API keys, tokens, database URLs —
+///   in our address space, where a core dump or an attached debugger would
+///   find it. Data we never display is data we should never hold.
+///
+/// `pid`, `parent`, `name` and `status` come from `/proc/<pid>/stat`, which
+/// is parsed regardless, so they need no flag. `cmd` and `user` use
+/// `OnlyIfNotSet`: both are fixed at exec time, so re-reading them every
+/// tick buys nothing.
+///
+/// `nothing()` keeps `tasks: true` (its one non-false default), so the
+/// process list still contains what it did before.
+fn process_refresh_kind() -> ProcessRefreshKind {
+    ProcessRefreshKind::nothing()
+        .with_cpu()
+        .with_memory()
+        .with_cmd(UpdateKind::OnlyIfNotSet)
+        .with_user(UpdateKind::OnlyIfNotSet)
+}
 
 pub struct Collector {
     sys: sysinfo::System,
@@ -76,7 +106,10 @@ impl Collector {
         cluster_engine: Option<Arc<dyn ClusterEngine + Send + Sync>>,
     ) -> Self {
         Self {
-            sys: sysinfo::System::new_all(),
+            // `new_all()` would run a full `refresh_all()` here, pulling in
+            // the environ/cwd/root/exe we deliberately skip below. Start
+            // empty; `run` seeds the baseline with the targeted refresh.
+            sys: sysinfo::System::new(),
             networks: sysinfo::Networks::new_with_refreshed_list(),
             interval,
             container_engine,
@@ -97,6 +130,19 @@ impl Collector {
         tokio::spawn(Self::run(self, tx, token))
     }
 
+    /// Refresh only the subsystems the TUI renders.
+    ///
+    /// PERF-L2 established the outer scope (`refresh_all` also rebuilds disk,
+    /// component and user tables we never read); [`process_refresh_kind`]
+    /// narrows the per-process side the same way.
+    fn refresh_targeted(&mut self) {
+        self.sys
+            .refresh_memory_specifics(MemoryRefreshKind::everything());
+        self.sys.refresh_cpu_usage();
+        self.sys
+            .refresh_processes_specifics(ProcessesToUpdate::All, true, process_refresh_kind());
+    }
+
     async fn run(mut self, tx: mpsc::Sender<SystemSnapshot>, token: CancellationToken) {
         let mut interval = tokio::time::interval(self.interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -104,7 +150,7 @@ impl Collector {
         // First tick completes immediately — seed the sysinfo delta baseline
         // so CPU % and network counters report useful values from tick #2.
         interval.tick().await;
-        self.sys.refresh_all();
+        self.refresh_targeted();
         self.networks.refresh(true);
 
         // Shared container + kube snapshot slots — written by their
@@ -144,18 +190,7 @@ impl Collector {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    // PERF-L2: targeted sysinfo refresh — `refresh_all` rebuilds
-                    // disk lists, components, users and a host of other tables
-                    // that the TUI never consumes. Limit refresh to the three
-                    // subsystems we actually render (memory, CPU usage,
-                    // processes). Network is refreshed via `Networks` below.
-                    self.sys.refresh_memory_specifics(MemoryRefreshKind::everything());
-                    self.sys.refresh_cpu_usage();
-                    self.sys.refresh_processes_specifics(
-                        ProcessesToUpdate::All,
-                        true,
-                        ProcessRefreshKind::everything(),
-                    );
+                    self.refresh_targeted();
                     self.networks.refresh(false);
 
                     let containers = last_containers.lock().await.clone();
@@ -277,6 +312,62 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
+
+    // ─── SEC-04 / PERF-01: refresh scope ──────────────────────────────────
+
+    /// Locks the refresh scope to what `SystemSnapshot::collect` reads. The
+    /// exclusions are the point: `disk_usage` costs a `/proc/<pid>/io` parse
+    /// per process per tick, and `environ` parks every process's secrets in
+    /// our address space for the lifetime of the run.
+    #[test]
+    fn process_refresh_kind_collects_only_rendered_fields() {
+        let rk = process_refresh_kind();
+
+        assert!(rk.cpu(), "cpu_percent column");
+        assert!(rk.memory(), "memory_bytes / memory_percent columns");
+        assert_eq!(rk.cmd(), UpdateKind::OnlyIfNotSet, "command column");
+        assert_eq!(rk.user(), UpdateKind::OnlyIfNotSet, "user column");
+
+        assert!(!rk.disk_usage(), "never rendered; costs a syscall per tick");
+        assert_eq!(rk.environ(), UpdateKind::Never, "never rendered; sensitive");
+        assert_eq!(rk.cwd(), UpdateKind::Never, "never rendered");
+        assert_eq!(rk.root(), UpdateKind::Never, "never rendered");
+        assert_eq!(rk.exe(), UpdateKind::Never, "never rendered");
+
+        assert!(
+            rk.tasks(),
+            "narrowing the refresh must not silently drop threads from the list"
+        );
+    }
+
+    /// The narrowed scope must still populate every column the TUI draws —
+    /// a refresh kind that collects nothing would also pass the assertions
+    /// above.
+    #[test]
+    fn targeted_refresh_still_populates_rendered_fields() {
+        let mut collector = Collector::new(Duration::from_millis(10));
+        collector.refresh_targeted();
+
+        let processes = collector.sys.processes();
+        assert!(!processes.is_empty(), "expected a populated process table");
+
+        let me = sysinfo::get_current_pid().expect("current pid");
+        let proc_info = processes.get(&me).expect("our own process is listed");
+
+        assert!(
+            !proc_info.name().is_empty(),
+            "name feeds the NAME column and the kill confirmation"
+        );
+        assert!(
+            !proc_info.cmd().is_empty(),
+            "cmd feeds the COMMAND column and must survive OnlyIfNotSet"
+        );
+        assert!(
+            proc_info.memory() > 0,
+            "memory feeds the MEM columns: {}",
+            proc_info.memory()
+        );
+    }
 
     // ─── mock engine ──────────────────────────────────────────────────────
 
