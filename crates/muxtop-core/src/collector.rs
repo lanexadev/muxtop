@@ -204,13 +204,17 @@ impl Collector {
         // configured so the UI hits the actionable "no cluster" message
         // immediately instead of "Waiting…" forever (otherwise
         // indistinguishable from a slow first poll).
-        let last_containers: Arc<Mutex<Option<ContainersSnapshot>>> = Arc::new(Mutex::new(None));
+        // PERF-02: the slots hold `Arc`s, so the per-tick read below is a
+        // refcount bump instead of a deep clone of data that changes at
+        // 0.5 Hz / 0.2 Hz.
+        let last_containers: Arc<Mutex<Option<Arc<ContainersSnapshot>>>> =
+            Arc::new(Mutex::new(None));
         let initial_kube = if self.cluster_engine.is_some() {
             None
         } else {
-            Some(KubeSnapshot::unavailable())
+            Some(Arc::new(KubeSnapshot::unavailable()))
         };
-        let last_kube: Arc<Mutex<Option<KubeSnapshot>>> = Arc::new(Mutex::new(initial_kube));
+        let last_kube: Arc<Mutex<Option<Arc<KubeSnapshot>>>> = Arc::new(Mutex::new(initial_kube));
 
         // Same three-state semantic for the GPU slot. `--no-gpu` and the
         // remote client both arrive here with no engine, and seeding
@@ -327,7 +331,7 @@ fn spawn_gpu_loop(
 /// it through the snapshot pipeline.
 fn spawn_cluster_loop(
     engine: Arc<dyn ClusterEngine + Send + Sync>,
-    slot: Arc<Mutex<Option<KubeSnapshot>>>,
+    slot: Arc<Mutex<Option<Arc<KubeSnapshot>>>>,
     token: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -339,11 +343,11 @@ fn spawn_cluster_loop(
                 _ = interval.tick() => {
                     match engine.snapshot().await {
                         Ok(snapshot) => {
-                            *slot.lock().await = Some(snapshot);
+                            *slot.lock().await = Some(Arc::new(snapshot));
                         }
                         Err(err) => {
                             tracing::warn!(error = %err, "cluster engine failed");
-                            *slot.lock().await = Some(KubeSnapshot::unavailable());
+                            *slot.lock().await = Some(Arc::new(KubeSnapshot::unavailable()));
                         }
                     }
                 }
@@ -361,7 +365,7 @@ fn spawn_cluster_loop(
 /// the UI can render the "no daemon" state.
 fn spawn_container_loop(
     engine: Arc<dyn ContainerEngine + Send + Sync>,
-    slot: Arc<Mutex<Option<ContainersSnapshot>>>,
+    slot: Arc<Mutex<Option<Arc<ContainersSnapshot>>>>,
     token: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -378,11 +382,11 @@ fn spawn_container_loop(
                                 daemon_up: true,
                                 containers,
                             };
-                            *slot.lock().await = Some(snapshot);
+                            *slot.lock().await = Some(Arc::new(snapshot));
                         }
                         Err(err) => {
                             tracing::warn!(error = %err, "container engine failed");
-                            *slot.lock().await = Some(ContainersSnapshot::unavailable());
+                            *slot.lock().await = Some(Arc::new(ContainersSnapshot::unavailable()));
                         }
                     }
                 }

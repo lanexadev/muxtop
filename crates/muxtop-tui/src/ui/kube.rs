@@ -578,7 +578,7 @@ mod tests {
         }];
 
         let mut snap = snapshot();
-        snap.kube = Some(KubeSnapshot {
+        snap.kube = Some(std::sync::Arc::new(KubeSnapshot {
             cluster_kind: ClusterKind::K3s,
             server_version: Some("v1.30.2+k3s1".into()),
             current_namespace: namespace.into(),
@@ -587,7 +587,7 @@ mod tests {
             pods,
             nodes,
             deployments,
-        });
+        }));
         let mut app = AppState::new();
         app.tab = Tab::Kube;
         app.apply_snapshot(snap);
@@ -651,7 +651,12 @@ mod tests {
     fn nodes_view_explains_the_cluster_scope_requirement() {
         let mut app = kube_app(true, true, "kube-system");
         app.switch_kube_subview(KubeSubview::Nodes);
-        if let Some(k) = app.last_snapshot.as_mut().and_then(|s| s.kube.as_mut()) {
+        if let Some(k) = app
+            .last_snapshot
+            .as_mut()
+            .and_then(|s| s.kube.as_mut())
+            .map(std::sync::Arc::make_mut)
+        {
             k.nodes.clear();
         }
         let text = all_text(&render_with(&app, 120, 24));

@@ -4594,7 +4594,7 @@ mod tests {
                 total_rx: 0,
                 total_tx: 0,
             },
-            containers: Some(ContainersSnapshot {
+            containers: Some(std::sync::Arc::new(ContainersSnapshot {
                 engine: EngineKind::Docker,
                 daemon_up: true,
                 containers: vec![ContainerSnapshot {
@@ -4613,7 +4613,7 @@ mod tests {
                     block_write_bytes: 0,
                     started_at_ms: 1_700_000_000_000,
                 }],
-            }),
+            })),
             kube: None,
             gpu: None,
             timestamp_ms: 1_700_000_000_000,
@@ -4822,7 +4822,8 @@ mod tests {
         // Two containers with different CPU values so Cpu desc and Mem desc
         // produce opposite orderings.
         let mut snap = make_snapshot_with_container("a-id", "alpha");
-        if let Some(cs) = snap.containers.as_mut() {
+        // Sole owner at this point, so `make_mut` mutates in place.
+        if let Some(cs) = snap.containers.as_mut().map(std::sync::Arc::make_mut) {
             cs.containers[0].cpu_pct = 1.0;
             cs.containers[0].mem_used_bytes = 9_000;
             cs.containers

@@ -1,4 +1,4 @@
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bincode::{Decode, Encode};
@@ -101,6 +101,23 @@ pub struct LoadSnapshot {
 /// still before `timestamp_ms`. Same consequence — a v0.4.x client decoding a
 /// v0.5 frame reads the GPU bytes as its `timestamp_ms` and fails. Client and
 /// server must match on the minor version.
+///
+/// # Why `Arc` on two of the three engine fields (PERF-02)
+///
+/// `containers` and `kube` are produced by loops slower than the system tick
+/// — 0.5 Hz and 0.2 Hz against a tick of at most 1 Hz — so owning them meant
+/// deep-cloning data that had not changed. At the 5 000-pod `ListParams`
+/// ceiling, four of every five kube clones were pure waste, each rebuilding
+/// three `String`s per pod.
+///
+/// `gpu` is deliberately left owned: `GPU_INTERVAL` is 1 s and `--refresh`
+/// has a 1 s floor, so the GPU engine never produces more slowly than the
+/// tick consumes and its clone is never redundant. The snapshot is also a
+/// handful of devices rather than thousands of rows.
+///
+/// `Arc` does not change the wire format: bincode encodes `Arc<T>` through
+/// `T::encode`, so the bytes are identical to the owned layout — see the
+/// round-trip test in `muxtop-proto`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct SystemSnapshot {
     pub cpu: CpuSnapshot,
@@ -108,8 +125,8 @@ pub struct SystemSnapshot {
     pub load: LoadSnapshot,
     pub processes: Vec<ProcessInfo>,
     pub networks: NetworkSnapshot,
-    pub containers: Option<ContainersSnapshot>,
-    pub kube: Option<KubeSnapshot>,
+    pub containers: Option<Arc<ContainersSnapshot>>,
+    pub kube: Option<Arc<KubeSnapshot>>,
     pub gpu: Option<GpusSnapshot>,
     /// Milliseconds since Unix epoch.
     pub timestamp_ms: u64,
@@ -130,8 +147,8 @@ impl SystemSnapshot {
     pub fn collect(
         sys: &sysinfo::System,
         networks: &sysinfo::Networks,
-        containers: Option<ContainersSnapshot>,
-        kube: Option<KubeSnapshot>,
+        containers: Option<Arc<ContainersSnapshot>>,
+        kube: Option<Arc<KubeSnapshot>>,
         gpu: Option<GpusSnapshot>,
     ) -> Self {
         use sysinfo::System as SysSystem;
