@@ -882,9 +882,9 @@ pub struct AppState {
     pub kube_selected: usize,
     pub kube_scroll_offset: usize,
     /// Filtered + sorted indices into the active Kube sub-view's list
-    /// (PERF-03), refreshed by [`AppState::recompute_kube_view`] whenever the
-    /// snapshot, sub-view, filter or sort changes. Stores indices rather than
-    /// clones so the cache cost tracks row count, not row size.
+    /// (PERF-03), refreshed by `recompute_kube_view` whenever the snapshot,
+    /// sub-view, filter or sort changes. Stores indices rather than clones so
+    /// the cache cost tracks row count, not row size.
     pub kube_view_cache: Vec<usize>,
     /// GPU tab state. Sorting and filtering are applied at render time, as on
     /// the Kube tab — a host has single-digit GPUs and rarely more than a few
