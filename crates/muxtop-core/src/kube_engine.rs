@@ -799,7 +799,20 @@ fn spawn_resource_loop(
         let node_api: Api<Node> = Api::all(client.clone());
         let lp = ListParams::default().limit(5_000);
 
+        // `interval` rather than tick-then-sleep: the latter made the real
+        // period `tick duration + POLL_INTERVAL`, so the loop drifted away
+        // from the 5 s the collector samples at and the two fell out of
+        // phase. `Skip` keeps a slow tick from being chased by a burst of
+        // catch-up polls. Same shape as the collector and container loops.
+        let mut ticker = tokio::time::interval(POLL_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = ticker.tick() => {}
+            }
+
             // Rebuilt every tick because `A` can rescope the engine between
             // ticks. `Api::all` / `Api::namespaced` only wrap the shared
             // client in a request builder — no I/O, no handshake, so this is
@@ -819,12 +832,30 @@ fn spawn_resource_loop(
                 _ = cancel.cancelled() => break,
                 _ = tick_resources(&pod_api, &node_api, &deployment_api, &lp, &cache) => {}
             }
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                _ = tokio::time::sleep(POLL_INTERVAL) => {}
-            }
         }
     })
+}
+
+/// List one resource kind, returning `None` on timeout or API error.
+///
+/// `None` means "keep whatever the cache already holds" — per-resource
+/// failure must not wipe the other two (a namespace-only Role that 403s on
+/// nodes is the documented degraded mode, not a reason to blank the tab).
+async fn list_or_warn<K>(api: &Api<K>, lp: &ListParams, kind: &'static str) -> Option<Vec<K>>
+where
+    K: Clone + std::fmt::Debug + serde::de::DeserializeOwned,
+{
+    match tokio::time::timeout(LIST_TIMEOUT, api.list(lp)).await {
+        Ok(Ok(list)) => Some(list.items),
+        Ok(Err(e)) => {
+            tracing::warn!(target: "muxtop::kube", kind, error = %e, "list failed");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(target: "muxtop::kube", kind, "list timed out");
+            None
+        }
+    }
 }
 
 async fn tick_resources(
@@ -834,39 +865,19 @@ async fn tick_resources(
     lp: &ListParams,
     cache: &Arc<RwLock<ResourceCache>>,
 ) {
-    let pods = match tokio::time::timeout(LIST_TIMEOUT, pod_api.list(lp)).await {
-        Ok(Ok(list)) => Some(list.items),
-        Ok(Err(e)) => {
-            tracing::warn!(target: "muxtop::kube", error = %e, "pods list failed");
-            None
-        }
-        Err(_) => {
-            tracing::warn!(target: "muxtop::kube", "pods list timed out");
-            None
-        }
-    };
-    let nodes = match tokio::time::timeout(LIST_TIMEOUT, node_api.list(lp)).await {
-        Ok(Ok(list)) => Some(list.items),
-        Ok(Err(e)) => {
-            tracing::warn!(target: "muxtop::kube", error = %e, "nodes list failed");
-            None
-        }
-        Err(_) => {
-            tracing::warn!(target: "muxtop::kube", "nodes list timed out");
-            None
-        }
-    };
-    let deployments = match tokio::time::timeout(LIST_TIMEOUT, deployment_api.list(lp)).await {
-        Ok(Ok(list)) => Some(list.items),
-        Ok(Err(e)) => {
-            tracing::warn!(target: "muxtop::kube", error = %e, "deployments list failed");
-            None
-        }
-        Err(_) => {
-            tracing::warn!(target: "muxtop::kube", "deployments list timed out");
-            None
-        }
-    };
+    // PERF-04: run the three lists concurrently. Sequentially they could
+    // spend 3 x LIST_TIMEOUT = 9 s on a slow API server — longer than the
+    // 5 s POLL_INTERVAL, so the loop would fall behind its own cadence and
+    // the UI would show data older than it advertises. Concurrently the
+    // worst case is one LIST_TIMEOUT, comfortably inside the interval.
+    //
+    // `join!` polls on this task rather than spawning: no 'static bounds,
+    // and cancellation still propagates through the caller's `select!`.
+    let (pods, nodes, deployments) = tokio::join!(
+        list_or_warn(pod_api, lp, "pods"),
+        list_or_warn(node_api, lp, "nodes"),
+        list_or_warn(deployment_api, lp, "deployments"),
+    );
 
     let mut w = cache.write().await;
     if let Some(p) = pods {
@@ -891,15 +902,22 @@ fn spawn_metrics_loop(
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // See `spawn_resource_loop` for why this is an interval rather than
+        // tick-then-sleep.
+        let mut ticker = tokio::time::interval(POLL_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = ticker.tick() => {}
+            }
+            // Re-read after the tick: `A` can rescope the engine while we
+            // wait, and the poll must use the scope in force now.
             let current = scope.read().await.clone();
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 _ = tick_metrics(&client, &cache, &current) => {}
-            }
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                _ = tokio::time::sleep(POLL_INTERVAL) => {}
             }
         }
     })
@@ -917,9 +935,14 @@ async fn tick_metrics(client: &Client, cache: &Arc<RwLock<MetricsCache>>, scope:
         Some(ns) => format!("/apis/metrics.k8s.io/v1beta1/namespaces/{ns}/pods"),
         None => "/apis/metrics.k8s.io/v1beta1/pods".to_string(),
     };
-    let pod_metrics = fetch_metrics_text(client, &pod_path).await;
     // Node metrics are cluster-scoped like the Node resource itself.
-    let node_metrics = fetch_metrics_text(client, "/apis/metrics.k8s.io/v1beta1/nodes").await;
+    //
+    // PERF-04: same reasoning as `tick_resources` — sequentially these two
+    // fetches could take 2 x LIST_TIMEOUT = 6 s against a 5 s POLL_INTERVAL.
+    let (pod_metrics, node_metrics) = tokio::join!(
+        fetch_metrics_text(client, &pod_path),
+        fetch_metrics_text(client, "/apis/metrics.k8s.io/v1beta1/nodes"),
+    );
 
     // Treat any error on either path as "metrics-server unavailable". This
     // matches what k9s does — the user just sees `—` in the CPU/MEM cols.
