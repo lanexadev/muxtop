@@ -710,14 +710,23 @@ fn spawn_resource_loop(
         let deployment_api: Api<Deployment> = Api::all(client.clone());
         let lp = ListParams::default().limit(5_000);
 
+        // `interval` rather than tick-then-sleep: the latter made the real
+        // period `tick duration + POLL_INTERVAL`, so the loop drifted away
+        // from the 5 s the collector samples at and the two fell out of
+        // phase. `Skip` keeps a slow tick from being chased by a burst of
+        // catch-up polls. Same shape as the collector and container loops.
+        let mut ticker = tokio::time::interval(POLL_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
-                _ = tick_resources(&pod_api, &node_api, &deployment_api, &lp, &cache) => {}
-            }
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                _ = tokio::time::sleep(POLL_INTERVAL) => {}
+                _ = ticker.tick() => {
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = tick_resources(&pod_api, &node_api, &deployment_api, &lp, &cache) => {}
+                    }
+                }
             }
         }
     })
@@ -788,14 +797,20 @@ fn spawn_metrics_loop(
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // See `spawn_resource_loop` for why this is an interval rather than
+        // tick-then-sleep.
+        let mut ticker = tokio::time::interval(POLL_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
-                _ = tick_metrics(&client, &cache) => {}
-            }
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                _ = tokio::time::sleep(POLL_INTERVAL) => {}
+                _ = ticker.tick() => {
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = tick_metrics(&client, &cache) => {}
+                    }
+                }
             }
         }
     })
