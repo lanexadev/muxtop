@@ -294,11 +294,18 @@ impl ClusterEngine for KubeEngine {
             .iter()
             .map(|p| pod_to_snapshot(p, &metrics, now_ms))
             .collect();
-        let nodes: Vec<NodeSnapshot> = resources
+        let mut nodes: Vec<NodeSnapshot> = resources
             .nodes
             .iter()
             .map(|n| node_to_snapshot(n, &metrics, now_ms))
             .collect();
+
+        // Cross-resource join: a single `Node` object carries no pod count,
+        // so the aggregation belongs here, where both lists are in hand.
+        let scheduled = pods_per_node(&pods);
+        for node in &mut nodes {
+            node.pod_count = scheduled.get(node.name.as_str()).copied().unwrap_or(0);
+        }
         let deployments: Vec<DeploymentSnapshot> = resources
             .deployments
             .iter()
@@ -536,9 +543,28 @@ pub(crate) fn node_to_snapshot(node: &Node, metrics: &MetricsCache, now_ms: u64)
         mem_capacity_bytes,
         mem_allocatable_bytes,
         mem_used_bytes,
-        pod_count: 0, // Populated in S2.6 once the resource cache has the cluster-wide pod list.
+        // Filled in by `ClusterEngine::snapshot`, which has the pod list a
+        // lone `Node` object cannot see.
+        pod_count: 0,
         pod_capacity,
     }
+}
+
+/// Count scheduled pods per node name.
+///
+/// Mirrors what `kubectl describe node` reports as "Non-terminated Pods":
+/// `Succeeded` and `Failed` pods have released their node resources, so
+/// counting them would overstate how full a node is — the column exists to
+/// be read against `pod_capacity`.
+fn pods_per_node(pods: &[PodSnapshot]) -> HashMap<&str, u32> {
+    let mut counts: HashMap<&str, u32> = HashMap::new();
+    for pod in pods {
+        if pod.node.is_empty() || matches!(pod.phase, PodPhase::Succeeded | PodPhase::Failed) {
+            continue;
+        }
+        *counts.entry(pod.node.as_str()).or_insert(0) += 1;
+    }
+    counts
 }
 
 fn node_status_synthetic(node: &Node) -> NodeStatus {
@@ -1122,6 +1148,88 @@ mod tests {
             ResourceCache::default(),
             MetricsCache::default(),
         )
+    }
+
+    // ---- pod_count join ----
+
+    fn pod_on(node: &str, phase: PodPhase) -> PodSnapshot {
+        PodSnapshot {
+            namespace: "default".into(),
+            name: format!("pod-{node}-{phase:?}"),
+            phase,
+            ready: (1, 1),
+            restarts: 0,
+            age_seconds: 60,
+            node: node.into(),
+            cpu_millis: None,
+            mem_bytes: None,
+            qos: QosClass::BestEffort,
+        }
+    }
+
+    #[test]
+    fn pods_per_node_counts_only_scheduled_live_pods() {
+        let pods = vec![
+            pod_on("node-a", PodPhase::Running),
+            pod_on("node-a", PodPhase::Pending),
+            pod_on("node-a", PodPhase::CrashLoop),
+            // Terminated: resources already released, so kubectl does not
+            // count these against the node either.
+            pod_on("node-a", PodPhase::Succeeded),
+            pod_on("node-a", PodPhase::Failed),
+            pod_on("node-b", PodPhase::Running),
+            // Unscheduled pods belong to no node.
+            pod_on("", PodPhase::Pending),
+        ];
+
+        let counts = pods_per_node(&pods);
+        assert_eq!(counts.get("node-a").copied(), Some(3));
+        assert_eq!(counts.get("node-b").copied(), Some(1));
+        assert_eq!(
+            counts.get("").copied(),
+            None,
+            "unscheduled pods have no node"
+        );
+    }
+
+    /// Regression for the hardcoded `pod_count: 0` the Nodes column shipped
+    /// with in v0.4.0 — it rendered "0" on every cluster.
+    #[tokio::test]
+    async fn snapshot_populates_node_pod_count() {
+        let node: Node = serde_json::from_value(json!({
+            "metadata": { "name": "node-a" },
+            "status": {
+                "conditions": [{ "type": "Ready", "status": "True" }],
+                "capacity": { "cpu": "4", "memory": "8Gi", "pods": "110" }
+            }
+        }))
+        .unwrap();
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": { "name": "web-0", "namespace": "default" },
+            "spec": { "nodeName": "node-a" },
+            "status": { "phase": "Running" }
+        }))
+        .unwrap();
+
+        let engine = KubeEngine::new_for_test(
+            ClusterKind::Generic,
+            None,
+            "default".into(),
+            ResourceCache {
+                pods: vec![pod],
+                nodes: vec![node],
+                deployments: Vec::new(),
+                last_update_ms: 1,
+            },
+            MetricsCache::default(),
+        );
+
+        let snap = engine.snapshot().await.expect("snapshot");
+        assert_eq!(
+            snap.nodes[0].pod_count, 1,
+            "the Nodes PODS column must reflect the actual pod list"
+        );
+        assert_eq!(snap.nodes[0].pod_capacity, 110);
     }
 
     // ---- SEC-05: bounded metrics body ----
