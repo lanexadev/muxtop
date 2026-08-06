@@ -18,7 +18,15 @@ Thank you for your interest in contributing! This document covers everything you
 
 ## Code of Conduct
 
-Be respectful and constructive. We aim to keep this project welcoming to contributors of all experience levels.
+Be respectful and constructive: argue about code, not about each other. The full
+text — including how to report a problem — is in
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+
+**Security issues do not go through the normal flow.** If you have found a
+vulnerability, [report it
+privately](https://github.com/lucasschimmel/muxtop/security/advisories/new)
+rather than opening an issue or a pull request — a public report is a disclosure.
+See [SECURITY.md](SECURITY.md).
 
 ---
 
@@ -220,10 +228,32 @@ tests use `serde_json::from_value` to construct typed `Pod` / `Node` /
 1. Ensure `just check` passes locally — this runs fmt, clippy, deny, and tests.
 2. Keep the scope of a PR focused. One feature or fix per PR.
 3. Update `CHANGELOG.md` under the `[Unreleased]` section following the existing format.
-4. Open the PR against the `develop` branch.
-5. Fill out the PR description: what changed, why, and how to test it.
+4. Update the documentation that your change would otherwise make wrong — the
+   README, the `--help` text, and [`docs/wiki/`](docs/wiki) for anything a user
+   acts on. **The wiki is generated from `docs/wiki/`**: editing a page in the
+   browser works until the next release overwrites it.
+5. Open the PR against the `develop` branch.
+6. Fill out the PR description: what changed, why, and how to test it. The
+   template's checklist has extra sections for changes that touch a published
+   crate's API, security-relevant code, or a platform boundary.
 
 CI will run automatically. PRs cannot be merged until all checks pass.
+
+### What CI runs
+
+Beyond fmt, clippy, `cargo deny` and tests on Ubuntu, macOS and Windows:
+
+| Job | Checks |
+|---|---|
+| `MSRV` | The workspace still compiles on the declared minimum, Rust 1.88 |
+| `Rustdoc` | `cargo doc` with `-Dwarnings` — catches broken intra-doc links |
+| `Coverage` | `cargo-llvm-cov`; the summary is in the run, the lcov file is an artifact |
+| `Semver` | `cargo-semver-checks` against the published `muxtop-core`, `muxtop-proto` and `muxtop-tui` |
+
+A separate scheduled workflow re-audits `Cargo.lock` against the RUSTSEC
+database daily and files an issue when a new advisory lands, since nothing else
+would trigger a build for an advisory published against code that already
+shipped.
 
 ---
 
