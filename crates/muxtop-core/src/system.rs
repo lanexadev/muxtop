@@ -1,4 +1,4 @@
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bincode::{Decode, Encode};
@@ -84,6 +84,19 @@ pub struct LoadSnapshot {
 /// **Wire-protocol break (v0.4):** the `kube` field is appended to the
 /// struct after `containers`, before `timestamp_ms`. bincode is order-
 /// sensitive, so this is incompatible with v0.3.x clients.
+///
+/// # Why `Arc` on the two engine fields (PERF-02)
+///
+/// Both are produced by polling loops slower than the system tick — 0.5 Hz
+/// for containers, 0.2 Hz for the cluster — yet a snapshot is emitted at
+/// 1 Hz. Owning them meant deep-cloning data that had not changed: at the
+/// 5 000-pod `ListParams` ceiling, four of every five kube clones were
+/// pure waste, each rebuilding three `String`s per pod.
+///
+/// `Arc` makes the per-tick cost a refcount bump. It does **not** change
+/// the wire format: bincode encodes `Arc<T>` through `T::encode`, so the
+/// bytes are identical to the owned layout — see the round-trip test in
+/// `muxtop-proto`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct SystemSnapshot {
     pub cpu: CpuSnapshot,
@@ -91,8 +104,8 @@ pub struct SystemSnapshot {
     pub load: LoadSnapshot,
     pub processes: Vec<ProcessInfo>,
     pub networks: NetworkSnapshot,
-    pub containers: Option<ContainersSnapshot>,
-    pub kube: Option<KubeSnapshot>,
+    pub containers: Option<Arc<ContainersSnapshot>>,
+    pub kube: Option<Arc<KubeSnapshot>>,
     /// Milliseconds since Unix epoch.
     pub timestamp_ms: u64,
 }
@@ -106,8 +119,8 @@ impl SystemSnapshot {
     pub fn collect(
         sys: &sysinfo::System,
         networks: &sysinfo::Networks,
-        containers: Option<ContainersSnapshot>,
-        kube: Option<KubeSnapshot>,
+        containers: Option<Arc<ContainersSnapshot>>,
+        kube: Option<Arc<KubeSnapshot>>,
     ) -> Self {
         use sysinfo::System as SysSystem;
 

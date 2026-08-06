@@ -459,6 +459,61 @@ fn test_kube_snapshot_wire_does_not_carry_credentials() {
 // `kube`). bincode's Encode/Decode is structural, so this is the same
 // idiom a v0.3.1 binary would have produced.
 
+/// Replica of the current `SystemSnapshot` with the two engine fields
+/// **owned** rather than `Arc`-wrapped — i.e. the shape the struct had
+/// before PERF-02.
+///
+/// bincode encodes `Arc<T>` by delegating to `T::encode`, so the two
+/// layouts must be byte-identical on the wire. This type is how we prove
+/// it instead of asserting it in a comment: a mixed-version fleet only
+/// stays interoperable if that property actually holds.
+#[derive(bincode::Encode, bincode::Decode, PartialEq, Clone)]
+struct SystemSnapshotOwnedEngines {
+    cpu: muxtop_core::system::CpuSnapshot,
+    memory: muxtop_core::system::MemorySnapshot,
+    load: muxtop_core::system::LoadSnapshot,
+    processes: Vec<ProcessInfo>,
+    networks: NetworkSnapshot,
+    containers: Option<ContainersSnapshot>,
+    kube: Option<KubeSnapshot>,
+    timestamp_ms: u64,
+}
+
+/// PERF-02 wrapped `containers` and `kube` in `Arc`. Encoding the
+/// `Arc`-carrying struct and decoding it as the owned shape (and back)
+/// must both succeed and preserve every field.
+#[test]
+fn wire_arc_engine_fields_encode_identically_to_owned() {
+    let cfg = config::standard();
+    let arc_snap = make_test_snapshot();
+
+    // Arc-shaped -> bytes -> owned-shaped.
+    let bytes = bincode::encode_to_vec(&arc_snap, cfg).expect("encode Arc shape");
+    let (owned, consumed): (SystemSnapshotOwnedEngines, usize) =
+        bincode::decode_from_slice(&bytes, cfg).expect("owned shape must decode Arc-shaped bytes");
+    assert_eq!(consumed, bytes.len(), "no trailing bytes");
+    assert_eq!(
+        owned.containers.as_ref(),
+        arc_snap.containers.as_deref(),
+        "containers must survive the shape round-trip"
+    );
+    assert_eq!(
+        owned.kube.as_ref(),
+        arc_snap.kube.as_deref(),
+        "kube must survive the shape round-trip"
+    );
+
+    // Owned-shaped -> bytes -> Arc-shaped, and the bytes must match too.
+    let owned_bytes = bincode::encode_to_vec(&owned, cfg).expect("encode owned shape");
+    assert_eq!(
+        owned_bytes, bytes,
+        "Arc<T> and T must serialise to the same bytes"
+    );
+    let (back, _): (SystemSnapshot, usize) =
+        bincode::decode_from_slice(&owned_bytes, cfg).expect("Arc shape must decode owned bytes");
+    assert_eq!(back, arc_snap, "full round-trip must be lossless");
+}
+
 /// Standalone replica of `muxtop_core::system::SystemSnapshot` as it
 /// existed in v0.3.x — identical field order, but **no `kube` field**.
 /// Encoding a value of this type produces the exact wire bytes a v0.3.x
@@ -483,7 +538,10 @@ fn sample_v03_snapshot() -> SystemSnapshotV03 {
         load: v04.load,
         processes: v04.processes,
         networks: v04.networks,
-        containers: v04.containers,
+        // The v0.3 shape owned this field; v0.4 wraps it in an `Arc`, which
+        // bincode encodes identically — unwrapping here keeps the fixture a
+        // faithful v0.3 layout.
+        containers: v04.containers.map(|c| (*c).clone()),
         timestamp_ms: v04.timestamp_ms,
     }
 }
