@@ -238,10 +238,14 @@ impl SystemSnapshot {
             containers,
             kube,
             gpu,
+            // A clock set before the epoch is absurd but reachable — an
+            // embedded host with no RTC reads 1970 until NTP lands. A system
+            // monitor is exactly the tool someone would reach for on a box in
+            // that state, so degrade to 0 instead of taking the whole process
+            // down. Matches `kube_engine::unix_ms`.
             timestamp_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .expect("system clock before Unix epoch")
-                .as_millis() as u64,
+                .map_or(0, |d| d.as_millis() as u64),
         }
     }
 }
