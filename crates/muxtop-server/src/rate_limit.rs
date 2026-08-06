@@ -75,6 +75,9 @@ impl Bucket {
 struct LimiterState {
     buckets: HashMap<IpAddr, Bucket>,
     last_sweep: Instant,
+    /// Whether the ceiling warning has already been emitted for the current
+    /// episode, so a sustained flood logs once rather than once per attempt.
+    ceiling_logged: bool,
 }
 
 impl LimiterState {
@@ -114,6 +117,7 @@ impl RateLimiter {
             state: Mutex::new(LimiterState {
                 buckets: HashMap::new(),
                 last_sweep: Instant::now(),
+                ceiling_logged: false,
             }),
         }
     }
@@ -156,13 +160,21 @@ impl RateLimiter {
             }
 
             if state.buckets.len() >= self.max_tracked {
-                tracing::warn!(
-                    tracked = state.buckets.len(),
-                    peer_ip = %ip,
-                    "rate-limiter tracking ceiling reached; rejecting unknown source"
-                );
+                // Log the transition, not the rejection: at the ceiling we are
+                // by definition under an address flood, and a line per refused
+                // connection would turn the limiter into a log amplifier —
+                // trading a bounded map for an unbounded log.
+                if !state.ceiling_logged {
+                    state.ceiling_logged = true;
+                    tracing::warn!(
+                        tracked = state.buckets.len(),
+                        "rate-limiter tracking ceiling reached; refusing unknown sources \
+                         until the sweep reclaims capacity"
+                    );
+                }
                 return false;
             }
+            state.ceiling_logged = false;
         }
 
         let bucket = state.buckets.entry(ip).or_insert(Bucket {
@@ -258,6 +270,7 @@ mod tests {
         let mut state = LimiterState {
             buckets: HashMap::new(),
             last_sweep: now,
+            ceiling_logged: false,
         };
         // Full: idle long enough to be back at burst.
         state.buckets.insert(
@@ -355,6 +368,28 @@ mod tests {
             rl.try_admit(nth_ip(3)),
             "an already-tracked source keeps its budget at the ceiling"
         );
+    }
+
+    /// A line per refused connection would let an attacker drive our log
+    /// volume — a bounded map paid for with an unbounded log.
+    #[test]
+    fn test_ceiling_warning_is_emitted_once_per_episode() {
+        let rl = RateLimiter::with_max_tracked(10.0, 10.0, 4);
+        for i in 0..4 {
+            assert!(rl.try_admit(nth_ip(i)));
+        }
+
+        assert!(!rl.try_admit(nth_ip(100)));
+        assert!(
+            rl.state.lock().unwrap().ceiling_logged,
+            "first refusal at the ceiling should arm the flag"
+        );
+
+        // Subsequent refusals must find the flag already set and stay quiet.
+        for i in 101..200 {
+            assert!(!rl.try_admit(nth_ip(i)));
+        }
+        assert!(rl.state.lock().unwrap().ceiling_logged);
     }
 
     /// Eviction must not become a way to reset a bucket: an IP that keeps
