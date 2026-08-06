@@ -723,6 +723,28 @@ fn spawn_resource_loop(
     })
 }
 
+/// List one resource kind, returning `None` on timeout or API error.
+///
+/// `None` means "keep whatever the cache already holds" — per-resource
+/// failure must not wipe the other two (RBAC that grants pods but not
+/// nodes is common).
+async fn list_or_warn<K>(api: &Api<K>, lp: &ListParams, kind: &'static str) -> Option<Vec<K>>
+where
+    K: Clone + std::fmt::Debug + serde::de::DeserializeOwned,
+{
+    match tokio::time::timeout(LIST_TIMEOUT, api.list(lp)).await {
+        Ok(Ok(list)) => Some(list.items),
+        Ok(Err(e)) => {
+            tracing::warn!(target: "muxtop::kube", kind, error = %e, "list failed");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(target: "muxtop::kube", kind, "list timed out");
+            None
+        }
+    }
+}
+
 async fn tick_resources(
     pod_api: &Api<Pod>,
     node_api: &Api<Node>,
@@ -730,39 +752,19 @@ async fn tick_resources(
     lp: &ListParams,
     cache: &Arc<RwLock<ResourceCache>>,
 ) {
-    let pods = match tokio::time::timeout(LIST_TIMEOUT, pod_api.list(lp)).await {
-        Ok(Ok(list)) => Some(list.items),
-        Ok(Err(e)) => {
-            tracing::warn!(target: "muxtop::kube", error = %e, "pods list failed");
-            None
-        }
-        Err(_) => {
-            tracing::warn!(target: "muxtop::kube", "pods list timed out");
-            None
-        }
-    };
-    let nodes = match tokio::time::timeout(LIST_TIMEOUT, node_api.list(lp)).await {
-        Ok(Ok(list)) => Some(list.items),
-        Ok(Err(e)) => {
-            tracing::warn!(target: "muxtop::kube", error = %e, "nodes list failed");
-            None
-        }
-        Err(_) => {
-            tracing::warn!(target: "muxtop::kube", "nodes list timed out");
-            None
-        }
-    };
-    let deployments = match tokio::time::timeout(LIST_TIMEOUT, deployment_api.list(lp)).await {
-        Ok(Ok(list)) => Some(list.items),
-        Ok(Err(e)) => {
-            tracing::warn!(target: "muxtop::kube", error = %e, "deployments list failed");
-            None
-        }
-        Err(_) => {
-            tracing::warn!(target: "muxtop::kube", "deployments list timed out");
-            None
-        }
-    };
+    // PERF-04: run the three lists concurrently. Sequentially they could
+    // spend 3 x LIST_TIMEOUT = 9 s on a slow API server — longer than the
+    // 5 s POLL_INTERVAL, so the loop would fall behind its own cadence and
+    // the UI would show data older than it advertises. Concurrently the
+    // worst case is one LIST_TIMEOUT, comfortably inside the interval.
+    //
+    // `join!` polls on this task rather than spawning: no 'static bounds,
+    // and cancellation still propagates through the caller's `select!`.
+    let (pods, nodes, deployments) = tokio::join!(
+        list_or_warn(pod_api, lp, "pods"),
+        list_or_warn(node_api, lp, "nodes"),
+        list_or_warn(deployment_api, lp, "deployments"),
+    );
 
     let mut w = cache.write().await;
     if let Some(p) = pods {
@@ -800,8 +802,12 @@ fn spawn_metrics_loop(
 }
 
 async fn tick_metrics(client: &Client, cache: &Arc<RwLock<MetricsCache>>) {
-    let pod_metrics = fetch_metrics_text(client, "/apis/metrics.k8s.io/v1beta1/pods").await;
-    let node_metrics = fetch_metrics_text(client, "/apis/metrics.k8s.io/v1beta1/nodes").await;
+    // PERF-04: same reasoning as `tick_resources` — sequentially these two
+    // fetches could take 2 x LIST_TIMEOUT = 6 s against a 5 s POLL_INTERVAL.
+    let (pod_metrics, node_metrics) = tokio::join!(
+        fetch_metrics_text(client, "/apis/metrics.k8s.io/v1beta1/pods"),
+        fetch_metrics_text(client, "/apis/metrics.k8s.io/v1beta1/nodes"),
+    );
 
     // Treat any error on either path as "metrics-server unavailable". This
     // matches what k9s does — the user just sees `—` in the CPU/MEM cols.
