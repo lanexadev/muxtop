@@ -9,9 +9,9 @@
 //! v0.4 ships a **poll-based** design rather than the reflector-based design
 //! initially scoped: a single tokio task spawned from [`KubeEngine::connect`]
 //! wakes every 5 s, calls `Api::<K>::list()` for Pods / Nodes / Deployments,
-//! and writes the raw objects into a shared [`ResourceCache`]. A second task
+//! and writes the raw objects into a shared `ResourceCache`. A second task
 //! polls `metrics.k8s.io/v1beta1` on the same cadence, filling
-//! [`MetricsCache`]. [`ClusterEngine::snapshot`] is therefore CPU-only —
+//! `MetricsCache`. [`ClusterEngine::snapshot`] is therefore CPU-only —
 //! it reads both caches and runs the typed-to-snapshot conversion.
 //!
 //! Reflectors / `kube::runtime::watcher` were considered but deferred to a
@@ -78,7 +78,7 @@ pub(crate) struct MetricsCache {
 /// `kube-rs`-backed [`ClusterEngine`].
 ///
 /// Construction goes through [`KubeEngine::connect`] for production paths
-/// (S2.6, future commit) or [`KubeEngine::new_for_test`] for unit tests
+/// (S2.6, future commit) or `KubeEngine::new_for_test` for unit tests
 /// that prepopulate the caches by hand.
 pub struct KubeEngine {
     cluster_kind: ClusterKind,
