@@ -855,13 +855,26 @@ async fn tick_metrics(client: &Client, cache: &Arc<RwLock<MetricsCache>>) {
     w.nodes = new_nodes;
 }
 
+/// Ceiling on a metrics-server response body (SEC-05).
+///
+/// Unlike the typed resource lists, `metrics.k8s.io` is served by an
+/// *aggregated* APIService: whoever runs that pod — or anyone able to
+/// register an APIService for it — chooses the response, and
+/// `Client::request_text` would buffer whatever they send. Streaming with a
+/// cap turns a hostile or malfunctioning metrics backend into a dropped
+/// poll instead of an out-of-memory kill.
+///
+/// 16 MiB is roughly 4x the largest plausible legitimate body (~4 MiB for
+/// the 5 000-pod ceiling `ListParams` imposes on the resource side).
+const MAX_METRICS_BODY: u64 = 16 * 1024 * 1024;
+
 async fn fetch_metrics_text(client: &Client, path: &str) -> Option<String> {
     let req = http::Request::builder()
         .uri(path)
         .method("GET")
         .body(Vec::new())
         .ok()?;
-    match tokio::time::timeout(LIST_TIMEOUT, client.request_text(req)).await {
+    match tokio::time::timeout(LIST_TIMEOUT, read_capped_body(client, req)).await {
         Ok(Ok(body)) => Some(body),
         Ok(Err(e)) => {
             tracing::debug!(target: "muxtop::kube", path, error = %e, "metrics fetch failed");
@@ -872,6 +885,50 @@ async fn fetch_metrics_text(client: &Client, path: &str) -> Option<String> {
             None
         }
     }
+}
+
+/// Read a response body, refusing to buffer more than [`MAX_METRICS_BODY`].
+///
+/// Reads one byte past the cap so an over-long body is detected rather than
+/// silently truncated into invalid JSON.
+async fn read_capped_body(
+    client: &Client,
+    req: http::Request<Vec<u8>>,
+) -> Result<String, ClusterError> {
+    let stream = client
+        .request_stream(req)
+        .await
+        .map_err(|e| ClusterError::Unreachable(e.to_string()))?;
+    futures::pin_mut!(stream);
+    read_capped(stream, MAX_METRICS_BODY).await
+}
+
+/// Buffer at most `cap` bytes from `stream` as UTF-8.
+///
+/// Reads one byte past `cap` so an over-long body is rejected outright
+/// rather than silently truncated into invalid JSON — a truncated parse
+/// would look like "metrics unavailable" and hide the real problem.
+pub(crate) async fn read_capped<R>(stream: R, cap: u64) -> Result<String, ClusterError>
+where
+    R: futures::AsyncRead,
+{
+    use futures::AsyncReadExt;
+
+    let mut buf = Vec::new();
+    futures::pin_mut!(stream);
+    stream
+        .take(cap + 1)
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|e| ClusterError::Other(format!("metrics body read: {e}")))?;
+
+    if buf.len() as u64 > cap {
+        return Err(ClusterError::Other(format!(
+            "metrics body exceeded {cap} bytes; refusing to buffer it"
+        )));
+    }
+
+    String::from_utf8(buf).map_err(|e| ClusterError::Other(format!("metrics body utf-8: {e}")))
 }
 
 /// metrics-server reports CPU usage in nanocores (`"123456789n"`) most of
@@ -945,6 +1002,45 @@ mod tests {
             ResourceCache::default(),
             MetricsCache::default(),
         )
+    }
+
+    // ---- SEC-05: bounded metrics body ----
+
+    #[tokio::test]
+    async fn read_capped_accepts_a_body_within_the_cap() {
+        let body = br#"{"items":[]}"#;
+        let out = read_capped(&body[..], 1024).await.expect("within cap");
+        assert_eq!(out, r#"{"items":[]}"#);
+    }
+
+    #[tokio::test]
+    async fn read_capped_accepts_a_body_exactly_at_the_cap() {
+        let body = [b'x'; 64];
+        let out = read_capped(&body[..], 64).await.expect("cap is inclusive");
+        assert_eq!(out.len(), 64);
+    }
+
+    /// The finding: an aggregated APIService chooses this response, so an
+    /// unbounded body is a memory-exhaustion primitive handed to whoever
+    /// runs metrics-server.
+    #[tokio::test]
+    async fn read_capped_rejects_an_oversized_body() {
+        let body = vec![b'x'; 4096];
+        let err = read_capped(&body[..], 1024)
+            .await
+            .expect_err("body is 4x the cap");
+        assert!(
+            matches!(&err, ClusterError::Other(m) if m.contains("exceeded")),
+            "expected an explicit over-cap error, got {err:?}"
+        );
+    }
+
+    /// Rejecting beats truncating: a half-read body would parse as invalid
+    /// JSON and be indistinguishable from "metrics-server is down".
+    #[tokio::test]
+    async fn read_capped_does_not_truncate_into_valid_looking_output() {
+        let body = vec![b'x'; 2048];
+        assert!(read_capped(&body[..], 1024).await.is_err());
     }
 
     // ---- connect stubs ----
