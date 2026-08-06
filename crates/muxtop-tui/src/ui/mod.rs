@@ -10,7 +10,7 @@ pub mod glyphs;
 mod gpu;
 mod help;
 mod inspector;
-mod kube;
+pub(crate) mod kube;
 mod log_view;
 mod network;
 mod palette;

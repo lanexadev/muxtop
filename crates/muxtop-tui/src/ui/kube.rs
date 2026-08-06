@@ -18,7 +18,7 @@ use crate::ui::theme::Level;
 use muxtop_core::kube::{
     DeploymentSnapshot, KubeSnapshot, NodeSnapshot, NodeStatus, PodPhase, PodSnapshot,
 };
-use muxtop_core::process::SortOrder;
+use muxtop_core::process::{SortOrder, contains_ignore_case};
 
 const POD_COLUMNS: &[Column] = &[
     Column::fixed("NAMESPACE", 18, Align::Left, PRIO_MEDIUM),
@@ -164,17 +164,16 @@ fn draw_subtabs(frame: &mut Frame, area: Rect, r: &Render<'_>, snap: &KubeSnapsh
 
 fn draw_pods(frame: &mut Frame, area: Rect, r: &Render<'_>, snap: &KubeSnapshot) {
     let app = r.app;
-    let f = app.kube_filter_input.to_lowercase();
-    let mut pods: Vec<&PodSnapshot> = snap
-        .pods
+    let f = &app.kube_filter_input;
+    // PERF-03: filtered+sorted order comes from the cache built once per
+    // state change in `AppState::recompute_kube_view`. `get` rather than
+    // indexing so a cache that briefly trails the snapshot degrades to fewer
+    // rows instead of panicking.
+    let pods: Vec<&PodSnapshot> = app
+        .kube_view_cache
         .iter()
-        .filter(|p| {
-            f.is_empty()
-                || p.name.to_lowercase().contains(&f)
-                || p.namespace.to_lowercase().contains(&f)
-        })
+        .filter_map(|&i| snap.pods.get(i))
         .collect();
-    sort_pods(&mut pods, app.kube_sort_field, app.kube_sort_order);
 
     let spec = Spec {
         columns: POD_COLUMNS,
@@ -269,20 +268,24 @@ fn pod_sort_column(field: KubeSortField) -> Option<usize> {
     })
 }
 
-fn sort_pods(pods: &mut [&PodSnapshot], field: KubeSortField, order: SortOrder) {
+fn sort_pods(idx: &mut [usize], pods: &[PodSnapshot], field: KubeSortField, order: SortOrder) {
     match field {
-        KubeSortField::PodName => {
-            pods.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)))
+        KubeSortField::PodName => idx.sort_by(|&a, &b| {
+            (&pods[a].namespace, &pods[a].name).cmp(&(&pods[b].namespace, &pods[b].name))
+        }),
+        KubeSortField::PodPhase => idx.sort_by_key(|&i| phase_rank(pods[i].phase)),
+        KubeSortField::PodRestarts => idx.sort_by_key(|&i| std::cmp::Reverse(pods[i].restarts)),
+        KubeSortField::PodCpu => {
+            idx.sort_by_key(|&i| std::cmp::Reverse(pods[i].cpu_millis.unwrap_or(0)))
         }
-        KubeSortField::PodPhase => pods.sort_by_key(|p| phase_rank(p.phase)),
-        KubeSortField::PodRestarts => pods.sort_by_key(|p| std::cmp::Reverse(p.restarts)),
-        KubeSortField::PodCpu => pods.sort_by_key(|p| std::cmp::Reverse(p.cpu_millis.unwrap_or(0))),
-        KubeSortField::PodMem => pods.sort_by_key(|p| std::cmp::Reverse(p.mem_bytes.unwrap_or(0))),
-        KubeSortField::PodAge => pods.sort_by_key(|p| std::cmp::Reverse(p.age_seconds)),
-        _ => pods.sort_by_key(|p| std::cmp::Reverse(p.cpu_millis.unwrap_or(0))),
+        KubeSortField::PodMem => {
+            idx.sort_by_key(|&i| std::cmp::Reverse(pods[i].mem_bytes.unwrap_or(0)))
+        }
+        KubeSortField::PodAge => idx.sort_by_key(|&i| std::cmp::Reverse(pods[i].age_seconds)),
+        _ => idx.sort_by_key(|&i| std::cmp::Reverse(pods[i].cpu_millis.unwrap_or(0))),
     }
     if matches!(order, SortOrder::Asc) {
-        pods.reverse();
+        idx.reverse();
     }
 }
 
@@ -306,13 +309,12 @@ fn phase_rank(phase: PodPhase) -> u8 {
 
 fn draw_nodes(frame: &mut Frame, area: Rect, r: &Render<'_>, snap: &KubeSnapshot) {
     let app = r.app;
-    let f = app.kube_filter_input.to_lowercase();
-    let mut nodes: Vec<&NodeSnapshot> = snap
-        .nodes
+    let f = &app.kube_filter_input;
+    let nodes: Vec<&NodeSnapshot> = app
+        .kube_view_cache
         .iter()
-        .filter(|n| f.is_empty() || n.name.to_lowercase().contains(&f))
+        .filter_map(|&i| snap.nodes.get(i))
         .collect();
-    sort_nodes(&mut nodes, app.kube_sort_field, app.kube_sort_order);
 
     // Nodes are a cluster-scoped resource: there is no namespaced variant, so
     // an empty list under a namespace scope means missing permissions, not an
@@ -408,18 +410,18 @@ fn node_sort_column(field: KubeSortField) -> Option<usize> {
     })
 }
 
-fn sort_nodes(nodes: &mut [&NodeSnapshot], field: KubeSortField, order: SortOrder) {
+fn sort_nodes(idx: &mut [usize], nodes: &[NodeSnapshot], field: KubeSortField, order: SortOrder) {
     match field {
-        KubeSortField::NodeName => nodes.sort_by(|a, b| a.name.cmp(&b.name)),
+        KubeSortField::NodeName => idx.sort_by(|&a, &b| nodes[a].name.cmp(&nodes[b].name)),
         KubeSortField::NodeMemPct => {
-            nodes.sort_by_key(|n| std::cmp::Reverse(n.mem_used_bytes.unwrap_or(0)))
+            idx.sort_by_key(|&i| std::cmp::Reverse(nodes[i].mem_used_bytes.unwrap_or(0)))
         }
-        KubeSortField::NodePodCount => nodes.sort_by_key(|n| std::cmp::Reverse(n.pod_count)),
-        KubeSortField::NodeAge => nodes.sort_by_key(|n| std::cmp::Reverse(n.age_seconds)),
-        _ => nodes.sort_by_key(|n| std::cmp::Reverse(n.cpu_used_millis.unwrap_or(0))),
+        KubeSortField::NodePodCount => idx.sort_by_key(|&i| std::cmp::Reverse(nodes[i].pod_count)),
+        KubeSortField::NodeAge => idx.sort_by_key(|&i| std::cmp::Reverse(nodes[i].age_seconds)),
+        _ => idx.sort_by_key(|&i| std::cmp::Reverse(nodes[i].cpu_used_millis.unwrap_or(0))),
     }
     if matches!(order, SortOrder::Asc) {
-        nodes.reverse();
+        idx.reverse();
     }
 }
 
@@ -429,17 +431,12 @@ fn sort_nodes(nodes: &mut [&NodeSnapshot], field: KubeSortField, order: SortOrde
 
 fn draw_deployments(frame: &mut Frame, area: Rect, r: &Render<'_>, snap: &KubeSnapshot) {
     let app = r.app;
-    let f = app.kube_filter_input.to_lowercase();
-    let mut deploys: Vec<&DeploymentSnapshot> = snap
-        .deployments
+    let f = &app.kube_filter_input;
+    let deploys: Vec<&DeploymentSnapshot> = app
+        .kube_view_cache
         .iter()
-        .filter(|d| {
-            f.is_empty()
-                || d.name.to_lowercase().contains(&f)
-                || d.namespace.to_lowercase().contains(&f)
-        })
+        .filter_map(|&i| snap.deployments.get(i))
         .collect();
-    sort_deployments(&mut deploys, app.kube_sort_field, app.kube_sort_order);
 
     let spec = Spec {
         columns: DEPLOY_COLUMNS,
@@ -491,21 +488,85 @@ fn deploy_sort_column(field: KubeSortField) -> Option<usize> {
     })
 }
 
-fn sort_deployments(deploys: &mut [&DeploymentSnapshot], field: KubeSortField, order: SortOrder) {
+fn sort_deployments(
+    idx: &mut [usize],
+    deploys: &[DeploymentSnapshot],
+    field: KubeSortField,
+    order: SortOrder,
+) {
     match field {
-        KubeSortField::DeployNamespace => {
-            deploys.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)))
-        }
-        KubeSortField::DeployReadyRatio => deploys.sort_by(|a, b| {
-            ratio(a)
-                .partial_cmp(&ratio(b))
+        KubeSortField::DeployNamespace => idx.sort_by(|&a, &b| {
+            (&deploys[a].namespace, &deploys[a].name)
+                .cmp(&(&deploys[b].namespace, &deploys[b].name))
+        }),
+        KubeSortField::DeployReadyRatio => idx.sort_by(|&a, &b| {
+            ratio(&deploys[a])
+                .partial_cmp(&ratio(&deploys[b]))
                 .unwrap_or(std::cmp::Ordering::Equal)
         }),
-        KubeSortField::DeployAge => deploys.sort_by_key(|d| std::cmp::Reverse(d.age_seconds)),
-        _ => deploys.sort_by(|a, b| a.name.cmp(&b.name)),
+        KubeSortField::DeployAge => idx.sort_by_key(|&i| std::cmp::Reverse(deploys[i].age_seconds)),
+        _ => idx.sort_by(|&a, &b| deploys[a].name.cmp(&deploys[b].name)),
     }
     if matches!(order, SortOrder::Asc) {
-        deploys.reverse();
+        idx.reverse();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// View pipeline (PERF-03)
+// ---------------------------------------------------------------------------
+
+/// Indices into the active sub-view's list, filtered and sorted.
+///
+/// v0.4 applied both at render time and re-derived the row count on every
+/// navigation keypress, lowercasing each row's name and namespace as it
+/// went. At the 5 000-pod ceiling `ListParams` allows, that was ~10 000
+/// transient `String`s per frame plus a full re-sort per press of `j` — the
+/// same cost PERF-M2 and PERF-M5 removed from the other tabs in v0.3.1, and
+/// which never reached this one.
+///
+/// Returning indices rather than clones keeps the cache proportional to the
+/// row count instead of the row *size*, and lets the render path borrow
+/// straight from the snapshot. The needle is lowercased once here; per-row
+/// matching uses `contains_ignore_case`, whose ASCII fast path allocates
+/// nothing.
+pub(crate) fn compute_view_indices(
+    snap: &KubeSnapshot,
+    subview: KubeSubview,
+    filter: &str,
+    sort_field: KubeSortField,
+    sort_order: SortOrder,
+) -> Vec<usize> {
+    let needle = filter.to_lowercase();
+
+    match subview {
+        KubeSubview::Pods => {
+            let mut idx: Vec<usize> = (0..snap.pods.len())
+                .filter(|&i| {
+                    contains_ignore_case(&snap.pods[i].name, &needle)
+                        || contains_ignore_case(&snap.pods[i].namespace, &needle)
+                })
+                .collect();
+            sort_pods(&mut idx, &snap.pods, sort_field, sort_order);
+            idx
+        }
+        KubeSubview::Nodes => {
+            let mut idx: Vec<usize> = (0..snap.nodes.len())
+                .filter(|&i| contains_ignore_case(&snap.nodes[i].name, &needle))
+                .collect();
+            sort_nodes(&mut idx, &snap.nodes, sort_field, sort_order);
+            idx
+        }
+        KubeSubview::Deployments => {
+            let mut idx: Vec<usize> = (0..snap.deployments.len())
+                .filter(|&i| {
+                    contains_ignore_case(&snap.deployments[i].name, &needle)
+                        || contains_ignore_case(&snap.deployments[i].namespace, &needle)
+                })
+                .collect();
+            sort_deployments(&mut idx, &snap.deployments, sort_field, sort_order);
+            idx
+        }
     }
 }
 
