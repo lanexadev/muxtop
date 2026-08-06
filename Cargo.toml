@@ -68,7 +68,7 @@ bincode = "2"
 async-trait = "0.1"
 
 # Docker/Podman API client (v0.3 Containers, see ADR-01 in forge/25)
-bollard = "0.20"
+bollard = "0.21"
 futures = "0.3"
 
 # Kubernetes API client (v0.4 Kube tab, see ADR-04 in forge/32) — features
