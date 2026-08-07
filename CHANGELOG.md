@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Processes no longer disappear from the tree view** (`muxtop-core`). `build_process_tree` reached every node from a root, and a process only qualified as a root if its `parent_pid` was absent, `0`, or missing from the snapshot. A group of processes listed as each other's ancestors satisfies none of those, so the whole group — and every subtree hanging off it — was unreachable and silently dropped. `parent_pid` is only what the OS reported at sample time, and PIDs get recycled: a dead parent's PID reappearing on one of its own descendants is enough to close such a loop, which is why this surfaced on Windows first (a CI run flattened 13 of 143 processes). The walk now marks what it has placed and re-roots whatever it could not reach, so `flatten_tree(&build_process_tree(p))` holds every process exactly once. The same pass fixes the `MAX_DEPTH` cut-off, which had been dropping the tail of any chain deeper than 256 rather than re-rooting it.
+
 ## [0.6.0] - 2026-08-07
 
 Security and performance release over the Kubernetes surface, plus one
