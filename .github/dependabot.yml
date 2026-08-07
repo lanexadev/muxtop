@@ -41,6 +41,19 @@ updates:
         update-types: ["version-update:semver-major"]
       - dependency-name: k8s-openapi
         update-types: ["version-update:semver-major"]
+      # bincode 3.0.0 is not a release. Development ceased after a doxxing and
+      # harassment incident, and because crates.io has no way to mark a crate
+      # unmaintained, the maintainers published a tombstone: a README stating
+      # the status and a lib.rs containing nothing but
+      # `compile_error!("https://xkcd.com/2347/")`. Every job on #34 failed on
+      # that line. Ignoring the major stops Dependabot reopening a PR that
+      # cannot compile by construction; it does not resolve the underlying
+      # problem, which is that muxtop-proto's wire format is built on a crate
+      # that will receive no further fixes. Migrating (wincode is
+      # bincode-compatible; postcard and rkyv are the other candidates) breaks
+      # the wire format, so it belongs in a release plan, not here.
+      - dependency-name: bincode
+        update-types: ["version-update:semver-major"]
 
   # ---------------------------------------------------------------------------
   # GitHub Actions
