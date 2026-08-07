@@ -294,11 +294,18 @@ impl ClusterEngine for KubeEngine {
             .iter()
             .map(|p| pod_to_snapshot(p, &metrics, now_ms))
             .collect();
-        let nodes: Vec<NodeSnapshot> = resources
+        let mut nodes: Vec<NodeSnapshot> = resources
             .nodes
             .iter()
             .map(|n| node_to_snapshot(n, &metrics, now_ms))
             .collect();
+
+        // Cross-resource join: a single `Node` object carries no pod count,
+        // so the aggregation belongs here, where both lists are in hand.
+        let scheduled = pods_per_node(&pods);
+        for node in &mut nodes {
+            node.pod_count = scheduled.get(node.name.as_str()).copied().unwrap_or(0);
+        }
         let deployments: Vec<DeploymentSnapshot> = resources
             .deployments
             .iter()
@@ -536,9 +543,28 @@ pub(crate) fn node_to_snapshot(node: &Node, metrics: &MetricsCache, now_ms: u64)
         mem_capacity_bytes,
         mem_allocatable_bytes,
         mem_used_bytes,
-        pod_count: 0, // Populated in S2.6 once the resource cache has the cluster-wide pod list.
+        // Filled in by `ClusterEngine::snapshot`, which has the pod list a
+        // lone `Node` object cannot see.
+        pod_count: 0,
         pod_capacity,
     }
+}
+
+/// Count scheduled pods per node name.
+///
+/// Mirrors what `kubectl describe node` reports as "Non-terminated Pods":
+/// `Succeeded` and `Failed` pods have released their node resources, so
+/// counting them would overstate how full a node is — the column exists to
+/// be read against `pod_capacity`.
+fn pods_per_node(pods: &[PodSnapshot]) -> HashMap<&str, u32> {
+    let mut counts: HashMap<&str, u32> = HashMap::new();
+    for pod in pods {
+        if pod.node.is_empty() || matches!(pod.phase, PodPhase::Succeeded | PodPhase::Failed) {
+            continue;
+        }
+        *counts.entry(pod.node.as_str()).or_insert(0) += 1;
+    }
+    counts
 }
 
 fn node_status_synthetic(node: &Node) -> NodeStatus {
@@ -773,7 +799,20 @@ fn spawn_resource_loop(
         let node_api: Api<Node> = Api::all(client.clone());
         let lp = ListParams::default().limit(5_000);
 
+        // `interval` rather than tick-then-sleep: the latter made the real
+        // period `tick duration + POLL_INTERVAL`, so the loop drifted away
+        // from the 5 s the collector samples at and the two fell out of
+        // phase. `Skip` keeps a slow tick from being chased by a burst of
+        // catch-up polls. Same shape as the collector and container loops.
+        let mut ticker = tokio::time::interval(POLL_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = ticker.tick() => {}
+            }
+
             // Rebuilt every tick because `A` can rescope the engine between
             // ticks. `Api::all` / `Api::namespaced` only wrap the shared
             // client in a request builder — no I/O, no handshake, so this is
@@ -793,12 +832,30 @@ fn spawn_resource_loop(
                 _ = cancel.cancelled() => break,
                 _ = tick_resources(&pod_api, &node_api, &deployment_api, &lp, &cache) => {}
             }
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                _ = tokio::time::sleep(POLL_INTERVAL) => {}
-            }
         }
     })
+}
+
+/// List one resource kind, returning `None` on timeout or API error.
+///
+/// `None` means "keep whatever the cache already holds" — per-resource
+/// failure must not wipe the other two (a namespace-only Role that 403s on
+/// nodes is the documented degraded mode, not a reason to blank the tab).
+async fn list_or_warn<K>(api: &Api<K>, lp: &ListParams, kind: &'static str) -> Option<Vec<K>>
+where
+    K: Clone + std::fmt::Debug + serde::de::DeserializeOwned,
+{
+    match tokio::time::timeout(LIST_TIMEOUT, api.list(lp)).await {
+        Ok(Ok(list)) => Some(list.items),
+        Ok(Err(e)) => {
+            tracing::warn!(target: "muxtop::kube", kind, error = %e, "list failed");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(target: "muxtop::kube", kind, "list timed out");
+            None
+        }
+    }
 }
 
 async fn tick_resources(
@@ -808,39 +865,19 @@ async fn tick_resources(
     lp: &ListParams,
     cache: &Arc<RwLock<ResourceCache>>,
 ) {
-    let pods = match tokio::time::timeout(LIST_TIMEOUT, pod_api.list(lp)).await {
-        Ok(Ok(list)) => Some(list.items),
-        Ok(Err(e)) => {
-            tracing::warn!(target: "muxtop::kube", error = %e, "pods list failed");
-            None
-        }
-        Err(_) => {
-            tracing::warn!(target: "muxtop::kube", "pods list timed out");
-            None
-        }
-    };
-    let nodes = match tokio::time::timeout(LIST_TIMEOUT, node_api.list(lp)).await {
-        Ok(Ok(list)) => Some(list.items),
-        Ok(Err(e)) => {
-            tracing::warn!(target: "muxtop::kube", error = %e, "nodes list failed");
-            None
-        }
-        Err(_) => {
-            tracing::warn!(target: "muxtop::kube", "nodes list timed out");
-            None
-        }
-    };
-    let deployments = match tokio::time::timeout(LIST_TIMEOUT, deployment_api.list(lp)).await {
-        Ok(Ok(list)) => Some(list.items),
-        Ok(Err(e)) => {
-            tracing::warn!(target: "muxtop::kube", error = %e, "deployments list failed");
-            None
-        }
-        Err(_) => {
-            tracing::warn!(target: "muxtop::kube", "deployments list timed out");
-            None
-        }
-    };
+    // PERF-04: run the three lists concurrently. Sequentially they could
+    // spend 3 x LIST_TIMEOUT = 9 s on a slow API server — longer than the
+    // 5 s POLL_INTERVAL, so the loop would fall behind its own cadence and
+    // the UI would show data older than it advertises. Concurrently the
+    // worst case is one LIST_TIMEOUT, comfortably inside the interval.
+    //
+    // `join!` polls on this task rather than spawning: no 'static bounds,
+    // and cancellation still propagates through the caller's `select!`.
+    let (pods, nodes, deployments) = tokio::join!(
+        list_or_warn(pod_api, lp, "pods"),
+        list_or_warn(node_api, lp, "nodes"),
+        list_or_warn(deployment_api, lp, "deployments"),
+    );
 
     let mut w = cache.write().await;
     if let Some(p) = pods {
@@ -865,15 +902,22 @@ fn spawn_metrics_loop(
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // See `spawn_resource_loop` for why this is an interval rather than
+        // tick-then-sleep.
+        let mut ticker = tokio::time::interval(POLL_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = ticker.tick() => {}
+            }
+            // Re-read after the tick: `A` can rescope the engine while we
+            // wait, and the poll must use the scope in force now.
             let current = scope.read().await.clone();
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 _ = tick_metrics(&client, &cache, &current) => {}
-            }
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                _ = tokio::time::sleep(POLL_INTERVAL) => {}
             }
         }
     })
@@ -891,9 +935,14 @@ async fn tick_metrics(client: &Client, cache: &Arc<RwLock<MetricsCache>>, scope:
         Some(ns) => format!("/apis/metrics.k8s.io/v1beta1/namespaces/{ns}/pods"),
         None => "/apis/metrics.k8s.io/v1beta1/pods".to_string(),
     };
-    let pod_metrics = fetch_metrics_text(client, &pod_path).await;
     // Node metrics are cluster-scoped like the Node resource itself.
-    let node_metrics = fetch_metrics_text(client, "/apis/metrics.k8s.io/v1beta1/nodes").await;
+    //
+    // PERF-04: same reasoning as `tick_resources` — sequentially these two
+    // fetches could take 2 x LIST_TIMEOUT = 6 s against a 5 s POLL_INTERVAL.
+    let (pod_metrics, node_metrics) = tokio::join!(
+        fetch_metrics_text(client, &pod_path),
+        fetch_metrics_text(client, "/apis/metrics.k8s.io/v1beta1/nodes"),
+    );
 
     // Treat any error on either path as "metrics-server unavailable". This
     // matches what k9s does — the user just sees `—` in the CPU/MEM cols.
@@ -975,13 +1024,26 @@ async fn tick_metrics(client: &Client, cache: &Arc<RwLock<MetricsCache>>, scope:
     w.nodes = new_nodes;
 }
 
+/// Ceiling on a metrics-server response body (SEC-05).
+///
+/// Unlike the typed resource lists, `metrics.k8s.io` is served by an
+/// *aggregated* APIService: whoever runs that pod — or anyone able to
+/// register an APIService for it — chooses the response, and
+/// `Client::request_text` would buffer whatever they send. Streaming with a
+/// cap turns a hostile or malfunctioning metrics backend into a dropped
+/// poll instead of an out-of-memory kill.
+///
+/// 16 MiB is roughly 4x the largest plausible legitimate body (~4 MiB for
+/// the 5 000-pod ceiling `ListParams` imposes on the resource side).
+const MAX_METRICS_BODY: u64 = 16 * 1024 * 1024;
+
 async fn fetch_metrics_text(client: &Client, path: &str) -> Option<String> {
     let req = http::Request::builder()
         .uri(path)
         .method("GET")
         .body(Vec::new())
         .ok()?;
-    match tokio::time::timeout(LIST_TIMEOUT, client.request_text(req)).await {
+    match tokio::time::timeout(LIST_TIMEOUT, read_capped_body(client, req)).await {
         Ok(Ok(body)) => Some(body),
         Ok(Err(e)) => {
             tracing::debug!(target: "muxtop::kube", path, error = %e, "metrics fetch failed");
@@ -992,6 +1054,50 @@ async fn fetch_metrics_text(client: &Client, path: &str) -> Option<String> {
             None
         }
     }
+}
+
+/// Read a response body, refusing to buffer more than [`MAX_METRICS_BODY`].
+///
+/// Reads one byte past the cap so an over-long body is detected rather than
+/// silently truncated into invalid JSON.
+async fn read_capped_body(
+    client: &Client,
+    req: http::Request<Vec<u8>>,
+) -> Result<String, ClusterError> {
+    let stream = client
+        .request_stream(req)
+        .await
+        .map_err(|e| ClusterError::Unreachable(e.to_string()))?;
+    futures::pin_mut!(stream);
+    read_capped(stream, MAX_METRICS_BODY).await
+}
+
+/// Buffer at most `cap` bytes from `stream` as UTF-8.
+///
+/// Reads one byte past `cap` so an over-long body is rejected outright
+/// rather than silently truncated into invalid JSON — a truncated parse
+/// would look like "metrics unavailable" and hide the real problem.
+pub(crate) async fn read_capped<R>(stream: R, cap: u64) -> Result<String, ClusterError>
+where
+    R: futures::AsyncRead,
+{
+    use futures::AsyncReadExt;
+
+    let mut buf = Vec::new();
+    futures::pin_mut!(stream);
+    stream
+        .take(cap + 1)
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|e| ClusterError::Other(format!("metrics body read: {e}")))?;
+
+    if buf.len() as u64 > cap {
+        return Err(ClusterError::Other(format!(
+            "metrics body exceeded {cap} bytes; refusing to buffer it"
+        )));
+    }
+
+    String::from_utf8(buf).map_err(|e| ClusterError::Other(format!("metrics body utf-8: {e}")))
 }
 
 /// metrics-server reports CPU usage in nanocores (`"123456789n"`) most of
@@ -1065,6 +1171,127 @@ mod tests {
             ResourceCache::default(),
             MetricsCache::default(),
         )
+    }
+
+    // ---- pod_count join ----
+
+    fn pod_on(node: &str, phase: PodPhase) -> PodSnapshot {
+        PodSnapshot {
+            namespace: "default".into(),
+            name: format!("pod-{node}-{phase:?}"),
+            phase,
+            ready: (1, 1),
+            restarts: 0,
+            age_seconds: 60,
+            node: node.into(),
+            cpu_millis: None,
+            mem_bytes: None,
+            qos: QosClass::BestEffort,
+        }
+    }
+
+    #[test]
+    fn pods_per_node_counts_only_scheduled_live_pods() {
+        let pods = vec![
+            pod_on("node-a", PodPhase::Running),
+            pod_on("node-a", PodPhase::Pending),
+            pod_on("node-a", PodPhase::CrashLoop),
+            // Terminated: resources already released, so kubectl does not
+            // count these against the node either.
+            pod_on("node-a", PodPhase::Succeeded),
+            pod_on("node-a", PodPhase::Failed),
+            pod_on("node-b", PodPhase::Running),
+            // Unscheduled pods belong to no node.
+            pod_on("", PodPhase::Pending),
+        ];
+
+        let counts = pods_per_node(&pods);
+        assert_eq!(counts.get("node-a").copied(), Some(3));
+        assert_eq!(counts.get("node-b").copied(), Some(1));
+        assert_eq!(
+            counts.get("").copied(),
+            None,
+            "unscheduled pods have no node"
+        );
+    }
+
+    /// Regression for the hardcoded `pod_count: 0` the Nodes column shipped
+    /// with in v0.4.0 — it rendered "0" on every cluster.
+    #[tokio::test]
+    async fn snapshot_populates_node_pod_count() {
+        let node: Node = serde_json::from_value(json!({
+            "metadata": { "name": "node-a" },
+            "status": {
+                "conditions": [{ "type": "Ready", "status": "True" }],
+                "capacity": { "cpu": "4", "memory": "8Gi", "pods": "110" }
+            }
+        }))
+        .unwrap();
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": { "name": "web-0", "namespace": "default" },
+            "spec": { "nodeName": "node-a" },
+            "status": { "phase": "Running" }
+        }))
+        .unwrap();
+
+        let engine = KubeEngine::new_for_test(
+            ClusterKind::Generic,
+            None,
+            "default".into(),
+            ResourceCache {
+                pods: vec![pod],
+                nodes: vec![node],
+                deployments: Vec::new(),
+                last_update_ms: 1,
+            },
+            MetricsCache::default(),
+        );
+
+        let snap = engine.snapshot().await.expect("snapshot");
+        assert_eq!(
+            snap.nodes[0].pod_count, 1,
+            "the Nodes PODS column must reflect the actual pod list"
+        );
+        assert_eq!(snap.nodes[0].pod_capacity, 110);
+    }
+
+    // ---- SEC-05: bounded metrics body ----
+
+    #[tokio::test]
+    async fn read_capped_accepts_a_body_within_the_cap() {
+        let body = br#"{"items":[]}"#;
+        let out = read_capped(&body[..], 1024).await.expect("within cap");
+        assert_eq!(out, r#"{"items":[]}"#);
+    }
+
+    #[tokio::test]
+    async fn read_capped_accepts_a_body_exactly_at_the_cap() {
+        let body = [b'x'; 64];
+        let out = read_capped(&body[..], 64).await.expect("cap is inclusive");
+        assert_eq!(out.len(), 64);
+    }
+
+    /// The finding: an aggregated APIService chooses this response, so an
+    /// unbounded body is a memory-exhaustion primitive handed to whoever
+    /// runs metrics-server.
+    #[tokio::test]
+    async fn read_capped_rejects_an_oversized_body() {
+        let body = vec![b'x'; 4096];
+        let err = read_capped(&body[..], 1024)
+            .await
+            .expect_err("body is 4x the cap");
+        assert!(
+            matches!(&err, ClusterError::Other(m) if m.contains("exceeded")),
+            "expected an explicit over-cap error, got {err:?}"
+        );
+    }
+
+    /// Rejecting beats truncating: a half-read body would parse as invalid
+    /// JSON and be indistinguishable from "metrics-server is down".
+    #[tokio::test]
+    async fn read_capped_does_not_truncate_into_valid_looking_output() {
+        let body = vec![b'x'; 2048];
+        assert!(read_capped(&body[..], 1024).await.is_err());
     }
 
     // ---- connect stubs ----

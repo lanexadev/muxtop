@@ -881,6 +881,11 @@ pub struct AppState {
     pub kube_filter_active: bool,
     pub kube_selected: usize,
     pub kube_scroll_offset: usize,
+    /// Filtered + sorted indices into the active Kube sub-view's list
+    /// (PERF-03), refreshed by `recompute_kube_view` whenever the snapshot,
+    /// sub-view, filter or sort changes. Stores indices rather than clones so
+    /// the cache cost tracks row count, not row size.
+    pub kube_view_cache: Vec<usize>,
     /// GPU tab state. Sorting and filtering are applied at render time, as on
     /// the Kube tab — a host has single-digit GPUs and rarely more than a few
     /// dozen GPU processes, so the per-frame projection is microseconds and
@@ -994,6 +999,7 @@ impl AppState {
             kube_filter_active: false,
             kube_selected: 0,
             kube_scroll_offset: 0,
+            kube_view_cache: Vec::new(),
             gpu_subview: GpuSubview::default(),
             gpu_sort_field: GpuSortField::default_for(GpuSubview::default()),
             gpu_sort_order: SortOrder::Desc,
@@ -1164,36 +1170,30 @@ impl AppState {
 
     /// Count of items rendered in the active Kube sub-view AFTER the filter
     /// is applied. Used by the j/k / scroll bounds.
+    /// PERF-03: reads the cache. This runs on every navigation keypress, and
+    /// re-filtering the whole pod list — lowercasing two fields per row — to
+    /// answer "how many rows are there" was the same mistake PERF-M5 fixed
+    /// for the Network and Containers tabs.
     pub fn kube_count(&self) -> usize {
-        let Some(snap) = self.last_snapshot.as_ref().and_then(|s| s.kube.as_ref()) else {
-            return 0;
+        self.kube_view_cache.len()
+    }
+
+    /// Rebuild [`Self::kube_view_cache`] from the current snapshot and view
+    /// state. Cheap to call; every mutation that can reorder or resize the
+    /// Kube table must call it, or the table and the selection bounds drift
+    /// apart.
+    fn recompute_kube_view(&mut self) {
+        let indices = match self.last_snapshot.as_ref().and_then(|s| s.kube.as_ref()) {
+            Some(snap) => crate::ui::kube::compute_view_indices(
+                snap,
+                self.kube_subview,
+                &self.kube_filter_input,
+                self.kube_sort_field,
+                self.kube_sort_order,
+            ),
+            None => Vec::new(),
         };
-        let f = self.kube_filter_input.to_lowercase();
-        match self.kube_subview {
-            KubeSubview::Pods => snap
-                .pods
-                .iter()
-                .filter(|p| {
-                    f.is_empty()
-                        || p.name.to_lowercase().contains(&f)
-                        || p.namespace.to_lowercase().contains(&f)
-                })
-                .count(),
-            KubeSubview::Nodes => snap
-                .nodes
-                .iter()
-                .filter(|n| f.is_empty() || n.name.to_lowercase().contains(&f))
-                .count(),
-            KubeSubview::Deployments => snap
-                .deployments
-                .iter()
-                .filter(|d| {
-                    f.is_empty()
-                        || d.name.to_lowercase().contains(&f)
-                        || d.namespace.to_lowercase().contains(&f)
-                })
-                .count(),
-        }
+        self.kube_view_cache = indices;
     }
 
     /// Count of rows rendered in the active GPU sub-view AFTER the filter is
@@ -1253,6 +1253,8 @@ impl AppState {
         self.kube_filter_active = false;
         self.kube_selected = 0;
         self.kube_scroll_offset = 0;
+        // The indices now point into a different list entirely.
+        self.recompute_kube_view();
     }
 
     /// Returns the currently selected process, if any.
@@ -1516,6 +1518,9 @@ impl AppState {
         // PERF-H4: refresh the cached sorted+filtered container view exactly
         // once per snapshot; render and action paths read this slice.
         self.recompute_containers_view();
+        // PERF-03: same contract for the Kube tab — the cached view must
+        // never outlive the snapshot it indexes into.
+        self.recompute_kube_view();
         // PERF-H1: a fresh snapshot always changes what we'd paint.
         self.mark_dirty();
     }
@@ -1972,7 +1977,8 @@ impl AppState {
     fn after_filter_change(&mut self, immediate: bool) {
         match self.tab {
             Tab::Containers => self.recompute_containers_view(),
-            Tab::Kube | Tab::Gpu | Tab::Network => {}
+            Tab::Kube => self.recompute_kube_view(),
+            Tab::Gpu | Tab::Network => {}
             _ => {
                 if immediate {
                     self.last_filter_change = None;
@@ -2036,6 +2042,7 @@ impl AppState {
                     next_kube_sort_field(self.kube_sort_field, self.kube_subview);
                 self.kube_selected = 0;
                 self.kube_scroll_offset = 0;
+                self.recompute_kube_view();
             }
             Tab::Gpu => {
                 self.gpu_sort_field = next_gpu_sort_field(self.gpu_sort_field, self.gpu_subview);
@@ -2060,7 +2067,10 @@ impl AppState {
                 self.containers_sort_order = flip(self.containers_sort_order);
                 self.recompute_containers_view();
             }
-            Tab::Kube => self.kube_sort_order = flip(self.kube_sort_order),
+            Tab::Kube => {
+                self.kube_sort_order = flip(self.kube_sort_order);
+                self.recompute_kube_view();
+            }
             Tab::Gpu => self.gpu_sort_order = flip(self.gpu_sort_order),
             _ => {
                 self.sort_order = flip(self.sort_order);
@@ -2107,31 +2117,20 @@ impl AppState {
     }
 
     /// Name of the selected Kubernetes object, whichever sub-view is active.
+    ///
+    /// Reads the same cache the table renders from. The previous version
+    /// re-derived the filtered list here and took `nth(kube_selected)` from
+    /// it — but `kube_selected` indexes the *sorted* order, so with any sort
+    /// active this returned a different object than the one highlighted on
+    /// screen. Sharing one projection makes that impossible rather than
+    /// merely fixed.
     fn selected_kube_name(&self) -> Option<String> {
         let snap = self.last_snapshot.as_ref()?.kube.as_ref()?;
-        let f = self.kube_filter_input.to_lowercase();
-        let matches = |name: &str, ns: &str| {
-            f.is_empty() || name.to_lowercase().contains(&f) || ns.to_lowercase().contains(&f)
-        };
+        let &idx = self.kube_view_cache.get(self.kube_selected)?;
         match self.kube_subview {
-            KubeSubview::Pods => snap
-                .pods
-                .iter()
-                .filter(|p| matches(&p.name, &p.namespace))
-                .nth(self.kube_selected)
-                .map(|p| p.name.clone()),
-            KubeSubview::Nodes => snap
-                .nodes
-                .iter()
-                .filter(|n| matches(&n.name, ""))
-                .nth(self.kube_selected)
-                .map(|n| n.name.clone()),
-            KubeSubview::Deployments => snap
-                .deployments
-                .iter()
-                .filter(|d| matches(&d.name, &d.namespace))
-                .nth(self.kube_selected)
-                .map(|d| d.name.clone()),
+            KubeSubview::Pods => snap.pods.get(idx).map(|p| p.name.clone()),
+            KubeSubview::Nodes => snap.nodes.get(idx).map(|n| n.name.clone()),
+            KubeSubview::Deployments => snap.deployments.get(idx).map(|d| d.name.clone()),
         }
     }
 
@@ -4563,6 +4562,124 @@ mod tests {
 
     // ─── Container actions (E6) ───────────────────────────────────────────
 
+    // -- PERF-03: Kube view cache --
+
+    /// Snapshot carrying `pod_names` as `(namespace, name, cpu_millis)`.
+    fn snapshot_with_pods(pods: &[(&str, &str, u32)]) -> muxtop_core::system::SystemSnapshot {
+        use muxtop_core::kube::{ClusterKind, KubeSnapshot, PodPhase, PodSnapshot, QosClass};
+        let mut snap = make_snapshot_with_container("c-id", "ctr");
+        snap.kube = Some(std::sync::Arc::new(KubeSnapshot {
+            cluster_kind: ClusterKind::Generic,
+            server_version: None,
+            current_namespace: "default".into(),
+            reachable: true,
+            metrics_available: true,
+            pods: pods
+                .iter()
+                .map(|(ns, name, cpu)| PodSnapshot {
+                    namespace: (*ns).into(),
+                    name: (*name).into(),
+                    phase: PodPhase::Running,
+                    ready: (1, 1),
+                    restarts: 0,
+                    age_seconds: 60,
+                    node: "node-1".into(),
+                    cpu_millis: Some(*cpu),
+                    mem_bytes: Some(1024),
+                    qos: QosClass::BestEffort,
+                })
+                .collect(),
+            nodes: Vec::new(),
+            deployments: Vec::new(),
+        }));
+        snap
+    }
+
+    /// The cache feeds both the table and the scroll bounds, so it has to
+    /// track the snapshot exactly — a stale cache shows rows that no longer
+    /// exist or hides ones that do.
+    #[test]
+    fn test_kube_view_cache_follows_the_snapshot() {
+        let mut app = AppState::new();
+        app.tab = Tab::Kube;
+        assert_eq!(app.kube_count(), 0, "no snapshot yet");
+
+        app.apply_snapshot(snapshot_with_pods(&[
+            ("default", "nginx-1", 100),
+            ("kube-system", "coredns", 50),
+        ]));
+        assert_eq!(app.kube_count(), 2);
+
+        // A shrinking cluster must shrink the cache, or j/k would scroll past
+        // the end of the list.
+        app.apply_snapshot(snapshot_with_pods(&[("default", "nginx-1", 100)]));
+        assert_eq!(app.kube_count(), 1);
+    }
+
+    /// Typing a filter is the hottest path through the cache.
+    #[test]
+    fn test_kube_filter_refreshes_the_cache() {
+        let mut app = AppState::new();
+        app.tab = Tab::Kube;
+        app.apply_snapshot(snapshot_with_pods(&[
+            ("default", "nginx-1", 100),
+            ("kube-system", "coredns", 50),
+        ]));
+
+        app.set_filter("nginx");
+        assert_eq!(app.kube_count(), 1, "filter should narrow the view");
+
+        // PERF-03 swapped to_lowercase()-per-row for contains_ignore_case;
+        // matching must stay case-insensitive.
+        app.set_filter("NGINX");
+        assert_eq!(app.kube_count(), 1, "matching must ignore case");
+
+        app.clear_filter();
+        assert_eq!(app.kube_count(), 2, "clearing restores every row");
+    }
+
+    /// Switching sub-views repoints the indices at a different list, so a
+    /// carried-over cache would index the wrong collection.
+    #[test]
+    fn test_kube_subview_switch_rebuilds_the_cache() {
+        let mut app = AppState::new();
+        app.tab = Tab::Kube;
+        app.apply_snapshot(snapshot_with_pods(&[("default", "nginx-1", 100)]));
+        assert_eq!(app.kube_count(), 1);
+
+        // The fixture has no nodes; the count must follow the new sub-view.
+        app.switch_kube_subview(KubeSubview::Nodes);
+        assert_eq!(app.kube_count(), 0);
+
+        app.switch_kube_subview(KubeSubview::Pods);
+        assert_eq!(app.kube_count(), 1);
+    }
+
+    /// Regression: `kube_selected` indexes the *sorted* order, but the old
+    /// `selected_kube_name` re-derived an unsorted filtered list and took the
+    /// nth element — so with a sort active it named a different object than
+    /// the one highlighted on screen.
+    #[test]
+    fn test_selected_kube_name_matches_the_sorted_row() {
+        let mut app = AppState::new();
+        app.tab = Tab::Kube;
+        // List order is alphabetical; CPU order is the reverse.
+        app.apply_snapshot(snapshot_with_pods(&[
+            ("default", "alpha", 10),
+            ("default", "bravo", 500),
+        ]));
+        app.kube_sort_field = KubeSortField::PodCpu;
+        app.kube_sort_order = SortOrder::Desc;
+        app.recompute_kube_view();
+
+        app.kube_selected = 0;
+        assert_eq!(
+            app.selected_kube_name().as_deref(),
+            Some("bravo"),
+            "row 0 under CPU-desc is the busiest pod, not the first in list order"
+        );
+    }
+
     fn make_snapshot_with_container(id: &str, name: &str) -> muxtop_core::system::SystemSnapshot {
         use muxtop_core::containers::{
             ContainerSnapshot, ContainerState, ContainersSnapshot, EngineKind,
@@ -4594,7 +4711,7 @@ mod tests {
                 total_rx: 0,
                 total_tx: 0,
             },
-            containers: Some(ContainersSnapshot {
+            containers: Some(std::sync::Arc::new(ContainersSnapshot {
                 engine: EngineKind::Docker,
                 daemon_up: true,
                 containers: vec![ContainerSnapshot {
@@ -4613,7 +4730,7 @@ mod tests {
                     block_write_bytes: 0,
                     started_at_ms: 1_700_000_000_000,
                 }],
-            }),
+            })),
             kube: None,
             gpu: None,
             timestamp_ms: 1_700_000_000_000,
@@ -4822,7 +4939,8 @@ mod tests {
         // Two containers with different CPU values so Cpu desc and Mem desc
         // produce opposite orderings.
         let mut snap = make_snapshot_with_container("a-id", "alpha");
-        if let Some(cs) = snap.containers.as_mut() {
+        // Sole owner at this point, so `make_mut` mutates in place.
+        if let Some(cs) = snap.containers.as_mut().map(std::sync::Arc::make_mut) {
             cs.containers[0].cpu_pct = 1.0;
             cs.containers[0].mem_used_bytes = 9_000;
             cs.containers

@@ -321,11 +321,11 @@ mod tests {
             .collect();
 
         let mut snap = snapshot();
-        snap.containers = Some(ContainersSnapshot {
+        snap.containers = Some(std::sync::Arc::new(ContainersSnapshot {
             engine: EngineKind::Docker,
             daemon_up,
             containers,
-        });
+        }));
         let mut app = AppState::new();
         app.tab = Tab::Containers;
         app.apply_snapshot(snap);

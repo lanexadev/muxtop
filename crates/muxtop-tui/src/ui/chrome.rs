@@ -14,6 +14,7 @@ use ratatui::widgets::Paragraph;
 use crate::app::{AppState, Tab};
 use crate::keymap;
 use crate::ui::Render;
+use crate::ui::sanitize::scrub_ctrl;
 use crate::ui::widgets::{meter, scrollbar};
 
 /// Width below which the header and tab bar are merged into a single row.
@@ -105,8 +106,13 @@ fn connection_spans(r: &Render<'_>) -> Vec<Span<'static>> {
                     .fg(theme.accent_secondary)
                     .bg(theme.header_bg),
             ),
+            // The hostname arrives in the server's `Welcome` frame. A hostile
+            // or compromised server — or merely a host whose $HOSTNAME a local
+            // user controls — would otherwise own a line of chrome that stays
+            // on screen for the whole session. Same guard the table cells got
+            // in v0.3.1 (MED-S5).
             Span::styled(
-                format!("{hostname}:{} ", addr.port()),
+                format!("{}:{} ", scrub_ctrl(hostname), addr.port()),
                 ratatui::style::Style::default()
                     .fg(theme.accent_secondary)
                     .bg(theme.header_bg),
