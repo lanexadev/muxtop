@@ -1,5 +1,9 @@
 pub mod actions;
 pub mod amd_engine;
+/// Apple Silicon backend. The FFI half is gated to macOS inside the module;
+/// the derivations stay compiled everywhere so their tests run on every CI
+/// target.
+pub mod apple;
 pub mod cluster_engine;
 pub mod collector;
 pub mod container_engine;
@@ -19,6 +23,8 @@ pub mod process;
 pub mod system;
 
 pub use actions::Signal;
+#[cfg(target_os = "macos")]
+pub use apple::AppleEngine;
 pub use cluster_engine::{
     ClusterEngine, ClusterError, KubeconfigSource, detect_kubeconfig, detect_kubeconfig_with,
 };

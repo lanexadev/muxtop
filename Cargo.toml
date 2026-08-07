@@ -29,6 +29,14 @@ sysinfo = "0.38"
 # NVIDIA driver. Target-gated in muxtop-core: NVML has no macOS build.
 nvml-wrapper = "0.12"
 
+# Apple Silicon GPU telemetry (v0.7). Target-gated in muxtop-core to macOS:
+# `core-foundation` wraps the Core Foundation types IOKit exchanges, and
+# `libloading` resolves the private IOReport symbols at runtime so the binary
+# still starts on a macOS release that has moved them.
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+libloading = "0.8"
+
 # TUI
 ratatui = "0.30"
 crossterm = "0.29"

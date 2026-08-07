@@ -1,7 +1,7 @@
-//! Criterion benchmarks for the v0.5 GPU pipeline.
+//! Criterion benchmarks for the GPU pipeline.
 //!
-//! Two things are worth measuring, and neither is the vendor query itself —
-//! that one is dominated by the driver and cannot be benchmarked
+//! Three things are worth measuring, and none of them is the vendor query
+//! itself — that one is dominated by the driver and cannot be benchmarked
 //! deterministically on a CI runner with no GPU:
 //!
 //! 1. **`CompositeGpuEngine` merge** — runs on every 1 Hz tick and is the
@@ -11,6 +11,8 @@
 //!    inference workers is the shape to hold the line on.
 //! 2. **`resolve_process_names`** — called from `SystemSnapshot::collect`
 //!    once per tick, on the same thread that builds the process table.
+//! 3. **The Apple Silicon derivations** (v0.7) — the residency-weighted clock
+//!    and the DVFS decode, the only arithmetic that backend adds to the tick.
 //!
 //! Run with:
 //!
@@ -23,6 +25,7 @@ use std::sync::Arc;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
+use muxtop_core::apple::metrics::{parse_dvfs_table, residency_weighted_clock_mhz};
 use muxtop_core::gpu::{
     GpuBackend, GpuDeviceSnapshot, GpuProcessKind, GpuProcessSnapshot, GpuVendor, GpusSnapshot,
 };
@@ -157,5 +160,65 @@ fn bench_resolve_process_names(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_composite_merge, bench_resolve_process_names);
+/// Apple Silicon's derivations (v0.7).
+///
+/// The other two benchmarks measure the merge; this one measures the only
+/// arithmetic the Apple backend adds to the tick. Both functions run once per
+/// second over a state array the hardware sizes (sixteen slots on an M3), so
+/// the absolute numbers should be negligible — the point is to notice if they
+/// ever stop being. Neither needs macOS, which is why `apple::metrics` is not
+/// `cfg`-gated.
+fn bench_apple_metrics(c: &mut Criterion) {
+    // The M3's table: a parked entry plus thirteen active states.
+    let table: Vec<u32> = vec![
+        0, 338, 618, 796, 836, 928, 952, 1056, 1053, 1170, 1152, 1278, 1204, 1338,
+    ];
+    // A realistic interval: mostly parked, some time spread over the low
+    // states, and the padding slots the channel reports but the chip never
+    // enters.
+    let residencies: Vec<(String, u64)> = [
+        ("OFF", 23_278_273u64),
+        ("P1", 877_127),
+        ("P2", 50_129),
+        ("P3", 151_952),
+        ("P5", 14_825),
+        ("P14", 0),
+        ("P15", 0),
+    ]
+    .iter()
+    .map(|(n, t)| ((*n).to_string(), *t))
+    .collect();
+
+    c.bench_function("apple_clock/16_states", |b| {
+        b.iter(|| {
+            black_box(residency_weighted_clock_mhz(
+                black_box(&residencies),
+                black_box(&table),
+            ))
+        });
+    });
+
+    c.bench_function("apple_dvfs_parse/14_states", |b| {
+        b.iter(|| black_box(parse_dvfs_table(black_box(M3_DVFS_BLOB))));
+    });
+}
+
+/// `voltage-states9` as read from a MacBook Air M3 — the same fixture the unit
+/// tests use, so the two cannot drift apart on what a real table looks like.
+const M3_DVFS_BLOB: &[u8] = &[
+    0x00, 0x00, 0x00, 0x00, 0x7d, 0x00, 0x00, 0x00, 0x80, 0x78, 0x25, 0x14, 0x71, 0x02, 0x00, 0x00,
+    0x80, 0xee, 0xd5, 0x24, 0xa8, 0x02, 0x00, 0x00, 0x00, 0xff, 0x71, 0x2f, 0xd5, 0x02, 0x00, 0x00,
+    0x00, 0x59, 0xd4, 0x31, 0xfd, 0x02, 0x00, 0x00, 0x00, 0x28, 0x50, 0x37, 0xfd, 0x02, 0x00, 0x00,
+    0x00, 0x5e, 0xbe, 0x38, 0x2f, 0x03, 0x00, 0x00, 0x00, 0x48, 0xf1, 0x3e, 0x2f, 0x03, 0x00, 0x00,
+    0x40, 0x81, 0xc3, 0x3e, 0x6b, 0x03, 0x00, 0x00, 0x80, 0xc8, 0xbc, 0x45, 0x6b, 0x03, 0x00, 0x00,
+    0x00, 0x20, 0xaa, 0x44, 0x93, 0x03, 0x00, 0x00, 0x80, 0xbb, 0x2c, 0x4c, 0x93, 0x03, 0x00, 0x00,
+    0x00, 0x95, 0xc3, 0x47, 0xac, 0x03, 0x00, 0x00, 0x80, 0x42, 0xc0, 0x4f, 0xac, 0x03, 0x00, 0x00,
+];
+
+criterion_group!(
+    benches,
+    bench_composite_merge,
+    bench_resolve_process_names,
+    bench_apple_metrics
+);
 criterion_main!(benches);

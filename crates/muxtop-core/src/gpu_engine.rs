@@ -3,7 +3,8 @@
 //! platform detection chain.
 //!
 //! This module defines the interface and the composition; the concrete
-//! backends live in `nvml_engine.rs` (NVIDIA) and `amd_engine.rs` (AMD).
+//! backends live in `nvml_engine.rs` (NVIDIA), `amd_engine.rs` (AMD) and
+//! `apple/` (Apple Silicon).
 //!
 //! # Why a composite rather than one engine per tab
 //!
@@ -29,7 +30,9 @@
 //! [`detect_gpu_engines`] tries, per platform:
 //! * **Linux** — NVML, then AMD sysfs. Both may succeed.
 //! * **Windows** — NVML only (`amdgpu` sysfs is a Linux interface).
-//! * **macOS** — nothing yet; see [`APPLE_DEFERRED_DETAIL`].
+//! * **macOS** — Apple Silicon via IOKit and `IOReport` (v0.7). NVML has no
+//!   macOS build and `amdgpu` is a Linux interface, so this is the only
+//!   backend there.
 //!
 //! Detection never fails: when no backend initialises it returns a
 //! [`NullGpuEngine`] carrying the reason, so the UI can explain *why* the tab
@@ -42,17 +45,20 @@ use thiserror::Error;
 
 use crate::gpu::{GpuBackend, GpusSnapshot};
 
-/// Message shown on macOS until the Apple Silicon backend lands.
+/// Message shown on a Mac with no GPU this build can read.
 ///
-/// Apple exposes no public API for GPU counters: the figures `powermetrics`
-/// prints come from the private `IOReport` framework, and the tool itself
-/// requires root. Shipping that in v0.5 would have meant either a private
-/// framework dependency or asking every macOS user to run muxtop as root —
-/// neither fits a tool whose entire premise is that it stays out of the way.
-/// It is scheduled for **v0.6**, not abandoned.
-pub const APPLE_DEFERRED_DETAIL: &str = "Apple Silicon GPU monitoring is not implemented yet — planned for v0.6 \
-     (macOS exposes GPU counters only through the private IOReport framework, \
-     which needs root)";
+/// v0.5 and v0.6 shipped a deferral message here instead of a backend, on the
+/// premise that macOS exposes GPU counters only through `IOReport` and that
+/// `IOReport` needs root because `powermetrics` does. Neither held up: the
+/// driver publishes utilisation and memory in the IORegistry through public
+/// IOKit calls, and the `IOReport` channels muxtop subscribes to are readable
+/// unprivileged. v0.7 reads both — see the `apple` module.
+///
+/// What remains unsupported on macOS is an **Intel** Mac: its AMD or Intel GPU
+/// answers the same `IOAccelerator` match with a differently shaped statistics
+/// dictionary, and no muxtop backend decodes that.
+pub const MACOS_UNSUPPORTED_GPU_DETAIL: &str = "no Apple Silicon GPU on this Mac — muxtop's macOS backend does not cover \
+     the AMD or Intel GPU in an Intel Mac";
 
 /// Errors raised by a [`GpuEngine`] implementation.
 ///
@@ -112,8 +118,8 @@ pub trait GpuEngine: Send + Sync {
 /// An engine that sees nothing, and knows why.
 ///
 /// Returned by [`detect_gpu_engines`] when no vendor backend initialises, so
-/// the "no GPU" state carries an explanation ("no NVIDIA driver loaded",
-/// "Apple Silicon lands in v0.6") instead of a bare placeholder. Keeping an
+/// the "no GPU" state carries an explanation ("no NVIDIA driver loaded", "no
+/// Apple Silicon GPU on this Mac") instead of a bare placeholder. Keeping an
 /// engine present rather than returning `None` also means the collector needs
 /// no special case.
 pub struct NullGpuEngine {
@@ -247,18 +253,16 @@ impl GpuEngine for CompositeGpuEngine {
 /// [`NullGpuEngine`] carrying the reason. Callers that want the tab disabled
 /// entirely (`--no-gpu`) pass `None` to the collector instead of calling this.
 pub fn detect_gpu_engines() -> Arc<dyn GpuEngine + Send + Sync> {
-    // `mut` is genuinely unused on platforms where no backend is compiled in
-    // (macOS today — see `APPLE_DEFERRED_DETAIL`). Darwin is in the release
-    // matrix, so it has to compile warning-free.
     let mut backends: Vec<Arc<dyn GpuEngine + Send + Sync>> = Vec::new();
     let mut reasons: Vec<String> = Vec::new();
 
-    // Both bindings are passed by `&mut` unconditionally, which is what keeps
-    // this warning-free on a target where every backend is `cfg`-ed out (macOS
-    // today). Doing the probing inline would leave `backends` never mutated
-    // there and trip `unused_mut` — a warning that only appears on a platform
-    // this machine cannot compile for, which is exactly how the v0.4.2 Windows
-    // break survived two releases.
+    // Both bindings are passed by `&mut` unconditionally, through a helper,
+    // rather than being probed inline. Every target in the release matrix now
+    // compiles at least one backend, but a target where they were all
+    // `cfg`-ed out would leave `backends` never mutated and trip `unused_mut`
+    // — a warning that appears on one platform only, which is exactly how the
+    // v0.4.2 Windows break survived two releases. The indirection costs
+    // nothing and removes the class of bug.
     probe_platform_backends(&mut backends, &mut reasons);
 
     if backends.is_empty() {
@@ -279,10 +283,10 @@ fn probe_platform_backends(
     backends: &mut Vec<Arc<dyn GpuEngine + Send + Sync>>,
     reasons: &mut Vec<String>,
 ) {
-    // Unconditional, and deliberately not `cfg`-ed: on macOS every block below
-    // that touches `backends` is compiled out, which would make it an unused
-    // parameter. Guarding this with a `cfg` would mean getting the platform
-    // list exactly right for a warning no machine here can reproduce.
+    // Unconditional, and deliberately not `cfg`-ed: on a target where every
+    // block below is compiled out both parameters would go unused. Guarding
+    // this with a `cfg` would mean getting the platform list exactly right for
+    // a warning no machine here can reproduce.
     let _ = (&backends, &reasons);
 
     #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -315,7 +319,16 @@ fn probe_platform_backends(
 
     #[cfg(target_os = "macos")]
     {
-        reasons.push(APPLE_DEFERRED_DETAIL.to_string());
+        match crate::apple::AppleEngine::connect() {
+            Ok(engine) => {
+                tracing::info!(target: "muxtop::gpu", "Apple Silicon backend initialised");
+                backends.push(Arc::new(engine));
+            }
+            Err(err) => {
+                tracing::debug!(target: "muxtop::gpu", error = %err, "Apple backend unavailable");
+                reasons.push(err.to_string());
+            }
+        }
     }
 }
 
@@ -436,7 +449,7 @@ mod tests {
                 path: "/sys/class/drm/card0/device/gpu_busy_percent".into(),
                 reason: "permission denied".into(),
             },
-            GpuError::Unsupported(APPLE_DEFERRED_DETAIL),
+            GpuError::Unsupported(MACOS_UNSUPPORTED_GPU_DETAIL),
         ];
         for err in &variants {
             assert!(!format!("{err}").is_empty(), "empty Display for {err:?}");
@@ -444,7 +457,7 @@ mod tests {
         assert!(format!("{}", variants[1]).contains("libnvidia-ml.so"));
         assert!(format!("{}", variants[1]).contains("NVIDIA"));
         assert!(format!("{}", variants[3]).contains("gpu_busy_percent"));
-        assert!(format!("{}", variants[4]).contains("v0.6"));
+        assert!(format!("{}", variants[4]).contains("Intel Mac"));
     }
 
     // ---- NullGpuEngine ----------------------------------------------------
@@ -677,10 +690,44 @@ mod tests {
     }
 
     #[test]
-    fn apple_detail_names_the_target_version() {
-        // The roadmap promises v0.6; the user-visible string must agree with
-        // it, otherwise the deferral reads as an abandonment.
-        assert!(APPLE_DEFERRED_DETAIL.contains("v0.6"));
-        assert!(APPLE_DEFERRED_DETAIL.contains("IOReport"));
+    fn macos_detail_says_which_macs_are_covered() {
+        // The predecessor of this string promised the backend "in v0.6" and
+        // was still saying so after v0.6 shipped without it. A message naming
+        // what is *supported* rather than what is *scheduled* cannot go stale
+        // the same way — and it has to say which Macs are out of scope, since
+        // an Intel Mac user seeing an empty tab has no other clue.
+        assert!(MACOS_UNSUPPORTED_GPU_DETAIL.contains("Apple Silicon"));
+        assert!(MACOS_UNSUPPORTED_GPU_DETAIL.contains("Intel Mac"));
+        assert!(
+            !MACOS_UNSUPPORTED_GPU_DETAIL.contains("v0."),
+            "a user-visible string must not name a release it will outlive"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_detection_produces_an_apple_backend_or_says_why_not() {
+        // Runs on the macOS CI leg and on any developer's Mac. It asserts the
+        // contract rather than a value, so it holds on an Apple Silicon host
+        // (a device is found) and on an Intel one (a reason is given).
+        let engine = detect_gpu_engines();
+        let snap = engine.snapshot().await.expect("detection must not error");
+
+        if snap.available {
+            let device = snap.devices.first().expect("available implies a device");
+            assert_eq!(device.vendor, GpuVendor::Apple);
+            assert_eq!(device.backend, GpuBackend::AppleIoReport);
+            assert!(!device.name.is_empty(), "a device must be nameable");
+            assert!(
+                !device.supports_process_stats,
+                "Apple publishes no per-process GPU accounting"
+            );
+        } else {
+            assert!(
+                snap.detail.contains("Apple") || snap.detail.contains("IOAccelerator"),
+                "an empty macOS GPU tab must explain itself: {}",
+                snap.detail
+            );
+        }
     }
 }
