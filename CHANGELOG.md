@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-07
+
+Security and performance release over the Kubernetes surface, plus one
+structural defect in the v0.3.1 rate limiter.
+
+**Minor bump, not patch.** `SystemSnapshot::{containers, kube}` change type, which
+breaks the source API of `muxtop-core` — permitted under Cargo's 0.x rules only on
+a minor bump. The wire format is unchanged and covered by a round-trip test, so a
+v0.6.0 client and server interoperate byte-for-byte with each other; a mixed
+v0.5/v0.6 pair does not, for the reasons already documented in v0.4.0 and v0.5.0.
+
 ### Security
 
 - **Rate-limiter memory is now bounded** (`muxtop-server`). The per-IP token-bucket map created an entry for every source address ever seen — including the ones it *rejected* — and never removed any, so an attacker with a routed IPv6 prefix could grow it until the process was OOM killed. The component meant to stop a flood was itself the target, and it is on by default. Idle buckets are now evicted on an amortised sweep: a bucket refilled back to `burst` admits exactly what an absent entry would, so dropping it is behaviour-preserving, and buckets reach that state after `burst / refill_per_sec` seconds (1 s at the defaults). Sweeps run at most once per second so the O(n) scan cannot be triggered per connection; `MAX_TRACKED_IPS` (65 536) is a last-resort ceiling past which unknown sources are rejected while already-tracked ones keep their budget.
