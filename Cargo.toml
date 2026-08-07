@@ -64,7 +64,7 @@ criterion = { version = "0.8", features = ["html_reports"] }
 # `rc` lets Serialize/Deserialize see through the `Arc`s on
 # `SystemSnapshot`'s container and cluster fields (PERF-02).
 serde = { version = "1", features = ["derive", "rc"] }
-bincode = "2"
+bincode = "3"
 
 # Async trait (dyn-safe async fn in trait — see ADR-01 in forge/24)
 async-trait = "0.1"
