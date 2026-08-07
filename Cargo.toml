@@ -22,7 +22,7 @@ rust-version = "1.88"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time", "net", "io-util"] }
 
 # System information
-sysinfo = "0.34"
+sysinfo = "0.38"
 
 # NVIDIA GPU telemetry (v0.5). Loads libnvidia-ml.so / nvml.dll dynamically at
 # runtime via libloading, so muxtop builds and runs unchanged on hosts with no
