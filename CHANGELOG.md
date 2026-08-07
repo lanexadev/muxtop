@@ -7,6 +7,122 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+#### Apple Silicon GPU support (`muxtop-core`, `muxtop-tui`)
+
+The GPU tab works on an Apple Silicon Mac. It was scheduled for v0.5, deferred
+to v0.6, and shipped in neither — the deferral rested on a premise that does not
+hold.
+
+**The v0.5 reasoning was wrong, and it is worth saying how.** The release notes
+argued that macOS exposes GPU counters only through the private `IOReport`
+framework, and that `IOReport` needs root because `powermetrics` does. Both
+halves are false. The GPU driver publishes utilisation and memory in the
+IORegistry through documented IOKit calls any user can make — it is where
+Activity Monitor's own GPU graph comes from — and the `IOReport` energy and
+performance-state channels are readable unprivileged. `powermetrics` needs root
+because it reads channels muxtop never subscribes to. Two releases of an empty
+tab came out of not checking.
+
+**No wire-protocol break.** `GpuVendor::Apple` and `GpuBackend::AppleIoReport`
+have been in the model since v0.5 precisely so this would be additive, so a
+v0.7 client and a v0.6 server still disagree only on the versions already
+documented in v0.4.0 and v0.5.0 — this release adds nothing to that list.
+
+- **Layered, not all-or-nothing.** `IOAccelerator` (public IOKit) gives the
+  device name, GPU core count, driver build, utilisation and memory;
+  `IOReport` (private, `dlopen`ed at runtime like NVML) adds power and clock. A
+  macOS release that renames the `IOReport` symbols costs the POWER and CLOCK
+  columns and nothing else — the tab keeps working on the public half alone.
+- **Power** is derived from the `GPU Energy` counter over the real interval
+  between two samples, not an assumed second. The unit travels with the value
+  because it is per-channel metadata rather than a constant: the same M3 reports
+  `GPU Energy` in nanojoules and `GPU` in millijoules, and hard-coding either
+  would be off by a factor of a million on the other. The two agree to within
+  rounding, which is how the conversion was checked.
+- **Clock** is the residency-weighted average over the states the GPU actually
+  ran in, from the hardware DVFS residency channel against the `voltage-states9`
+  table. The parked state is excluded from the average: a GPU that spent 90 % of
+  the second clock-gated and 10 % at 1 338 MHz was running at 1 338 MHz when it
+  ran, and folding the zero in would report a clock the hardware never used.
+- **The DVFS table is treated as untrusted input.** It is an undocumented
+  device-tree blob, and that index 9 is the GPU's is an observation about M1
+  through M4, not a contract. A blob that is not a whole number of `(Hz, mV)`
+  pairs, or that decodes to an impossible clock, is rejected outright — as is a
+  performance state the table cannot name *and* that accumulated time. Losing
+  the CLK column on a future chip is recoverable; printing an invented clock
+  next to real numbers is not.
+- **Unified memory is not VRAM, and the tab no longer says it is.** The GPU
+  addresses the same physical pool as the CPU, so the memory column header reads
+  **MEM** on an Apple Silicon host and the Inspector says "Unified memory". The
+  figures are the driver's GPU-resident bytes against the machine's whole
+  memory: 2 GB of 16 GB reads 12 %, with the CPU competing for the rest.
+  Discrete cards keep the VRAM wording, which on them is accurate.
+- **Apple Silicon only.** `IOAccelerator` is the generic accelerator class, so
+  an Intel Mac's AMD or Intel GPU answers the same match with a differently
+  shaped statistics dictionary. Detection requires Apple's own `AGX` driver
+  family and the empty tab explains itself, rather than showing a row labelled
+  Apple that reports nothing.
+- The `apple/metrics.rs` derivations — DVFS decode, residency weighting, energy
+  units — are deliberately **not** `cfg`-gated, so their tests run on the Linux
+  and Windows CI legs too. Only the FFI is gated. This is the same rule
+  `amd_engine` follows, and for the same reason: the v0.4.2 Windows break
+  survived two releases because one leg never compiled that code.
+
+### Honest limitations
+
+Held to the same contract as every other backend — **`—` means "cannot report",
+never "zero"**.
+
+- **No per-process usage.** There is no Apple equivalent of NVML's process
+  queries, public or private. The Procs sub-view says so explicitly, as it does
+  for AMD, instead of rendering an empty list that reads as an idle GPU.
+- **No GPU temperature.** The `GPU Stats / Temperature` channels exist in the
+  `IOReport` legend and read zero for an unprivileged process on every machine
+  tested. A confident 0 °C on a warm laptop would be worse than a dash.
+- **No power limit, no fan, no encoder/decoder.** The SoC power budget is shared
+  with the CPU and managed by firmware, cooling is chassis-wide rather than
+  per-GPU (a MacBook Air has none at all), and the media engine publishes no
+  utilisation counter.
+- **Power and clock are `—` for the first tick.** Both are counters, not gauges:
+  they are only defined over an interval. The baseline is taken on the first
+  collector tick rather than at connect time — the gap between connecting and
+  the first tick is unbounded and can be a millisecond, and dividing an energy
+  counter by a millisecond produces a number with no relationship to the GPU's
+  power draw. One tick of `—` buys a real one-second window.
+
+### Changed
+
+- **Sub-watt power no longer rounds away to `0W`** (`muxtop-tui`). Whole watts
+  are right for a discrete card that idles in the tens and peaks in the
+  hundreds; they are wrong for an Apple GPU idling under a tenth of a watt,
+  where `0W` claims a powered-off block. Figures below 10 W now carry one
+  decimal. Discrete cards are unaffected.
+- **An empty bus id renders as `—`** in the Inspector (`muxtop-tui`). Apple
+  Silicon's GPU is on the SoC die and has no PCI bus to report; the blank cell
+  read as a rendering bug rather than as an absent value.
+- The macOS "no GPU" message names what is *supported* rather than what is
+  *scheduled*. Its predecessor promised the backend "in v0.6" and was still
+  saying so after v0.6 shipped without it; a test now fails if the string names
+  a release at all.
+
+### API
+
+Source-breaking for consumers of `muxtop-core` outside this workspace, which
+under Cargo's 0.x rules means this release takes a **minor** bump rather than a
+patch. The wire format is untouched.
+
+- `muxtop_core::gpu_engine::APPLE_DEFERRED_DETAIL` is removed. Its replacement
+  is `MACOS_UNSUPPORTED_GPU_DETAIL`, which describes an unsupported *host* (an
+  Intel Mac) rather than an unshipped release.
+- New `muxtop_core::apple` module. `AppleEngine` is re-exported at the crate
+  root on macOS targets; `apple::metrics` is public on every target so the
+  derivations can be tested and reused.
+- New macOS-only dependencies: `core-foundation`, `core-foundation-sys` and
+  `libloading`. All three are target-gated, so no other platform's dependency
+  graph or binary size changes.
+
 ### Fixed
 
 - **Processes no longer disappear from the tree view** (`muxtop-core`). `build_process_tree` reached every node from a root, and a process only qualified as a root if its `parent_pid` was absent, `0`, or missing from the snapshot. A group of processes listed as each other's ancestors satisfies none of those, so the whole group — and every subtree hanging off it — was unreachable and silently dropped. `parent_pid` is only what the OS reported at sample time, and PIDs get recycled: a dead parent's PID reappearing on one of its own descendants is enough to close such a loop, which is why this surfaced on Windows first (a CI run flattened 13 of 143 processes). The walk now marks what it has placed and re-roots whatever it could not reach, so `flatten_tree(&build_process_tree(p))` holds every process exactly once. The same pass fixes the `MAX_DEPTH` cut-off, which had been dropping the tail of any chain deeper than 256 rather than re-rooting it.
