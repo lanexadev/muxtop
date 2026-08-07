@@ -125,7 +125,8 @@ replace the archive can replace the `.sha256` beside it. See
 
 | | |
 |---|---|
-| **v0.7** | Apple Silicon GPU support (IOKit + `IOReport`, no root), interactive `docker exec` with a PTY |
+| **v0.7** ✓ | Apple Silicon GPU support (IOKit + `IOReport`, no root) |
+| **v0.8** | Interactive `docker exec` with a PTY |
 | **v1.0** | WASM plugin system, user themes, configuration file |
 
 The [README roadmap](https://github.com/lucasschimmel/muxtop#roadmap) is

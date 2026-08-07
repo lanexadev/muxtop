@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-08
+
+Feature release: the GPU tab on **Apple Silicon**. Utilisation and memory come
+from the IORegistry through public IOKit calls, power and clock from `IOReport`
+loaded at runtime — all of it unprivileged, which is precisely the fact the v0.5
+and v0.6 deferrals got wrong. macOS becomes the third platform with a working
+GPU tab.
+
+The roadmap's other v0.7 item, interactive `docker exec` (PTY), moves to v0.8 —
+the same treatment v0.5 gave it. This release is Apple Silicon only.
+
+**Minor bump, not patch.** `gpu_engine::APPLE_DEFERRED_DETAIL` is removed and
+`muxtop_core::apple` is new public surface, which breaks the source API of
+`muxtop-core` — permitted under Cargo's 0.x rules only on a minor bump.
+
+**The wire format is untouched, and a mixed v0.6/v0.7 pair therefore does
+interoperate** — the first minor release since v0.3 where that holds. Not one
+type carrying `Encode`/`Decode` changed: `GpuVendor::Apple` and
+`GpuBackend::AppleIoReport` were reserved in the model in v0.5 for exactly this
+release, so the backend had somewhere to land without appending a field. The
+version-matching rules documented in v0.4.0 and v0.5.0 gain no new entry.
+
 ### Added
 
 #### Apple Silicon GPU support (`muxtop-core`, `muxtop-tui`)
@@ -25,10 +47,9 @@ performance-state channels are readable unprivileged. `powermetrics` needs root
 because it reads channels muxtop never subscribes to. Two releases of an empty
 tab came out of not checking.
 
-**No wire-protocol break.** `GpuVendor::Apple` and `GpuBackend::AppleIoReport`
-have been in the model since v0.5 precisely so this would be additive, so a
-v0.7 client and a v0.6 server still disagree only on the versions already
-documented in v0.4.0 and v0.5.0 — this release adds nothing to that list.
+**No wire-protocol break** — see the release header. The reserved `Apple`
+variants are why: a backend arriving without a home in the model would have had
+to append a field, and bincode is order-sensitive.
 
 - **Layered, not all-or-nothing.** `IOAccelerator` (public IOKit) gives the
   device name, GPU core count, driver build, utilisation and memory;

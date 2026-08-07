@@ -368,7 +368,8 @@ just dev      # continuous check with bacon
 | **v0.4** ✓ | Kubernetes Pod tab (read-only) via [kube-rs](https://github.com/kube-rs/kube), kubeconfig auto-detection, metrics-server graceful degradation |
 | **v0.5** ✓ | GPU tab — NVIDIA via NVML, AMD via `amdgpu` sysfs, per-process usage, graceful per-metric degradation |
 | **v0.6** ✓ | Security and performance hardening — bounded rate limiter, shared cluster snapshots, cached Kube view, narrowed process collection |
-| v0.7 | Apple Silicon GPU support (IOKit + `IOReport`, unprivileged) + interactive `docker exec` (PTY) |
+| **v0.7** ✓ | Apple Silicon GPU support — IOKit `IOAccelerator` + `IOReport`, unprivileged, unified-memory reporting |
+| v0.8 | Interactive `docker exec` (PTY) |
 | v1.0 | WASM plugin system + themes + configuration file |
 
 ---

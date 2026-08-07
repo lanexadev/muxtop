@@ -127,7 +127,7 @@ For detail, check `~/.local/share/muxtop/muxtop.log`, or run with
 
 ## Not implemented
 
-- **Interactive `docker exec`** with a PTY is scheduled for **v0.7**.
+- **Interactive `docker exec`** with a PTY is scheduled for **v0.8**.
 - **Logs** (`docker logs`) are not shown — use `docker logs` for now.
 - **Creating, deleting or scaling** containers is out of scope. muxtop stops,
   kills and restarts what already exists; it is a monitor, not an orchestrator.
