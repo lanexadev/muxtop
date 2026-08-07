@@ -91,7 +91,9 @@ pub fn sort_processes(procs: &mut [ProcessInfo], field: SortField, order: SortOr
 /// can skip the per-call `String` allocation that `haystack.to_lowercase()`
 /// requires. Falls back to the allocating Unicode path only when at least
 /// one side carries non-ASCII bytes.
-fn contains_ignore_case(haystack: &str, needle_lower: &str) -> bool {
+/// `needle_lower` must already be lowercased — callers lowercase the filter
+/// once per pass, not once per row.
+pub fn contains_ignore_case(haystack: &str, needle_lower: &str) -> bool {
     if needle_lower.is_empty() {
         return true;
     }

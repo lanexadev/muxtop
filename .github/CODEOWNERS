@@ -1,0 +1,22 @@
+# Every path has an owner, so a pull request always requests a review from
+# someone. muxtop has a single maintainer today; the per-area lines below are
+# not redundant duplication — they are where a second reviewer gets added when
+# one shows up, without having to rediscover the boundaries.
+
+*                           @lucasschimmel
+
+# Security-relevant surface: the network-facing daemon, the wire protocol, the
+# process-signalling module, and the dependency allow-list.
+/crates/muxtop-server/      @lucasschimmel
+/crates/muxtop-proto/       @lucasschimmel
+/crates/muxtop-core/src/actions.rs  @lucasschimmel
+/deny.toml                  @lucasschimmel
+
+# Anything that can publish, sign, or grant permissions.
+/.github/workflows/         @lucasschimmel
+/.github/dependabot.yml     @lucasschimmel
+/scripts/install.sh         @lucasschimmel
+
+# Documentation that users act on — a wrong command here is a real incident.
+/SECURITY.md                @lucasschimmel
+/docs/wiki/                 @lucasschimmel

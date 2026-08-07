@@ -89,7 +89,7 @@ struct Cli {
     refresh: u64,
 
     /// Authentication token (required, ≥16 chars). Also reads from
-    /// MUXTOP_TOKEN. Note: --token leaks via /proc/<pid>/cmdline and
+    /// MUXTOP_TOKEN. Note: --token leaks via /proc/PID/cmdline and
     /// `ps eww` on shared hosts; prefer --token-file there.
     #[arg(long, env = "MUXTOP_TOKEN", conflicts_with = "token_file")]
     token: Option<String>,
@@ -283,7 +283,7 @@ async fn main() -> Result<()> {
     // Mandatory authentication: token is required (minimum 16 characters).
     // --token and --token-file are mutually exclusive (enforced via clap's
     // `conflicts_with`). --token-file is preferred on shared hosts because
-    // --token leaks via /proc/<pid>/cmdline and `ps eww`.
+    // --token leaks via /proc/PID/cmdline and `ps eww`.
     let auth_token: Token = if let Some(path) = cli.token_file.as_deref() {
         read_token_file(path)?
     } else {

@@ -1,0 +1,69 @@
+version: 2
+
+updates:
+  # ---------------------------------------------------------------------------
+  # Rust dependencies
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Paris
+    # PRs target `develop`: `main` takes release merges only, so a Dependabot
+    # PR opened against it would either be closed or would bypass the branch
+    # model. See CONTRIBUTING.md.
+    target-branch: develop
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      # One PR a week for the routine churn. Ungrouped, a 40-dependency
+      # workspace produces enough noise that the majors — the ones that
+      # actually need reading — get skimmed along with the rest.
+      cargo-minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    ignore:
+      # Majors of the crates that define muxtop's rendering and cluster
+      # surface are deliberate, breaking, and belong in a release plan rather
+      # than in an automated PR: ratatui majors rewrite widget APIs, and a
+      # kube / k8s-openapi major follows the Kubernetes API version the
+      # workspace targets (pinned in three places — see the k8s-openapi notes
+      # in Cargo.toml). Minor and patch updates for all three still flow
+      # through the group above.
+      - dependency-name: ratatui
+        update-types: ["version-update:semver-major"]
+      - dependency-name: kube
+        update-types: ["version-update:semver-major"]
+      - dependency-name: k8s-openapi
+        update-types: ["version-update:semver-major"]
+
+  # ---------------------------------------------------------------------------
+  # GitHub Actions
+  # ---------------------------------------------------------------------------
+  # Every action in .github/workflows is pinned to a commit SHA, which stops a
+  # compromised upstream tag from being re-pointed at malicious code — but a
+  # SHA also never picks up a security fix on its own. This is the other half
+  # of that trade: Dependabot moves the SHAs forward and updates the `# v4`
+  # comment beside each one, in a PR that CI checks.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Paris
+    target-branch: develop
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - ci
+    commit-message:
+      prefix: "chore(ci)"
+    groups:
+      actions-all:
+        patterns: ["*"]

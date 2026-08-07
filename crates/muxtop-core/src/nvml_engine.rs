@@ -16,7 +16,7 @@
 //!
 //! [`nvml_wrapper::Nvml::init`] resolves `libnvidia-ml.so` / `nvml.dll`
 //! through `libloading` at **runtime**. muxtop therefore builds and runs
-//! identically on machines with no NVIDIA hardware — [`NvmlEngine::connect`]
+//! identically on machines with no NVIDIA hardware — `NvmlEngine::connect`
 //! simply returns [`GpuError::DriverUnavailable`] and the composite engine
 //! moves on to the next backend. No feature flag, no separate build.
 //!

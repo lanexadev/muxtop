@@ -7,6 +7,113 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-07
+
+Security and performance release over the Kubernetes surface, plus one
+structural defect in the v0.3.1 rate limiter.
+
+**Minor bump, not patch.** `SystemSnapshot::{containers, kube}` change type, which
+breaks the source API of `muxtop-core` — permitted under Cargo's 0.x rules only on
+a minor bump. The wire format is unchanged and covered by a round-trip test, so a
+v0.6.0 client and server interoperate byte-for-byte with each other; a mixed
+v0.5/v0.6 pair does not, for the reasons already documented in v0.4.0 and v0.5.0.
+
+### Security
+
+- **Rate-limiter memory is now bounded** (`muxtop-server`). The per-IP token-bucket map created an entry for every source address ever seen — including the ones it *rejected* — and never removed any, so an attacker with a routed IPv6 prefix could grow it until the process was OOM killed. The component meant to stop a flood was itself the target, and it is on by default. Idle buckets are now evicted on an amortised sweep: a bucket refilled back to `burst` admits exactly what an absent entry would, so dropping it is behaviour-preserving, and buckets reach that state after `burst / refill_per_sec` seconds (1 s at the defaults). Sweeps run at most once per second so the O(n) scan cannot be triggered per connection; `MAX_TRACKED_IPS` (65 536) is a last-resort ceiling past which unknown sources are rejected while already-tracked ones keep their budget.
+- **Flood refusals no longer amplify into the log.** Both refusal paths wrote one line per rejected connection, and refusals arrive at flood rate by definition — a bounded accept path feeding an unbounded log. The ceiling warning now fires on the transition rather than per attempt, and the per-peer accept message drops from `warn` to `debug`.
+- **The remote hostname is scrubbed** (`muxtop-tui`). The v0.4.1 follow-up closed the sanitizer bypass on the confirm prompt and the status path, but the connection indicator still interpolated the hostname straight from the server's `Welcome` frame — and unlike a toast, the chrome is painted every frame for the whole session.
+- **Per-process collection narrowed to what the TUI renders** (`muxtop-core`). `ProcessRefreshKind::everything()` also collected `environ`, `cwd`, `root` and `exe`. `environ` is read once and then held in sysinfo's process table for the whole run, so running muxtop as root parked a copy of every process's environment — API keys, tokens, database URLs — in our address space, for data we never display.
+- **metrics-server responses are capped at 16 MiB** (`muxtop-core`). `metrics.k8s.io` is served by an *aggregated* APIService, so unlike the typed resource lists its body is chosen by a component outside the trust boundary the rest of the kube path assumes. Oversized bodies are rejected rather than truncated, since a half-read body parses as invalid JSON and would be misreported as "metrics-server unavailable".
+- **No panic on a pre-epoch system clock** (`muxtop-core`). `SystemSnapshot::collect` ran `.expect()` on `duration_since(UNIX_EPOCH)` every tick. An embedded host with no RTC reads 1970 until NTP lands — and is exactly the kind of box someone points a system monitor at.
+- Dependabot alerts and automated security fixes enabled; private vulnerability reporting enabled; `develop` protected with required status checks.
+
+### Fixed
+
+- **Nodes sub-view PODS column** (`muxtop-core`). `pod_count` was hardcoded to `0` behind a "populated in S2.6" comment that never landed, so the column reported 0 pods on every node of every cluster since v0.4.0. The count now joins the pod list in `ClusterEngine::snapshot` and follows `kubectl describe node`'s "Non-terminated Pods" rule — Succeeded and Failed pods have released their node resources.
+- **Selected Kubernetes object under an active sort** (`muxtop-tui`). `selected_kube_name` re-derived its own *unsorted* filtered list and took `nth(kube_selected)`, but the selection indexes the sorted order — so with any sort active it named a different object than the one highlighted on screen. It now reads the same projection the table renders from.
+
+### Performance
+
+- **Container and cluster snapshots are shared, not deep-cloned** (`muxtop-core`). Both are produced by loops slower than the system tick (0.5 Hz and 0.2 Hz against at most 1 Hz), so four of every five kube clones rebuilt three `String`s per pod for nothing. Both fields are now `Arc`. Measured on a 1 000-pod snapshot: **149 µs → 10 ns** per tick, removing ~3 000 redundant allocations per second and scaling with cluster size. `gpu` is deliberately left owned — `GPU_INTERVAL` is 1 s and `--refresh` has a 1 s floor, so its clone is never redundant. **The wire format is unchanged** — bincode encodes `Arc<T>` through `T::encode`, and a new proto test proves the byte sequences are identical rather than asserting it in a comment.
+- **Kube tab view is cached** (`muxtop-tui`). The tab never received v0.3.1's PERF-M2/PERF-M5 fixes: it re-filtered and re-sorted every frame, lowercasing each row's name and namespace, and `kube_count()` ran a second full filter on every navigation keypress. `compute_view_indices` now runs once per state change into `AppState::kube_view_cache`, matching via `contains_ignore_case` (ASCII fast path, no allocation). The cache stores indices, so it costs one `usize` per row regardless of row size.
+- **Narrowed process refresh** (`muxtop-core`). Beyond the `environ` exposure above, `disk_usage` was refreshed unconditionally on every tick — a `/proc/<pid>/io` open+parse per process per second on Linux. Measured on macOS with 444 processes: 5.87 ms → 4.75 ms per refresh (**−19 %**); the Linux saving is not measured here.
+- **Kube polls hold their cadence** (`muxtop-core`). Resource and metrics fetches awaited one after another under 3 s timeouts each, so a slow API server could spend 9 s and 6 s respectively against a 5 s `POLL_INTERVAL`. Both loops also slept *after* their work, making the real period `tick + 5 s` and drifting out of phase with the collector's fixed sampling. They now fan out with `tokio::join!` and are driven by `tokio::time::interval` with `MissedTickBehavior::Skip`.
+
+### Not done
+
+- Caching the converted `KubeSnapshot` inside `KubeEngine` was considered and rejected. With the cadence drift fixed above, the redundant conversion is ~60 µs/s at 1 000 pods; a second cache keyed on `last_update_ms` would trade that for a way to render stale cluster state.
+
+### API
+
+- `SystemSnapshot::{containers, kube}` are now `Option<Arc<..>>`, and `SystemSnapshot::collect` takes them as such. Wire-compatible; source-breaking for any consumer of `muxtop-core` outside this workspace.
+- `muxtop_core::process::contains_ignore_case` is now public.
+
+### Repository and pipeline
+
+No change to the binary. muxtop is a public project with a network-facing
+daemon, and the parts of it that a user has to trust — the release pipeline,
+the disclosure policy, the operational documentation — had not received the
+same attention as the code.
+
+### Added
+
+- **`SECURITY.md`** — disclosure policy with private reporting, response
+  targets, an explicit in-scope / out-of-scope list, and a one-page summary of
+  the trust boundaries. Private vulnerability reporting is enabled on the
+  repository, so a report never has to start as a public issue.
+- **A wiki, generated from `docs/wiki/`** — thirteen pages covering what the
+  README cannot hold: TLS and token setup for `muxtop-server` with a hardened
+  systemd unit, Kubernetes RBAC for both the namespaced and cluster-wide cases,
+  container socket choices, GPU backend limits, a symptom → cause
+  troubleshooting table, performance tuning, the architecture, and the release
+  runbook. `wiki-sync.yml` mirrors it on release, so the wiki is a published
+  artefact rather than a second source that drifts.
+- **Scheduled advisory audit (`advisories.yml`)** — `cargo deny check
+  advisories` daily. CI only runs when somebody pushes, so an advisory
+  published against an already-shipped dependency previously went unnoticed
+  until the next unrelated commit. Failures open one rolling issue rather than
+  one per day, and `deny.toml`'s documented exceptions are honoured so the
+  audit does not re-report accepted risk every morning.
+- **CodeQL analysis** — on push and weekly, feeding the Security tab.
+- **Build-provenance attestations on release artefacts** — verifiable with
+  `gh attestation verify <archive> --repo lucasschimmel/muxtop`. A published
+  checksum cannot prove provenance: whoever can replace the archive can replace
+  the `.sha256` beside it.
+- **Release gate (`verify` job)** — the tag must match the workspace version and
+  `CHANGELOG.md` must document it. Everything downstream is irreversible: a
+  crates.io publish is permanent and two package managers take the version
+  before a mistake is noticeable.
+- **New CI jobs** — MSRV check against the declared 1.88, `cargo doc` with
+  `-Dwarnings` (broken intra-doc links are the most common rot in a published
+  crate), coverage via `cargo-llvm-cov` reported to the run summary with no
+  third-party service, and `cargo-semver-checks` on the three published crates.
+- **`dependabot.yml`** — weekly Cargo and GitHub Actions updates against
+  `develop`, grouped so the majors that need reading are not skimmed alongside
+  forty patch bumps.
+- **Issue and pull-request templates, `CODEOWNERS`, `CODE_OF_CONDUCT.md`.** The
+  bug template asks for terminal, `$TERM`, platform and local-vs-remote up
+  front — the answers that decide whether a report is reproducible.
+
+### Changed
+
+- **Every third-party GitHub Action is pinned to a commit SHA**, so a
+  re-pointed tag cannot inject code into a release. Dependabot advances them
+  under review. Note that pinning `dtolnay/rust-toolchain` by SHA means the
+  toolchain can no longer be inferred from the `@stable` ref, so every use now
+  names it explicitly.
+- **Workflow tokens are read-only by default**, with write scopes granted per
+  job: `release` gets `contents: write`, `build` gets attestation signing, and
+  the Homebrew and APT jobs get nothing on this repository. A compromised build
+  step cannot publish a release.
+- **`concurrency` groups on every workflow.** Pull-request runs supersede
+  themselves; `develop`, `main` and release runs never cancel, since a cancelled
+  required check reads as a failure.
+- **`cross` and `cargo-deb` install as prebuilt binaries** instead of being
+  compiled from source on every release build.
+- **`fail-fast: false`** on the test and release matrices — hiding whether a
+  break is platform-specific is the opposite of useful.
+
 ## [0.5.1] - 2026-08-05
 
 Ergonomics and UI/UX release. No new data source: everything muxtop already

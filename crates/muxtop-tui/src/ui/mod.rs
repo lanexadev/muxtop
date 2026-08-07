@@ -10,7 +10,7 @@ pub mod glyphs;
 mod gpu;
 mod help;
 mod inspector;
-mod kube;
+pub(crate) mod kube;
 mod log_view;
 mod network;
 mod palette;
@@ -393,6 +393,32 @@ mod tests {
         assert!(
             contains(&buf, "read-only"),
             "remote mode must announce that actions are unavailable"
+        );
+    }
+
+    /// SEC-02: the hostname arrives in the server's `Welcome` frame, and the
+    /// chrome that renders it stays on screen for the whole session — so it
+    /// needs the same guard the table cells got in v0.3.1.
+    #[test]
+    fn header_scrubs_a_hostile_remote_hostname() {
+        let mut app = app_with_data();
+        app.connection_mode = crate::ConnectionMode::Remote {
+            hostname: "prod\x1b]0;pwned\x07-01".to_string(),
+            addr: "10.0.0.1:4242".parse().unwrap(),
+        };
+        let text = all_text(&render_with(&app, 120, 24));
+
+        assert!(
+            !text.contains('\x1b'),
+            "ESC survived into the chrome:\n{text}"
+        );
+        assert!(
+            !text.contains('\x07'),
+            "BEL survived into the chrome:\n{text}"
+        );
+        assert!(
+            text.contains("prod?"),
+            "the printable part of the hostname should still render:\n{text}"
         );
     }
 

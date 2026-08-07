@@ -135,7 +135,13 @@ pub async fn run(
                 //    (no TLS handshake at all) if the source has exceeded
                 //    its token-bucket budget.
                 if !rate_limiter.try_admit(peer.ip()) {
-                    tracing::warn!(peer = %peer, "rate-limited, dropping TCP stream");
+                    // `debug`, not `warn`: this fires once per refused
+                    // connection, and refusals arrive at flood rate by
+                    // definition. Warning here would let an attacker drive
+                    // our log volume — a bounded accept path feeding an
+                    // unbounded log. Operators who want the per-peer detail
+                    // can raise the level.
+                    tracing::debug!(peer = %peer, "rate-limited, dropping TCP stream");
                     drop(tcp_stream);
                     continue;
                 }
