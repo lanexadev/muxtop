@@ -1978,7 +1978,7 @@ dependencies = [
 
 [[package]]
 name = "muxtop"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1998,7 +1998,7 @@ dependencies = [
 
 [[package]]
 name = "muxtop-core"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "bincode",
@@ -2023,7 +2023,7 @@ dependencies = [
 
 [[package]]
 name = "muxtop-proto"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "bincode",
  "criterion",
@@ -2042,7 +2042,7 @@ dependencies = [
 
 [[package]]
 name = "muxtop-server"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2068,7 +2068,7 @@ dependencies = [
 
 [[package]]
 name = "muxtop-tui"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "criterion",
  "crossterm",
