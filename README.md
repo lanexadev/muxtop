@@ -295,14 +295,30 @@ Everything the mouse can do, the keyboard can do. Overrides: `--theme <name>` (`
 
 ## Benchmarks
 
-Tested on macOS with 500+ processes (Thomas benchmark):
+Measured on a MacBook Air M3 (8 GB, macOS 26.5.1) with ~450 processes, via the
+Thomas benchmark. These are v0.7.0 figures: the numbers that stood here before
+were measured at **v0.3.1** and had gone four releases without being re-run, so
+they described a binary nobody was downloading any more.
 
-| Metric | Target | muxtop |
+| Metric | Target | muxtop v0.7.0 |
 |----------|-------|--------|
-| Startup (`--about`) | < 100 ms | ~12 ms |
-| Binary size | < 10 MB | **5.3 MiB** (LTO + strip) |
+| Startup (`--about`) | < 100 ms | **12 ms** |
+| Binary size | < 10 MB | **8.0 MiB** (LTO + strip) |
 | FPS (TUI) | > 30 | ~60 (event-driven, idle ≈ 0 redraws) |
-| Peak RSS (30 s) | < 15 MiB | **11.3 MiB** (htop ~15, btop ~40) |
+| Peak RSS (30 s) | < 15 MiB | **12.4 MiB** — 9.9 MiB with `--no-gpu` |
+
+Both numbers that moved are attributed rather than guessed at:
+
+- **The GPU tab is the entire memory difference.** The Apple Silicon backend
+  costs ~2.4 MiB resident. The dependency bumps since v0.6.0 cost nothing
+  measurable — v0.7.0 with `--no-gpu` lands on v0.6.0 to within run-to-run
+  noise, on the same machine.
+- **Binary size has been near 8 MiB since v0.4** brought in a Kubernetes
+  client. v0.7.0 added 49 KiB to it. The 5.3 MiB figure predates that tab.
+
+Both are targets for **v0.8**, which is an optimisation release rather than a
+feature one. Restating a budget you have drifted past is not the same as meeting
+it, and this table is where the drift became visible.
 
 Run the benchmark yourself:
 
@@ -369,7 +385,7 @@ just dev      # continuous check with bacon
 | **v0.5** ✓ | GPU tab — NVIDIA via NVML, AMD via `amdgpu` sysfs, per-process usage, graceful per-metric degradation |
 | **v0.6** ✓ | Security and performance hardening — bounded rate limiter, shared cluster snapshots, cached Kube view, narrowed process collection |
 | **v0.7** ✓ | Apple Silicon GPU support — IOKit `IOAccelerator` + `IOReport`, unprivileged, unified-memory reporting |
-| v0.8 | Interactive `docker exec` (PTY) |
+| v0.8 | Optimisation pass — binary size, resident memory, allocation profile — plus interactive `docker exec` (PTY) |
 | v1.0 | WASM plugin system + themes + configuration file |
 
 ---
