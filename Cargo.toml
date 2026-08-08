@@ -10,7 +10,7 @@ panic = "abort"
 
 [workspace.package]
 edition = "2024"
-version = "0.6.0"
+version = "0.7.0"
 authors = ["Lucas Schimmel"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lucasschimmel/muxtop"
@@ -28,6 +28,14 @@ sysinfo = "0.38"
 # runtime via libloading, so muxtop builds and runs unchanged on hosts with no
 # NVIDIA driver. Target-gated in muxtop-core: NVML has no macOS build.
 nvml-wrapper = "0.12"
+
+# Apple Silicon GPU telemetry (v0.7). Target-gated in muxtop-core to macOS:
+# `core-foundation` wraps the Core Foundation types IOKit exchanges, and
+# `libloading` resolves the private IOReport symbols at runtime so the binary
+# still starts on a macOS release that has moved them.
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+libloading = "0.8"
 
 # TUI
 ratatui = "0.30"
@@ -95,9 +103,9 @@ rcgen = "0.14"
 ring = "0.17"
 
 # Internal crates
-muxtop-core = { path = "crates/muxtop-core", version = "0.6.0" }
-muxtop-tui = { path = "crates/muxtop-tui", version = "0.6.0" }
-muxtop-proto = { path = "crates/muxtop-proto", version = "0.6.0" }
+muxtop-core = { path = "crates/muxtop-core", version = "0.7.0" }
+muxtop-tui = { path = "crates/muxtop-tui", version = "0.7.0" }
+muxtop-proto = { path = "crates/muxtop-proto", version = "0.7.0" }
 
 [package]
 name = "muxtop"

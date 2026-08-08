@@ -2007,7 +2007,7 @@ dependencies = [
 
 [[package]]
 name = "muxtop"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2027,11 +2027,13 @@ dependencies = [
 
 [[package]]
 name = "muxtop-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "bincode",
  "bollard",
+ "core-foundation 0.10.1",
+ "core-foundation-sys",
  "criterion",
  "dirs",
  "futures",
@@ -2039,6 +2041,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "libc",
+ "libloading",
  "nvml-wrapper",
  "serde",
  "serde_json",
@@ -2052,7 +2055,7 @@ dependencies = [
 
 [[package]]
 name = "muxtop-proto"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "bincode",
  "criterion",
@@ -2071,7 +2074,7 @@ dependencies = [
 
 [[package]]
 name = "muxtop-server"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2097,7 +2100,7 @@ dependencies = [
 
 [[package]]
 name = "muxtop-tui"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "criterion",
  "crossterm",
