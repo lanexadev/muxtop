@@ -113,6 +113,32 @@ never "zero"**.
   counter by a millisecond produces a number with no relationship to the GPU's
   power draw. One tick of `—` buys a real one-second window.
 
+### Measured cost
+
+The Thomas macro-benchmark was re-run for this release, and it turned up two
+things worth stating rather than burying.
+
+- **The Apple backend costs ~2.4 MiB of resident memory.** Peak RSS over a 30 s
+  headless run goes from 10.1 MiB to 12.4 MiB on a MacBook Air M3. The figure is
+  attributed, not assumed: v0.7.0 launched with `--no-gpu` lands at 9.9 MiB,
+  which matches v0.6.0 on the same machine to within run-to-run noise, so none
+  of the growth belongs to the dependency bumps that also landed here — sysinfo
+  0.34 → 0.38 included, despite sitting on the process-collection hot path. That
+  leaves 0.6 MiB of headroom against the project's 13 MiB budget, which is
+  thinner than it should be. The most likely first cut is the `IOReport`
+  subscription: it copies the whole `Energy Model` group, roughly eighty CPU
+  channels, to read one GPU counter.
+- **Binary size did not meaningfully move** — 7.99 MiB at v0.6.0, 8.03 MiB here,
+  so this release added 49 KiB. The three new macOS dependencies are thin FFI
+  layers and behave like it.
+
+The README's benchmark table was showing figures measured at **v0.3.1** and
+never re-run across four releases — 5.3 MiB binary, 11.3 MiB RSS — which
+described a binary nobody had downloaded since v0.4 brought in a Kubernetes
+client. It now carries measured v0.7.0 numbers, the machine they came from, and
+the attribution above. **v0.8 is an optimisation release**: restating a budget
+you have drifted past is not the same as meeting it.
+
 ### Changed
 
 - **Sub-watt power no longer rounds away to `0W`** (`muxtop-tui`). Whole watts
