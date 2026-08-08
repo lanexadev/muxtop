@@ -122,17 +122,19 @@ rules:
 ## GPU support
 
 muxtop probes for GPUs at startup and needs **no extra privileges** — NVML is
-readable by any user, and the `amdgpu` sysfs nodes are world-readable. Nothing
-is installed and no vendor SDK is required at build time: the NVIDIA library is
-loaded dynamically at runtime, so the same binary runs on machines with and
-without an NVIDIA driver. Disable the probe with `--no-gpu`.
+readable by any user, the `amdgpu` sysfs nodes are world-readable, and the macOS
+counters are readable unprivileged too (`powermetrics` needs root; the channels
+muxtop reads do not). Nothing is installed and no vendor SDK is required at
+build time: the NVIDIA library and the macOS `IOReport` library are both loaded
+dynamically at runtime, so the same binary runs with or without them. Disable
+the probe with `--no-gpu`.
 
 | Vendor | Backend | Platforms | Status |
 |---|---|---|---|
 | **NVIDIA** | NVML (`libnvidia-ml.so` / `nvml.dll`, loaded at runtime) | Linux, Windows | Full — including per-process usage |
 | **AMD** | `amdgpu` sysfs (`/sys/class/drm/card*/device`) | Linux | Devices only — no per-process usage |
+| **Apple Silicon** | IOKit `IOAccelerator` + `IOReport` (loaded at runtime) | macOS | Devices only — no per-process usage, no temperature |
 | **Intel** | — | — | Not implemented |
-| **Apple Silicon** | IOReport | macOS | **Planned for v0.6** |
 
 ### What each backend can and cannot report
 
@@ -153,15 +155,36 @@ lie about an idle GPU.
   than papered over. On Linux the figures and the distinction are real.
 - **Fanless cards report no fan**, and a laptop dGPU parked in runtime-D3 may
   report nothing at all until something wakes it.
+- **Apple Silicon reports no per-process usage and no GPU temperature.** There
+  is no Apple equivalent of NVML's process queries, and the GPU thermal channels
+  read zero for an unprivileged process, so the tab shows `—` rather than a
+  confident 0 °C on a warm laptop. Power caps, fan and encoder/decoder counters
+  are likewise not published: the SoC power budget is shared with the CPU and
+  managed by firmware, and cooling is chassis-wide rather than per-GPU.
 
-### Why Apple Silicon is not in this release
+### Apple Silicon: unified memory is not VRAM
 
-macOS exposes GPU counters only through the private `IOReport` framework — the
-same source `powermetrics` reads, and `powermetrics` requires root. Shipping
-that in v0.5 would have meant either taking a private-framework dependency or
-asking every macOS user to run muxtop as root, neither of which fits a tool
-whose premise is staying out of the way. It is scheduled for **v0.6**; the data
-model, the wire format and the tab already accommodate it.
+The GPU addresses the same physical memory as the CPU. The Devices table
+therefore shows a **MEM** column rather than VRAM, reading the driver's
+GPU-resident bytes against the machine's whole pool — on a 16 GB Mac, a GPU
+holding 2 GB shows 12 %, and the CPU is competing for the other 88 %. The
+Inspector spells it out as "Unified memory".
+
+Two sources are read, and they degrade independently:
+
+| Source | Gives | If it fails |
+|---|---|---|
+| IOKit `IOAccelerator` (public API) | device name, GPU cores, driver, utilisation, memory | no Apple GPU is reported |
+| `IOReport` (private, `dlopen`ed) | power, clock | those two columns render `—` |
+
+`IOReport` is a private framework with no stability promise, so its symbols are
+resolved at runtime exactly as NVML's are. A macOS release that renames them
+costs two columns, not the tab.
+
+**Intel Macs are not covered.** Their AMD or Intel GPU answers the same IOKit
+match with a differently shaped statistics dictionary, and muxtop decodes only
+Apple's own driver family. The tab says so rather than showing a row labelled
+Apple that reports nothing.
 
 ---
 
@@ -272,14 +295,30 @@ Everything the mouse can do, the keyboard can do. Overrides: `--theme <name>` (`
 
 ## Benchmarks
 
-Tested on macOS with 500+ processes (Thomas benchmark):
+Measured on a MacBook Air M3 (8 GB, macOS 26.5.1) with ~450 processes, via the
+Thomas benchmark. These are v0.7.0 figures: the numbers that stood here before
+were measured at **v0.3.1** and had gone four releases without being re-run, so
+they described a binary nobody was downloading any more.
 
-| Metric | Target | muxtop |
+| Metric | Target | muxtop v0.7.0 |
 |----------|-------|--------|
-| Startup (`--about`) | < 100 ms | ~12 ms |
-| Binary size | < 10 MB | **5.3 MiB** (LTO + strip) |
+| Startup (`--about`) | < 100 ms | **12 ms** |
+| Binary size | < 10 MB | **8.0 MiB** (LTO + strip) |
 | FPS (TUI) | > 30 | ~60 (event-driven, idle ≈ 0 redraws) |
-| Peak RSS (30 s) | < 15 MiB | **11.3 MiB** (htop ~15, btop ~40) |
+| Peak RSS (30 s) | < 15 MiB | **12.4 MiB** — 9.9 MiB with `--no-gpu` |
+
+Both numbers that moved are attributed rather than guessed at:
+
+- **The GPU tab is the entire memory difference.** The Apple Silicon backend
+  costs ~2.4 MiB resident. The dependency bumps since v0.6.0 cost nothing
+  measurable — v0.7.0 with `--no-gpu` lands on v0.6.0 to within run-to-run
+  noise, on the same machine.
+- **Binary size has been near 8 MiB since v0.4** brought in a Kubernetes
+  client. v0.7.0 added 49 KiB to it. The 5.3 MiB figure predates that tab.
+
+Both are targets for **v0.8**, which is an optimisation release rather than a
+feature one. Restating a budget you have drifted past is not the same as meeting
+it, and this table is where the drift became visible.
 
 Run the benchmark yourself:
 
@@ -344,7 +383,9 @@ just dev      # continuous check with bacon
 | **v0.3.1** ✓ | TLS 1.3 hardening, per-IP rate limit, ANSI sanitizer, event-driven render, `lto=fat` build sweep |
 | **v0.4** ✓ | Kubernetes Pod tab (read-only) via [kube-rs](https://github.com/kube-rs/kube), kubeconfig auto-detection, metrics-server graceful degradation |
 | **v0.5** ✓ | GPU tab — NVIDIA via NVML, AMD via `amdgpu` sysfs, per-process usage, graceful per-metric degradation |
-| v0.6 | Apple Silicon GPU support (IOReport) + interactive `docker exec` (PTY) |
+| **v0.6** ✓ | Security and performance hardening — bounded rate limiter, shared cluster snapshots, cached Kube view, narrowed process collection |
+| **v0.7** ✓ | Apple Silicon GPU support — IOKit `IOAccelerator` + `IOReport`, unprivileged, unified-memory reporting |
+| v0.8 | Optimisation pass — binary size, resident memory, allocation profile — plus interactive `docker exec` (PTY) |
 | v1.0 | WASM plugin system + themes + configuration file |
 
 ---

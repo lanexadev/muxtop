@@ -1,4 +1,5 @@
-// GPU tab — NVIDIA (NVML) and AMD (amdgpu sysfs), read-only.
+// GPU tab — NVIDIA (NVML), AMD (amdgpu sysfs) and Apple Silicon (IOKit +
+// IOReport), read-only.
 //
 // Ported onto the shared widget layer in 0.5.1. The domain rule that shaped the
 // original view is preserved and is the reason several cells render a dash:
@@ -24,7 +25,7 @@ use muxtop_core::gpu::{
 };
 use muxtop_core::process::SortOrder;
 
-const DEVICE_COLUMNS: &[Column] = &[
+const DEVICE_COLUMNS: [Column; 10] = [
     Column::fixed("#", 4, Align::Right, PRIO_ESSENTIAL),
     Column::flex("DEVICE", 18, PRIO_ESSENTIAL),
     Column::fixed("VENDOR", 9, Align::Left, PRIO_LOW),
@@ -36,6 +37,10 @@ const DEVICE_COLUMNS: &[Column] = &[
     Column::fixed("FAN", 6, Align::Right, PRIO_LOW),
     Column::fixed("ENC/DEC", 10, Align::Right, PRIO_LOW),
 ];
+
+/// Index of the memory column in [`DEVICE_COLUMNS`], whose header is the one
+/// thing about the table that depends on the hardware — see [`memory_label`].
+const DEVICE_MEM_COLUMN: usize = 4;
 
 const PROC_COLUMNS: &[Column] = &[
     Column::fixed("PID", 8, Align::Right, PRIO_ESSENTIAL),
@@ -94,6 +99,27 @@ fn backend_label(backend: GpuBackend) -> &'static str {
         GpuBackend::AmdSysfs => "amdgpu",
         GpuBackend::AppleIoReport => "IOReport",
     }
+}
+
+/// Header for the memory column.
+///
+/// `VRAM` is a lie on Apple Silicon: the GPU has no dedicated memory, it
+/// addresses the same pool as the CPU. The column shows the same two numbers
+/// either way — bytes held by the GPU against the total available to it — but
+/// calling the whole of a Mac's RAM "VRAM" would misdescribe both of them.
+/// The header follows the devices actually on screen, so a mixed host (only
+/// possible off macOS, where no Apple GPU exists) keeps the discrete wording.
+fn memory_label(snap: &GpusSnapshot) -> &'static str {
+    let all_unified =
+        !snap.devices.is_empty() && snap.devices.iter().all(|d| d.vendor == GpuVendor::Apple);
+    if all_unified { "MEM" } else { "VRAM" }
+}
+
+/// [`DEVICE_COLUMNS`] with the memory header resolved for this snapshot.
+fn device_columns(snap: &GpusSnapshot) -> [Column; DEVICE_COLUMNS.len()] {
+    let mut columns = DEVICE_COLUMNS;
+    columns[DEVICE_MEM_COLUMN].label = memory_label(snap);
+    columns
 }
 
 fn vendor_label(vendor: GpuVendor) -> &'static str {
@@ -169,8 +195,9 @@ fn draw_devices(frame: &mut Frame, area: Rect, r: &Render<'_>, snap: &GpusSnapsh
         .collect();
     sort_devices(&mut devices, app.gpu_sort_field, app.gpu_sort_order);
 
+    let columns = device_columns(snap);
     let spec = Spec {
-        columns: DEVICE_COLUMNS,
+        columns: &columns,
         sort_col: device_sort_column(app.gpu_sort_field),
         descending: matches!(app.gpu_sort_order, SortOrder::Desc),
         total: devices.len(),
@@ -188,6 +215,21 @@ fn draw_devices(frame: &mut Frame, area: Rect, r: &Render<'_>, snap: &GpusSnapsh
         Some(d) => device_row(d, r),
         None => Row::new(Vec::new()),
     });
+}
+
+/// Format a power figure with just enough precision to stay true.
+///
+/// Whole watts are right for a discrete card, which idles in the tens and
+/// peaks in the hundreds. They are wrong for an Apple Silicon GPU, which idles
+/// under a tenth of a watt: rounding that to `0W` claims a powered-off block,
+/// which is a different statement from a nearly-idle one and exactly the kind
+/// of confusion the dashes elsewhere in this table exist to prevent.
+pub(super) fn watts(w: f32) -> String {
+    if w.abs() < 10.0 {
+        format!("{w:.1}")
+    } else {
+        format!("{w:.0}")
+    }
 }
 
 fn device_row(d: &GpuDeviceSnapshot, r: &Render<'_>) -> Row {
@@ -225,8 +267,8 @@ fn device_row(d: &GpuDeviceSnapshot, r: &Render<'_>) -> Row {
     });
 
     let power = match (d.power_watts, d.power_limit_watts) {
-        (Some(w), Some(limit)) => Cell::new(format!("{w:.0}/{limit:.0}W")),
-        (Some(w), None) => Cell::new(format!("{w:.0}W")),
+        (Some(w), Some(limit)) => Cell::new(format!("{}/{}W", watts(w), watts(limit))),
+        (Some(w), None) => Cell::new(format!("{}W", watts(w))),
         _ => dash(),
     };
 
@@ -649,6 +691,126 @@ mod tests {
             devices[0].index, 0,
             "ascending must not promote an unreported temperature to coldest"
         );
+    }
+
+    // ---- Apple Silicon ----------------------------------------------------
+
+    /// An Apple Silicon device as the v0.7 backend produces one: unified
+    /// memory, no temperature, no fan, no power cap, no per-process stats.
+    fn apple_device() -> GpuDeviceSnapshot {
+        GpuDeviceSnapshot {
+            index: 0,
+            vendor: GpuVendor::Apple,
+            backend: GpuBackend::AppleIoReport,
+            name: "Apple M3 (8-core GPU)".into(),
+            bus_id: String::new(),
+            driver_version: Some("351.2".into()),
+            utilization_pct: Some(62.0),
+            mem_utilization_pct: None,
+            mem_used_bytes: Some(2 << 30),
+            mem_total_bytes: Some(8 << 30),
+            temperature_c: None,
+            power_watts: Some(2.9),
+            power_limit_watts: None,
+            graphics_clock_mhz: Some(874),
+            memory_clock_mhz: None,
+            fan_pct: None,
+            encoder_pct: None,
+            decoder_pct: None,
+            supports_process_stats: false,
+        }
+    }
+
+    fn apple_app() -> AppState {
+        let mut snap = snapshot();
+        snap.gpu = Some(GpusSnapshot {
+            backends: vec![GpuBackend::AppleIoReport],
+            available: true,
+            devices: vec![apple_device()],
+            processes: Vec::new(),
+            detail: String::new(),
+        });
+        let mut app = AppState::new();
+        app.tab = Tab::Gpu;
+        app.apply_snapshot(snap);
+        app
+    }
+
+    #[test]
+    fn apple_memory_column_does_not_claim_to_be_vram() {
+        // The GPU shares the machine's RAM with the CPU. Showing 2 GB of an
+        // 8 GB pool under a "VRAM" header would describe neither number.
+        let app = apple_app();
+        let text = all_text(&render_with(&app, 180, 30));
+        assert!(text.contains("MEM"), "expected a MEM header:\n{text}");
+        assert!(
+            !text.contains("VRAM"),
+            "unified memory must not be labelled VRAM:\n{text}"
+        );
+        assert!(text.contains("2.0G/8.0G"), "{text}");
+    }
+
+    #[test]
+    fn discrete_cards_keep_the_vram_header() {
+        // The relabelling is conditional, not a rename: an NVIDIA card really
+        // does have dedicated video memory.
+        let app = gpu_app(true, true, false);
+        let text = all_text(&render_with(&app, 180, 30));
+        assert!(text.contains("VRAM"), "{text}");
+    }
+
+    #[test]
+    fn sub_watt_power_does_not_round_away_to_zero() {
+        // An idle Apple GPU draws under a tenth of a watt. `0W` would claim a
+        // powered-off block, which is not what the counter said.
+        assert_eq!(watts(0.08), "0.1");
+        assert_eq!(watts(2.9), "2.9");
+        // Discrete cards keep whole watts: `220/450W` is the useful reading,
+        // and a decimal there is noise on a figure that moves by tens.
+        assert_eq!(watts(220.0), "220");
+        assert_eq!(watts(450.4), "450");
+    }
+
+    #[test]
+    fn apple_renders_its_unavailable_metrics_as_dashes() {
+        let app = apple_app();
+        let text = all_text(&render_with(&app, 180, 30));
+        assert!(
+            text.contains('—'),
+            "temperature, fan and enc/dec are unreportable on Apple Silicon \
+             and must not read as zero:\n{text}"
+        );
+        assert!(text.contains("Apple"));
+        assert!(text.contains("874MHz"), "{text}");
+    }
+
+    #[test]
+    fn apple_procs_view_says_the_platform_cannot_answer() {
+        let mut app = apple_app();
+        app.switch_gpu_subview(GpuSubview::Procs);
+        let text = all_text(&render_with(&app, 140, 30));
+        assert!(
+            text.contains("no per-process accounting"),
+            "an empty list would read as an idle GPU:\n{text}"
+        );
+    }
+
+    #[test]
+    fn memory_label_follows_the_devices_on_screen() {
+        let mut snap = GpusSnapshot::unavailable();
+        assert_eq!(
+            memory_label(&snap),
+            "VRAM",
+            "an empty list must not adopt the unified wording"
+        );
+
+        snap.devices.push(apple_device());
+        assert_eq!(memory_label(&snap), "MEM");
+
+        // A host with both would be reporting one device that has dedicated
+        // memory, so the discrete wording wins.
+        snap.devices.push(device(1, GpuVendor::Nvidia, true));
+        assert_eq!(memory_label(&snap), "VRAM");
     }
 
     #[test]

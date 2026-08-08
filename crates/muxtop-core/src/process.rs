@@ -143,6 +143,20 @@ pub struct TreeNode {
 /// Processes whose `parent_pid` matches another process's `pid` become children
 /// of that parent. Processes with no parent in the list (orphans), `parent_pid`
 /// of `None`, or `parent_pid` of `Some(0)` become root nodes at depth 0.
+///
+/// The returned forest holds every input process exactly once — that is,
+/// `flatten_tree(&build_process_tree(p)).len() == p.len()`. Two inputs would
+/// otherwise break that invariant, and both are handled by re-rooting the
+/// affected process at depth 0:
+///
+/// - **Parent cycles.** `parent_pid` is a snapshot of what the OS reported,
+///   and PIDs get recycled — freely on Windows — so a dead parent's PID can
+///   reappear on one of its own descendants and leave a group of processes
+///   listed as each other's ancestors. No member of such a group qualifies as
+///   a root, so the group and every subtree hanging off it would be
+///   unreachable and would silently disappear from the tree view.
+/// - **Depth truncation.** Recursion stops at `MAX_DEPTH` to bound the stack;
+///   the children cut off there are re-rooted instead of dropped.
 pub fn build_process_tree(procs: &[ProcessInfo]) -> Vec<TreeNode> {
     use std::collections::HashMap;
 
@@ -181,7 +195,9 @@ pub fn build_process_tree(procs: &[ProcessInfo]) -> Vec<TreeNode> {
         depth: usize,
         procs: &[ProcessInfo],
         children_map: &HashMap<u32, Vec<usize>>,
+        visited: &mut [bool],
     ) -> TreeNode {
+        visited[idx] = true;
         let p = &procs[idx];
         let children = if depth < MAX_DEPTH {
             children_map
@@ -189,7 +205,18 @@ pub fn build_process_tree(procs: &[ProcessInfo]) -> Vec<TreeNode> {
                 .map(|indices| indices.as_slice())
                 .unwrap_or_default()
                 .iter()
-                .map(|&ci| build_subtree(ci, depth + 1, procs, children_map))
+                // Skipping an already-placed child is what closes a parent
+                // cycle: the walk stops the first time it comes back around.
+                // (A `filter().map()` pair cannot express this — the filter
+                // would hold `visited` borrowed while the map needs it by
+                // `&mut`.)
+                .filter_map(|&ci| {
+                    if visited[ci] {
+                        None
+                    } else {
+                        Some(build_subtree(ci, depth + 1, procs, children_map, visited))
+                    }
+                })
                 .collect()
         } else {
             Vec::new() // Truncate at max depth to prevent stack overflow.
@@ -201,10 +228,22 @@ pub fn build_process_tree(procs: &[ProcessInfo]) -> Vec<TreeNode> {
         }
     }
 
-    roots
+    let mut visited = vec![false; procs.len()];
+    let mut forest: Vec<TreeNode> = roots
         .iter()
-        .map(|&ri| build_subtree(ri, 0, procs, &children_map))
-        .collect()
+        .map(|&ri| build_subtree(ri, 0, procs, &children_map, &mut visited))
+        .collect();
+
+    // Whatever the root walk could not reach is either inside a parent cycle or
+    // past MAX_DEPTH. Re-root it, in input order so the forest stays
+    // deterministic, rather than letting the process fall out of the tree.
+    for idx in 0..procs.len() {
+        if !visited[idx] {
+            forest.push(build_subtree(idx, 0, procs, &children_map, &mut visited));
+        }
+    }
+
+    forest
 }
 
 /// Flatten a tree into a depth-first ordered list of `(ProcessInfo, depth)` pairs.
@@ -558,5 +597,49 @@ mod tests {
         let tree = build_process_tree(&procs);
         let flat = flatten_tree(&tree);
         assert_eq!(flat.len(), procs.len(), "all processes must be in the tree");
+    }
+
+    #[test]
+    fn test_tree_parent_cycle_keeps_every_process() {
+        // PID reuse can leave two processes naming each other as parent. Neither
+        // is a root, so before the cycle guard the pair — and `c` below it —
+        // dropped out of the tree entirely.
+        let procs = vec![
+            make_proc_with_parent(1, Some(0), "init"),
+            make_proc_with_parent(10, Some(11), "a"),
+            make_proc_with_parent(11, Some(10), "b"),
+            make_proc_with_parent(100, Some(10), "c"),
+        ];
+        let tree = build_process_tree(&procs);
+        let flat = flatten_tree(&tree);
+
+        assert_eq!(flat.len(), procs.len(), "cycle members must still appear");
+        let mut pids: Vec<u32> = flat.iter().map(|(p, _)| p.pid).collect();
+        pids.sort_unstable();
+        assert_eq!(pids, vec![1, 10, 11, 100], "each process appears once");
+    }
+
+    #[test]
+    fn test_tree_self_parent_appears_once() {
+        let procs = vec![make_proc_with_parent(7, Some(7), "ouroboros")];
+        let tree = build_process_tree(&procs);
+        let flat = flatten_tree(&tree);
+
+        assert_eq!(flat.len(), 1);
+        assert_eq!(flat[0].0.pid, 7);
+        assert_eq!(flat[0].1, 0, "a self-parented process is its own root");
+    }
+
+    #[test]
+    fn test_tree_deeper_than_max_depth_keeps_every_process() {
+        // A 300-link chain crosses the MAX_DEPTH cut-off; the tail below it is
+        // re-rooted rather than truncated away.
+        let procs: Vec<ProcessInfo> = (1..=300u32)
+            .map(|pid| make_proc_with_parent(pid, Some(pid - 1), "link"))
+            .collect();
+        let tree = build_process_tree(&procs);
+        let flat = flatten_tree(&tree);
+
+        assert_eq!(flat.len(), procs.len());
     }
 }

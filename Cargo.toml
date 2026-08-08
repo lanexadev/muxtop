@@ -10,7 +10,7 @@ panic = "abort"
 
 [workspace.package]
 edition = "2024"
-version = "0.6.0"
+version = "0.7.0"
 authors = ["Lucas Schimmel"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lucasschimmel/muxtop"
@@ -22,12 +22,20 @@ rust-version = "1.88"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time", "net", "io-util"] }
 
 # System information
-sysinfo = "0.34"
+sysinfo = "0.38"
 
 # NVIDIA GPU telemetry (v0.5). Loads libnvidia-ml.so / nvml.dll dynamically at
 # runtime via libloading, so muxtop builds and runs unchanged on hosts with no
 # NVIDIA driver. Target-gated in muxtop-core: NVML has no macOS build.
 nvml-wrapper = "0.12"
+
+# Apple Silicon GPU telemetry (v0.7). Target-gated in muxtop-core to macOS:
+# `core-foundation` wraps the Core Foundation types IOKit exchanges, and
+# `libloading` resolves the private IOReport symbols at runtime so the binary
+# still starts on a macOS release that has moved them.
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+libloading = "0.8"
 
 # TUI
 ratatui = "0.30"
@@ -58,7 +66,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 dirs = "6"
 
 # Benchmarking
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 
 # Serialization
 # `rc` lets Serialize/Deserialize see through the `Arc`s on
@@ -70,7 +78,7 @@ bincode = "2"
 async-trait = "0.1"
 
 # Docker/Podman API client (v0.3 Containers, see ADR-01 in forge/25)
-bollard = "0.20"
+bollard = "0.21"
 futures = "0.3"
 
 # Kubernetes API client (v0.4 Kube tab, see ADR-04 in forge/32) — features
@@ -95,9 +103,9 @@ rcgen = "0.14"
 ring = "0.17"
 
 # Internal crates
-muxtop-core = { path = "crates/muxtop-core", version = "0.6.0" }
-muxtop-tui = { path = "crates/muxtop-tui", version = "0.6.0" }
-muxtop-proto = { path = "crates/muxtop-proto", version = "0.6.0" }
+muxtop-core = { path = "crates/muxtop-core", version = "0.7.0" }
+muxtop-tui = { path = "crates/muxtop-tui", version = "0.7.0" }
+muxtop-proto = { path = "crates/muxtop-proto", version = "0.7.0" }
 
 [package]
 name = "muxtop"

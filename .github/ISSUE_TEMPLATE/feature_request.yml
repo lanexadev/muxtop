@@ -11,8 +11,8 @@ body:
         questions below are about the problem before the solution.
 
         Check the [roadmap](https://github.com/lucasschimmel/muxtop#roadmap)
-        first — GPU on Apple Silicon, `docker exec`, the config file and the
-        plugin system are already scheduled.
+        first — `docker exec`, the config file and the plugin system are
+        already scheduled.
 
   - type: textarea
     id: problem

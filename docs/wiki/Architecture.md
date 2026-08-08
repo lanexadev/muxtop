@@ -52,10 +52,13 @@ cluster_engine.rs     trait + kubeconfig detection → kube_engine.rs    (kube-r
 gpu_engine.rs         trait + a composite that merges vendors
                                                   → nvml_engine.rs     (NVIDIA)
                                                   → amd_engine.rs      (AMD sysfs)
+                                                  → apple/             (IOKit + IOReport)
 ```
 
-The GPU composite is why an NVIDIA and an AMD card appear in one list, and why
-adding Apple's IOReport backend in v0.6 is plumbing rather than redesign.
+The GPU composite is why an NVIDIA and an AMD card appear in one list, and it is
+what made adding Apple Silicon in v0.7 plumbing rather than redesign: the data
+model, the wire format and the tab already carried the `Apple` variants, so the
+release shipped without a protocol break.
 
 Every optional metric is an `Option` all the way through the model. That is what
 lets the UI render `—` for "the driver cannot report this" instead of a `0` that
